@@ -1,0 +1,255 @@
+use qm_types::CredentialError;
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const PENDING_LIFETIME: Duration = Duration::from_secs(120);
+const DISPATCH_LIFETIME: Duration = Duration::from_secs(30);
+const DOMAIN: &[u8] = b"quartermaster.credential-approval.v1\0allow-once\0";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RequestBinding {
+    pub session_id: [u8; 16],
+    pub policy_digest: [u8; 32],
+    pub request_digest: [u8; 32],
+    pub credential_digest: [u8; 32],
+}
+
+struct SessionState {
+    active: bool,
+    policy_digest: [u8; 32],
+    generation: u64,
+}
+
+pub(super) struct Authority {
+    session_id: [u8; 16],
+    public_key: Vec<u8>,
+    state: Mutex<SessionState>,
+}
+
+/// Host-owned approval authority. The key must come from broker enrolment, never
+/// an incoming request. This does not authenticate a process or normalize a request.
+pub struct ApprovalSession {
+    authority: Arc<Authority>,
+}
+
+impl ApprovalSession {
+    pub(super) fn authority(&self) -> Arc<Authority> {
+        Arc::clone(&self.authority)
+    }
+
+    /// Accepts an enrolled P-256 public key in uncompressed SEC1 format.
+    pub fn new(
+        session_id: [u8; 16],
+        policy_digest: [u8; 32],
+        public_key: &[u8],
+    ) -> Result<Self, CredentialError> {
+        if public_key.len() != 65 || public_key[0] != 4 {
+            return Err(CredentialError::InvalidApprovalKey);
+        }
+        Ok(Self {
+            authority: Arc::new(Authority {
+                session_id,
+                public_key: public_key.to_vec(),
+                state: Mutex::new(SessionState {
+                    active: true,
+                    policy_digest,
+                    generation: 0,
+                }),
+            }),
+        })
+    }
+
+    /// The broker must digest its frozen, verified request, including the principal,
+    /// operation, resource, recipient and provider binding. Guest digests are untrusted.
+    pub fn begin(
+        &self,
+        request_digest: [u8; 32],
+        credential_digest: [u8; 32],
+    ) -> Result<PendingApproval, CredentialError> {
+        let state = self
+            .authority
+            .state
+            .lock()
+            .map_err(|_| CredentialError::StateUnavailable)?;
+        if !state.active {
+            return Err(CredentialError::SessionRevoked);
+        }
+        let mut nonce = [0; 32];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| CredentialError::RandomnessUnavailable)?;
+        Ok(PendingApproval {
+            authority: Arc::clone(&self.authority),
+            binding: RequestBinding {
+                session_id: self.authority.session_id,
+                policy_digest: state.policy_digest,
+                request_digest,
+                credential_digest,
+            },
+            generation: state.generation,
+            nonce,
+            created_at: Instant::now(),
+            authenticated_at: None,
+        })
+    }
+
+    pub fn update_policy(&self, policy_digest: [u8; 32]) -> Result<(), CredentialError> {
+        let mut state = self
+            .authority
+            .state
+            .lock()
+            .map_err(|_| CredentialError::StateUnavailable)?;
+        if !state.active {
+            return Err(CredentialError::SessionRevoked);
+        }
+        if state.policy_digest != policy_digest {
+            let Some(generation) = state.generation.checked_add(1) else {
+                state.active = false;
+                return Err(CredentialError::SessionRevoked);
+            };
+            state.generation = generation;
+            state.policy_digest = policy_digest;
+        }
+        Ok(())
+    }
+
+    pub fn revoke(&self) -> Result<(), CredentialError> {
+        self.authority
+            .state
+            .lock()
+            .map_err(|_| CredentialError::StateUnavailable)?
+            .active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ApprovalSession {
+    fn drop(&mut self) {
+        let _ = self.revoke();
+    }
+}
+
+/// A pending request cannot expose a credential. Dropping it cancels that approval.
+pub struct PendingApproval {
+    authority: Arc<Authority>,
+    binding: RequestBinding,
+    generation: u64,
+    nonce: [u8; 32],
+    created_at: Instant,
+    authenticated_at: Option<Instant>,
+}
+
+impl PendingApproval {
+    fn check_session(&self) -> Result<(), CredentialError> {
+        let state = self
+            .authority
+            .state
+            .lock()
+            .map_err(|_| CredentialError::StateUnavailable)?;
+        if !state.active {
+            return Err(CredentialError::SessionRevoked);
+        }
+        if state.generation != self.generation || state.policy_digest != self.binding.policy_digest
+        {
+            return Err(CredentialError::PolicyChanged);
+        }
+        Ok(())
+    }
+
+    /// Called only by the trusted host authentication callback at fresh OS success.
+    /// Never expose this as a guest/UI timestamp or boolean IPC endpoint. The returned
+    /// challenge must then be signed by the enrolled presence-protected key.
+    pub fn record_authentication(&mut self) -> Result<Vec<u8>, CredentialError> {
+        self.record_authentication_at(Instant::now())
+    }
+
+    fn record_authentication_at(&mut self, now: Instant) -> Result<Vec<u8>, CredentialError> {
+        self.check_session()?;
+        if self.authenticated_at.is_some() {
+            return Err(CredentialError::AlreadyAuthenticated);
+        }
+        if now < self.created_at || now.duration_since(self.created_at) >= PENDING_LIFETIME {
+            return Err(CredentialError::PendingExpired);
+        }
+        self.authenticated_at = Some(now);
+        Ok(self.signing_bytes(now))
+    }
+
+    fn signing_bytes(&self, authenticated_at: Instant) -> Vec<u8> {
+        let mut bytes = DOMAIN.to_vec();
+        bytes.extend(self.binding.session_id);
+        bytes.extend(self.binding.policy_digest);
+        bytes.extend(self.binding.request_digest);
+        bytes.extend(self.binding.credential_digest);
+        bytes.extend(self.nonce);
+        bytes.extend(
+            authenticated_at
+                .duration_since(self.created_at)
+                .as_nanos()
+                .to_be_bytes(),
+        );
+        bytes
+    }
+
+    fn check_dispatch_at(&self, clock: impl FnOnce() -> Instant) -> Result<(), CredentialError> {
+        self.check_session()?;
+        let now = clock();
+        let authenticated_at = self
+            .authenticated_at
+            .ok_or(CredentialError::MissingPresence)?;
+        if now < authenticated_at || now.duration_since(authenticated_at) >= DISPATCH_LIFETIME {
+            return Err(CredentialError::DispatchExpired);
+        }
+        Ok(())
+    }
+
+    /// Verification consumes the pending request. Its nonce cannot be reused for a
+    /// second grant, and a replacement pending request has a fresh random nonce.
+    pub fn approve(self, signature: &[u8]) -> Result<ApprovedRequest, CredentialError> {
+        self.check_dispatch_at(Instant::now)?;
+        let authenticated_at = self
+            .authenticated_at
+            .ok_or(CredentialError::MissingPresence)?;
+        if signature.is_empty() || signature.len() > 72 {
+            return Err(CredentialError::InvalidApprovalSignature);
+        }
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &self.authority.public_key)
+            .verify(&self.signing_bytes(authenticated_at), signature)
+            .map_err(|_| CredentialError::InvalidApprovalSignature)?;
+        Ok(ApprovedRequest { pending: self })
+    }
+}
+
+/// A single-use capability, constructed only by verified approval. No raw proof or
+/// boolean can be converted into this type through an unchecked constructor.
+///
+/// ```compile_fail
+/// let grant = qm_providers::ApprovedRequest { pending: todo!() };
+/// ```
+pub struct ApprovedRequest {
+    pending: PendingApproval,
+}
+
+impl ApprovedRequest {
+    pub(super) fn belongs_to(&self, authority: &Arc<Authority>) -> bool {
+        Arc::ptr_eq(&self.pending.authority, authority)
+    }
+
+    pub(super) fn check(&self) -> Result<(), CredentialError> {
+        self.check_at(Instant::now)
+    }
+
+    pub(super) fn check_at(&self, clock: impl FnOnce() -> Instant) -> Result<(), CredentialError> {
+        self.pending.check_dispatch_at(clock)
+    }
+
+    pub(super) fn binding(&self) -> &RequestBinding {
+        &self.pending.binding
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/approval.rs"]
+mod tests;

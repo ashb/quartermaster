@@ -1,0 +1,6 @@
+/docs/evidence/
+/target/
+/.venv/
+/.pytest_cache/
+**/__pycache__/
+**/xcuserdata/

@@ -1,0 +1,12 @@
+[package]
+name = "qm-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+qm-types.workspace = true
+rbw.workspace = true
+ring = "=0.17.14"
+zeroize.workspace = true
