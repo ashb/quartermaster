@@ -23,3 +23,7 @@ and consuming approval capabilities for a credential-owning broker.
 
 Use `just test` for the Rust suite and `just check` for tests, formatting and
 Clippy. Dependencies are locked; `just fetch` prepares the local offline cache.
+
+The macOS security package retains one biometric-protected approval key across
+launches and builds. Missing or substituted enrolled keys fail closed; explicit
+reset is required before enrolling a replacement.

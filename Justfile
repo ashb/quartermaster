@@ -9,6 +9,7 @@ fetch:
 
 test:
     cargo test --locked --offline --workspace --all-features
+    swift test --package-path macos/Security --scratch-path target/swift-security
 
 fmt:
     cargo fmt --all
