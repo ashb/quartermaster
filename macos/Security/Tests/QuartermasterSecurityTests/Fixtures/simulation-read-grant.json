@@ -1,0 +1,22 @@
+{
+  "method": "GET",
+  "path": "/api/v3/repos/quartermaster/demo/issues/42",
+  "body": "",
+  "repository": "quartermaster/demo",
+  "issue": 42,
+  "origin": "https://github.example.invalid",
+  "peer": {"cdHash": "1111111111111111111111111111111111111111"},
+  "authorization": {
+    "purpose": "quartermaster.issue-read-grant.v1",
+    "grant": {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "uid": 501,
+      "codeHash": "1111111111111111111111111111111111111111",
+      "action": "issueReads",
+      "repository": "quartermaster/demo",
+      "role": "github-write",
+      "expiresUnix": 4600,
+      "budget": 100
+    }
+  }
+}

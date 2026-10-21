@@ -3,7 +3,7 @@ use rbw::api::KdfType;
 use rbw::identity::Identity;
 use rbw::locked::Password;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KdfAlgorithm {
     Pbkdf2,
     Argon2id,
@@ -17,7 +17,7 @@ pub struct KdfLimits {
     pub argon2_parallelism: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KdfParameters {
     pub algorithm: KdfAlgorithm,
     pub iterations: u32,
@@ -84,6 +84,14 @@ pub struct VaultIdentity {
 impl VaultIdentity {
     pub fn email(&self) -> &str {
         &self.identity.email
+    }
+
+    pub(crate) fn keys(&self) -> &rbw::locked::Keys {
+        &self.identity.keys
+    }
+
+    pub(crate) fn password_hash(&self) -> &rbw::locked::PasswordHash {
+        &self.identity.master_password_hash
     }
 }
 

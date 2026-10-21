@@ -1,0 +1,17 @@
+[package]
+name = "quartermasterd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+qm-broker = { path = "../../crates/qm-broker" }
+serde_json = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.190"
+
+[[bin]]
+name = "quartermasterd"
+path = "src/main.rs"

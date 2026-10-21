@@ -7,6 +7,17 @@ publish.workspace = true
 
 [dependencies]
 qm-types.workspace = true
+log = { version = "=0.4.34", features = ["max_level_off", "release_max_level_off"] }
 rbw.workspace = true
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 ring = "=0.17.14"
-zeroize.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+uuid = "1"
+zeroize = { workspace = true, features = ["serde"] }
+time.workspace = true
+
+[dev-dependencies]
+axum = "=0.8.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

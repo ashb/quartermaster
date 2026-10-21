@@ -18,12 +18,13 @@ Thirdly, you don't get much context about what process is asking for credentials
 
 ## Current status
 
-Quartermaster provides authenticated credential parsing, bounded key derivation
-and consuming approval capabilities for a credential-owning broker.
+The macOS development app manages an encrypted Vaultwarden cache and mediates
+selected GitHub issue reads. Real writes are rejected. A local simulation also
+exercises approval without sending a GitHub action.
 
-Use `just test` for the Rust suite and `just check` for tests, formatting and
-Clippy. Dependencies are locked; `just fetch` prepares the local offline cache.
+See [development](docs/development.md) for requirements, signing, builds and tests,
+and [GitHub setup](docs/github.md) for enrolment and requests. Use dedicated
+development vault data.
 
-The macOS security package retains one biometric-protected approval key across
-launches and builds. Missing or substituted enrolled keys fail closed; explicit
-reset is required before enrolling a replacement.
+The [architecture](docs/architecture.md) describes intended integrations;
+[security boundaries](docs/security-boundaries.md) defines the trust contract.

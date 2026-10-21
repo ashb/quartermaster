@@ -6,7 +6,10 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [.library(name: "QuartermasterSecurity", targets: ["QuartermasterSecurity"])],
     targets: [
-        .target(name: "QuartermasterSecurity"),
-        .testTarget(name: "QuartermasterSecurityTests", dependencies: ["QuartermasterSecurity"]),
+        .target(name: "QuartermasterIPC", publicHeadersPath: "include",
+                linkerSettings: [.linkedFramework("Foundation"), .linkedFramework("LocalAuthentication")]),
+        .target(name: "QuartermasterSecurity", dependencies: ["QuartermasterIPC"]),
+        .testTarget(name: "QuartermasterSecurityTests", dependencies: ["QuartermasterSecurity", "QuartermasterIPC"],
+                    resources: [.copy("Fixtures")]),
     ]
 )

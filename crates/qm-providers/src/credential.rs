@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 /// Structurally validated ciphertext; authentication happens during decryption.
 pub struct EncryptedCredential {
     cipher: CipherString,
+    encoded: String,
     digest: [u8; 32],
 }
 
@@ -43,6 +44,7 @@ impl EncryptedCredential {
         }
         Ok(Self {
             cipher,
+            encoded: encoded.to_owned(),
             digest: digest(&SHA256, encoded.as_bytes())
                 .as_ref()
                 .try_into()
@@ -52,6 +54,26 @@ impl EncryptedCredential {
 
     pub fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    pub(crate) fn encoded(&self) -> &str {
+        &self.encoded
+    }
+
+    pub(crate) fn authenticate(&self, keys: &rbw::locked::Keys) -> Result<(), CredentialError> {
+        let CipherString::Symmetric {
+            iv,
+            ciphertext,
+            mac: Some(mac),
+        } = &self.cipher
+        else {
+            return Err(CredentialError::InvalidCiphertext);
+        };
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, keys.mac_key());
+        let mut authenticated = Vec::with_capacity(iv.len() + ciphertext.len());
+        authenticated.extend_from_slice(iv);
+        authenticated.extend_from_slice(ciphertext);
+        ring::hmac::verify(&key, &authenticated, mac).map_err(|_| CredentialError::DecryptionFailed)
     }
 }
 
