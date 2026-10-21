@@ -1,15 +1,18 @@
 import Testing
+
 @testable import QuartermasterSecurity
 
 @Test @MainActor func revocationCancelsAnActiveApprovalAndRunsItsBackendOperation() async {
     let workflow = ApprovalControlWorkflow()
     var approvalVisible = true
     var revoked = false
-    await workflow.revokeReadAccess(cancelApproval: { approvalVisible = false }, revoke: {
-        #expect(!approvalVisible)
-        #expect(workflow.busy)
-        revoked = true
-    })
+    await workflow.revokeReadAccess(
+        cancelApproval: { approvalVisible = false },
+        revoke: {
+            #expect(!approvalVisible)
+            #expect(workflow.busy)
+            revoked = true
+        })
     #expect(revoked)
     #expect(!workflow.busy)
 }
@@ -19,10 +22,12 @@ import Testing
     var calls: [String] = []
     await workflow.perform {
         calls.append("operation")
-        await workflow.revokeReadAccess(cancelApproval: { calls.append("cancel") }, revoke: {
-            calls.append("revoke")
-            #expect(workflow.phase == .revoking)
-        })
+        await workflow.revokeReadAccess(
+            cancelApproval: { calls.append("cancel") },
+            revoke: {
+                calls.append("revoke")
+                #expect(workflow.phase == .revoking)
+            })
         #expect(workflow.phase == .revocationQueued)
         await workflow.perform { calls.append("must not run") }
         calls.append("operation completed")

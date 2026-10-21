@@ -4,9 +4,10 @@ use super::configuration::GitHubConfig;
 #[cfg(unix)]
 use super::{https::AuthenticatedMetadata, response::MetadataFailure};
 use crate::owner::{
-    dispatch::{self, CredentialSelection},
+    dispatch::{self, Acquisition, CredentialSelection},
     operation::OperationId,
-    request::FrozenOperation,
+    policy::AuthorizationError,
+    request::{Action, FrozenOperation},
 };
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
@@ -115,11 +116,35 @@ impl RepositoryLookup {
 }
 
 impl PreparedMetadata {
-    pub(in crate::owner) fn new(
-        id: OperationId,
-        lookup: RepositoryLookup,
-        snapshot: &qm_providers::VaultSnapshot,
-    ) -> Result<Self, dispatch::Error> {
+    pub(in crate::owner) fn acquire(input: Acquisition<'_>) -> Result<Self, dispatch::Error> {
+        let Acquisition {
+            id,
+            operation,
+            authorizer,
+            principal,
+            selection,
+            snapshot,
+            now,
+        } = input;
+        if !matches!(
+            operation.request().action(),
+            Action::ListIssues | Action::ReadIssue
+        ) {
+            return Err(dispatch::Error::Authorization(AuthorizationError::Denied));
+        }
+        authorizer
+            .check_acquisition(operation, principal, selection, now)
+            .map_err(dispatch::Error::Authorization)?;
+        let config = authorizer
+            .github_configuration()
+            .ok_or(dispatch::Error::Unavailable)?;
+        let lookup = RepositoryLookup::new(
+            config,
+            operation.request(),
+            selection.clone(),
+            authorizer.policy_generation(),
+        )
+        .map_err(|_| dispatch::Error::Unavailable)?;
         if !lookup.selection.matches_snapshot(snapshot) {
             return Err(dispatch::Error::CredentialMismatch);
         }
@@ -233,5 +258,68 @@ impl RepositoryBinding {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/github_repository.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::owner::{github::configuration::GitHubConfig, request, test_support::vault};
+    use serde_json::json;
+    use std::io::Cursor;
+
+    fn config(id: u64) -> GitHubConfig {
+        GitHubConfig::decode(&serde_json::to_vec(&json!({"version":1,"mode":"github","repositories":[{"id":id,"owner":"example","name":"one"}]})).unwrap()).unwrap()
+    }
+
+    fn operation(config: &GitHubConfig) -> request::FrozenOperation {
+        request::read_configured(
+            &mut Cursor::new(
+                "GET /repos/example/one/issues/123 HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            ),
+            Some(config),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn github_repository_lookup_is_limited_to_the_configured_name_and_checks_numeric_identity() {
+        let snapshot = vault::snapshot("github-read");
+        let selection = vault::selection(&snapshot);
+        let lookup =
+            RepositoryLookup::new(&config(123), &operation(&config(123)), selection.clone(), 7)
+                .unwrap();
+        assert_eq!(lookup.path(), "/repos/example/one");
+        assert!(
+            lookup
+                .verify(br#"{"id":123,"full_name":"example/one","private":true}"#)
+                .is_ok()
+        );
+        for body in [
+            br#"{"id":456,"full_name":"example/one"}"#.as_slice(),
+            br#"{"id":123,"full_name":"example/transferred"}"#,
+            br#"{"id":123,"full_name":"another/one"}"#,
+            br#"{"id":123,"id":456,"full_name":"example/one"}"#,
+            br#"{"id":0,"full_name":"example/one"}"#,
+            br#"{"message":"Bad credentials"}"#,
+        ] {
+            assert!(lookup.verify(body).is_err());
+        }
+        assert!(
+            RepositoryLookup::new(&config(456), &operation(&config(123)), selection, 7).is_err()
+        );
+    }
+
+    #[test]
+    fn github_repository_binding_cannot_survive_a_policy_provider_or_repository_replacement() {
+        let snapshot = vault::snapshot("github-read");
+        let selection = vault::selection(&snapshot);
+        let lookup =
+            RepositoryLookup::new(&config(123), &operation(&config(123)), selection.clone(), 7)
+                .unwrap();
+        let binding = lookup
+            .verify(br#"{"id":123,"full_name":"example/one"}"#)
+            .unwrap();
+        assert!(binding.matches(&operation(&config(123)), &selection, 7));
+        assert!(!binding.matches(&operation(&config(123)), &selection, 8));
+        assert!(!binding.matches(&operation(&config(456)), &selection, 7));
+        let other = vault::snapshot("github-write");
+        assert!(!binding.matches(&operation(&config(123)), &vault::selection(&other), 7));
+    }
+}

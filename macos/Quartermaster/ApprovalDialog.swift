@@ -6,24 +6,32 @@ import QuartermasterSecurity
 import SwiftUI
 
 enum DialogPresentationLease {
-    enum Failure: Error { case alreadyPresented, invalidLock, system(Int32) }
+    enum Failure: Error {
+        case alreadyPresented
+        case invalidLock
+        case system(Int32)
+    }
 
     static func acquire() throws -> Int32 {
-        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                                  appropriateFor: nil, create: true)
+        let support = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
         let directory = support.appendingPathComponent("Quartermaster/Development", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
         var parent = stat()
         guard lstat(directory.path, &parent) == 0, parent.st_uid == geteuid(),
-              parent.st_mode & S_IFMT == S_IFDIR, parent.st_mode & 0o077 == 0 else { throw Failure.invalidLock }
+            parent.st_mode & S_IFMT == S_IFDIR, parent.st_mode & 0o077 == 0
+        else { throw Failure.invalidLock }
         let path = directory.appendingPathComponent("approval-presentation.lock").path
         let descriptor = open(path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard descriptor >= 0 else { throw Failure.system(errno) }
         var attributes = stat()
         guard fstat(descriptor, &attributes) == 0,
-              attributes.st_uid == geteuid(), attributes.st_nlink == 1,
-              attributes.st_mode & S_IFMT == S_IFREG, attributes.st_mode & 0o077 == 0 else {
+            attributes.st_uid == geteuid(), attributes.st_nlink == 1,
+            attributes.st_mode & S_IFMT == S_IFREG, attributes.st_mode & 0o077 == 0
+        else {
             close(descriptor)
             throw Failure.invalidLock
         }
@@ -70,7 +78,9 @@ struct ApprovalPresentation {
     }
 
     var authenticationReason: String {
-        readGrant == nil ? "approve closing issue \(request.issue.map(String.init) ?? "?") in \(request.repository)" : "allow issue reads in \(request.repository)"
+        readGrant == nil
+            ? "approve closing issue \(request.issue.map(String.init) ?? "?") in \(request.repository)"
+            : "allow issue reads in \(request.repository)"
     }
 }
 
@@ -161,14 +171,18 @@ struct ApprovalDialogView: View {
                         .help(peer.commandLine ?? "Command arguments unavailable")
                     DisclosureGroup("HTTP request") {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("\(presentation.request.method) \(presentation.request.origin ?? "")\(presentation.request.path)")
+                            Text(
+                                "\(presentation.request.method) \(presentation.request.origin ?? "")\(presentation.request.path)"
+                            )
                             Text(presentation.request.body)
                         }.font(.caption.monospaced()).textSelection(.enabled)
                     }.font(.caption)
                     DisclosureGroup("Socket peer: PID \(peer.pid) · signature checked") {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(peer.executable)
-                            Text("\(peer.signingIdentifier) · \(peer.adHoc ? "ad-hoc signature" : peer.teamIdentifier ?? "no Team ID")")
+                            Text(
+                                "\(peer.signingIdentifier) · \(peer.adHoc ? "ad-hoc signature" : peer.teamIdentifier ?? "no Team ID")"
+                            )
                             Text("CDHash: \(peer.cdHash)")
                         }.font(.caption.monospaced()).textSelection(.enabled)
                     }.font(.caption)
@@ -196,7 +210,8 @@ struct ApprovalDialogView: View {
                 }.keyboardShortcut(.cancelAction)
                 Spacer()
                 Text(authenticationTitle).font(.headline)
-                EmbeddedAuthentication(context: controller.context, onVisible: { Task { await controller.approve() } }).frame(width: 32, height: 32)
+                EmbeddedAuthentication(context: controller.context, onVisible: { Task { await controller.approve() } })
+                    .frame(width: 32, height: 32)
             }
         }
         .onChange(of: controller.phase) { _, phase in
@@ -216,7 +231,9 @@ struct ApprovalDialogView: View {
 
     private var statusDetail: String {
         if !controller.detail.isEmpty { return controller.detail }
-        if presentation.readGrant != nil { return "Further permitted reads need no prompt while this grant remains valid." }
+        if presentation.readGrant != nil {
+            return "Further permitted reads need no prompt while this grant remains valid."
+        }
         return "Local simulation — no GitHub action will run."
     }
 
@@ -237,17 +254,21 @@ final class ApprovalDialog: NSObject, NSWindowDelegate {
     var onClose: (() -> Void)?
 
     init(backend: BrokerPending) {
-        let presentation = ApprovalPresentation(request: backend.request, provider: backend.provider, readGrant: backend.readGrant)
+        let presentation = ApprovalPresentation(
+            request: backend.request, provider: backend.provider, readGrant: backend.readGrant)
         controller = ApprovalController(backend: backend, reason: presentation.authenticationReason)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 596, height: 460),
-                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 596, height: 460),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
         super.init()
         window.title = "Quartermaster approval"
         window.isReleasedWhenClosed = false
         window.delegate = self
         let window = self.window
-        window.contentView = NSHostingView(rootView: ApprovalDialogView(presentation: presentation, controller: controller,
-                                                                         close: { [weak window] in window?.performClose(nil) }))
+        window.contentView = NSHostingView(
+            rootView: ApprovalDialogView(
+                presentation: presentation, controller: controller,
+                close: { [weak window] in window?.performClose(nil) }))
     }
 
     func cancel() {

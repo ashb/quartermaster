@@ -31,7 +31,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
     func start() {
         let mainMenu = NSMenu()
         let applicationMenu = NSMenu()
-        applicationMenu.addItem(withTitle: "Quit Quartermaster", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        applicationMenu.addItem(
+            withTitle: "Quit Quartermaster", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let applicationItem = mainMenu.addItem(withTitle: "Quartermaster", action: nil, keyEquivalent: "")
         applicationItem.submenu = applicationMenu
         let editMenu = NSMenu(title: "Edit")
@@ -39,7 +40,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
             ("Cut", #selector(NSText.cut(_:)), "x"),
             ("Copy", #selector(NSText.copy(_:)), "c"),
             ("Paste", #selector(NSText.paste(_:)), "v"),
-            ("Select All", #selector(NSText.selectAll(_:)), "a")
+            ("Select All", #selector(NSText.selectAll(_:)), "a"),
         ] {
             editMenu.addItem(withTitle: title, action: action, keyEquivalent: key)
         }
@@ -57,7 +58,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
             ("Sync vault", #selector(syncVault)),
             ("Lock vault", #selector(lockVault)),
             ("Revoke read access", #selector(revokeReads)),
-            ("Discard offline cache…", #selector(discardVault))
+            ("Discard offline cache…", #selector(discardVault)),
         ] {
             let entry = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
             entry.target = self
@@ -92,8 +93,9 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
                                 continue
                             }
                             let pending = try BrokerPending(client: connection, reply: reply)
-                            do { presentation = try DialogPresentationLease.acquire() }
-                            catch DialogPresentationLease.Failure.alreadyPresented {
+                            do { presentation = try DialogPresentationLease.acquire() } catch DialogPresentationLease
+                                .Failure.alreadyPresented
+                            {
                                 pending.cancel()
                                 continue
                             }
@@ -106,7 +108,9 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
                             dialog.window.center()
                             dialog.window.makeKeyAndOrderFront(nil)
                             NSApplication.shared.activate(ignoringOtherApps: true)
-                        } else if reply.kind != "idle" { throw BrokerFailure.invalidMessage }
+                        } else if reply.kind != "idle" {
+                            throw BrokerFailure.invalidMessage
+                        }
                     }
                     try await Task.sleep(for: .milliseconds(200))
                 }
@@ -132,7 +136,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
         // Temporary development enrolment until native preferences are available.
         let alert = NSAlert()
         alert.messageText = "Enrol the dedicated vault"
-        alert.informativeText = "Sign in to discover the account and pin the selected Login item. The offline cache will be protected by Touch ID."
+        alert.informativeText =
+            "Sign in to discover the account and pin the selected Login item. The offline cache will be protected by Touch ID."
         alert.addButton(withTitle: "Sign in and enrol")
         alert.addButton(withTitle: "Cancel")
         let server = NSTextField(string: vaultSource?.server ?? "")
@@ -148,12 +153,19 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
         fields.alignment = .leading
         fields.spacing = 8
         fields.frame = NSRect(x: 0, y: 0, width: 420, height: 112)
-        for field in [server, email, item, password] { field.widthAnchor.constraint(equalToConstant: 420).isActive = true }
+        for field in [server, email, item, password] {
+            field.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        }
         alert.accessoryView = fields
         NSApplication.shared.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { password.stringValue = ""; return }
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            password.stringValue = ""
+            return
+        }
         let itemId = item.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = BrokerMessage(kind: "vaultLogin", server: server.stringValue, email: email.stringValue, password: password.stringValue, itemId: itemId.isEmpty ? nil : itemId)
+        let request = BrokerMessage(
+            kind: "vaultLogin", server: server.stringValue, email: email.stringValue, password: password.stringValue,
+            itemId: itemId.isEmpty ? nil : itemId)
         password.stringValue = ""
         await executeVault(request, reenroll: true)
     }
@@ -166,9 +178,10 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
         guard client != nil else { return }
         statusItem?.button?.title = "QM [DEBUG] · revocation pending"
         Task {
-            await controls.revokeReadAccess(cancelApproval: {
-                active?.cancel()
-            }, revoke: { await self.performReadRevocation() })
+            await controls.revokeReadAccess(
+                cancelApproval: {
+                    active?.cancel()
+                }, revoke: { await self.performReadRevocation() })
         }
     }
 
@@ -207,7 +220,9 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
         alert.informativeText = "Sign in again to rebuild it from the dedicated vault."
         alert.addButton(withTitle: "Discard cache")
         alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn { performVault(BrokerMessage(kind: "vaultDiscard"), reenroll: true) }
+        if alert.runModal() == .alertFirstButtonReturn {
+            performVault(BrokerMessage(kind: "vaultDiscard"), reenroll: true)
+        }
     }
 
     private func performVault(_ request: BrokerMessage, reenroll: Bool) {
@@ -232,8 +247,11 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
             let alert = NSAlert()
             alert.messageText = "Vault: \(reply.state ?? "unknown")"
             if let binding = reply.binding {
-                alert.informativeText = "Account: \(binding.email)\nAccount ID: \(binding.account_id)\nLogin item ID: \(binding.item_id)\nRole: \(binding.role)"
-            } else { alert.informativeText = reply.error ?? "No vault is enrolled." }
+                alert.informativeText =
+                    "Account: \(binding.email)\nAccount ID: \(binding.account_id)\nLogin item ID: \(binding.item_id)\nRole: \(binding.role)"
+            } else {
+                alert.informativeText = reply.error ?? "No vault is enrolled."
+            }
             alert.runModal()
         } catch {
             let alert = NSAlert()

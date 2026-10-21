@@ -1,6 +1,7 @@
 import Foundation
 import LocalAuthentication
 import Testing
+
 @testable import QuartermasterSecurity
 
 @MainActor private final class AuthenticationFixture: ApprovalAuthentication {
@@ -46,8 +47,9 @@ import Testing
     let now = MonotonicTimestamp.now
     let authentication = AuthenticationFixture(timestamp: now)
     let backend = ApprovalBackendFixture()
-    let controller = ApprovalController(backend: backend, reason: "Approve request", authentication: authentication,
-                                        keys: keys, now: { now })
+    let controller = ApprovalController(
+        backend: backend, reason: "Approve request", authentication: authentication,
+        keys: keys, now: { now })
 
     await controller.approve()
     await controller.approve()
@@ -70,8 +72,9 @@ import Testing
     let now = MonotonicTimestamp.now
     let authentication = AuthenticationFixture(timestamp: now)
     let backend = ApprovalBackendFixture()
-    let controller = ApprovalController(backend: backend, reason: "Approve request", authentication: authentication,
-                                        keys: keys, now: { now })
+    let controller = ApprovalController(
+        backend: backend, reason: "Approve request", authentication: authentication,
+        keys: keys, now: { now })
     backend.onChallenge = { controller.cancel() }
 
     await controller.approve()
@@ -92,8 +95,9 @@ import Testing
     let authentication = AuthenticationFixture(timestamp: now)
     authentication.failure = true
     let backend = ApprovalBackendFixture()
-    let controller = ApprovalController(backend: backend, reason: "Approve request", authentication: authentication,
-                                        keys: keys, now: { now })
+    let controller = ApprovalController(
+        backend: backend, reason: "Approve request", authentication: authentication,
+        keys: keys, now: { now })
 
     await controller.approve()
 
@@ -109,8 +113,9 @@ import Testing
     let now = MonotonicTimestamp.now
     let authentication = AuthenticationFixture(timestamp: now)
     let backend = ApprovalBackendFixture()
-    let controller = ApprovalController(backend: backend, reason: "Approve request", authentication: authentication,
-                                        keys: ApprovalKeyStore(storage: storage), now: { now })
+    let controller = ApprovalController(
+        backend: backend, reason: "Approve request", authentication: authentication,
+        keys: ApprovalKeyStore(storage: storage), now: { now })
 
     await controller.approve()
 
@@ -128,8 +133,9 @@ import Testing
     let requested = try authenticated.advanced(by: .seconds(1))
     let authentication = AuthenticationFixture(timestamp: authenticated)
     let backend = ApprovalBackendFixture()
-    let controller = ApprovalController(backend: backend, reason: "Approve request", authentication: authentication,
-                                        keys: keys, now: { requested })
+    let controller = ApprovalController(
+        backend: backend, reason: "Approve request", authentication: authentication,
+        keys: keys, now: { requested })
 
     await controller.approve()
 

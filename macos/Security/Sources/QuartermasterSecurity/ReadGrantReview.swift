@@ -69,7 +69,8 @@ public struct ReadGrantReview: Sendable {
         switch request.origin {
         case .simulation:
             guard request.repositoryId == nil, request.repository == "quartermaster/demo",
-                  request.issue == 42, request.path == "/api/v3/repos/quartermaster/demo/issues/42" else {
+                request.issue == 42, request.path == "/api/v3/repos/quartermaster/demo/issues/42"
+            else {
                 throw Failure.invalidGrant
             }
             destination = .simulation
@@ -77,22 +78,26 @@ public struct ReadGrantReview: Sendable {
             guard let id = request.repositoryId, id > 0 else { throw Failure.invalidGrant }
             let path = String(request.path.split(separator: "?", maxSplits: 1)[0])
             let prefixes = ["/repos/\(request.repository)/issues", "/repositories/\(id)/issues"]
-            guard prefixes.contains(where: { prefix in
-                if path == prefix { return true }
-                guard path.hasPrefix(prefix + "/") else { return false }
-                let number = path.dropFirst(prefix.count + 1)
-                return !number.isEmpty && number.utf8.allSatisfy({ (48...57).contains($0) }) && (UInt64(number) ?? 0) > 0
-            }) else { throw Failure.invalidGrant }
+            guard
+                prefixes.contains(where: { prefix in
+                    if path == prefix { return true }
+                    guard path.hasPrefix(prefix + "/") else { return false }
+                    let number = path.dropFirst(prefix.count + 1)
+                    return !number.isEmpty && number.utf8.allSatisfy({ (48...57).contains($0) })
+                        && (UInt64(number) ?? 0) > 0
+                })
+            else { throw Failure.invalidGrant }
             destination = .github(repositoryID: id)
         }
         let hex = { (text: String) in text.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
         guard authorization.purpose == "quartermaster.issue-read-grant.v1", grant.action == "issueReads",
-              grant.id.count == 32, hex(grant.id), grant.uid == uid,
-              [40, 64].contains(grant.codeHash.count), hex(grant.codeHash), grant.codeHash == request.peer.cdHash,
-              grant.repository == request.repository,
-              grant.role == role, ["github-read", "github-write"].contains(role),
-              grant.budget > 0, grant.budget <= 100, expires > now, expires.timeIntervalSince(now) <= 3601,
-              request.method == "GET", request.body.isEmpty else {
+            grant.id.count == 32, hex(grant.id), grant.uid == uid,
+            [40, 64].contains(grant.codeHash.count), hex(grant.codeHash), grant.codeHash == request.peer.cdHash,
+            grant.repository == request.repository,
+            grant.role == role, ["github-read", "github-write"].contains(role),
+            grant.budget > 0, grant.budget <= 100, expires > now, expires.timeIntervalSince(now) <= 3601,
+            request.method == "GET", request.body.isEmpty
+        else {
             throw Failure.invalidGrant
         }
         repository = request.repository

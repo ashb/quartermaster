@@ -15,8 +15,7 @@ fmt:
     cargo fmt --all
 
 check: test
-    cargo fmt --all --check
-    cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings
+    prek run --all-files
 
 # Build the normal app and bundled backend without launching them.
 build: (_mac "unsigned")

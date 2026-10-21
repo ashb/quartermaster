@@ -1,0 +1,16 @@
+minimum_prek_version = "0.5.5"
+
+[[repos]]
+repo = "https://github.com/doublify/pre-commit-rust"
+rev = "eeee35a89e69d5772bdee97db1a6a898467b686e" # v1.0
+
+[[repos.hooks]]
+id = "fmt"
+args = ["--all"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "clippy"
+args = ["--locked", "--offline", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+types = ["file"]
+files = '^(crates/|bins/|Cargo\.(toml|lock)$|\.cargo/|prek\.toml$)'

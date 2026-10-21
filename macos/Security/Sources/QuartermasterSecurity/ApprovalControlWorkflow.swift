@@ -19,8 +19,10 @@ public final class ApprovalControlWorkflow {
         phase = .idle
     }
 
-    public func revokeReadAccess(cancelApproval: @MainActor () -> Void,
-                                 revoke: @escaping @MainActor () async -> Void) async {
+    public func revokeReadAccess(
+        cancelApproval: @MainActor () -> Void,
+        revoke: @escaping @MainActor () async -> Void
+    ) async {
         cancelApproval()
         switch phase {
         case .operation, .revocationQueued:

@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import LocalAuthentication
 import Testing
+
 @testable import QuartermasterSecurity
 
 final class MemoryKeyStorage: ApprovalKeyStorage {

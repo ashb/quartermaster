@@ -1,12 +1,13 @@
-import SwiftUI
 import QuartermasterSecurity
+import SwiftUI
 
 @main
 struct QuartermasterApp: App {
     init() {
         if CommandLine.arguments.dropFirst().first == "--vault-enroll", [4, 5].contains(CommandLine.arguments.count) {
             let itemId = CommandLine.arguments.count == 5 ? CommandLine.arguments[4] : nil
-            exit(BrokerApplication.run(enrollment: (CommandLine.arguments[2], CommandLine.arguments[3]), itemId: itemId))
+            exit(
+                BrokerApplication.run(enrollment: (CommandLine.arguments[2], CommandLine.arguments[3]), itemId: itemId))
         }
         if CommandLine.arguments.dropFirst().first?.hasPrefix("--approval-key-") == true {
             exit(ApprovalKeyCommand.run(Array(CommandLine.arguments.dropFirst())))

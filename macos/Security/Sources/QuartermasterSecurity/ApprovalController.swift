@@ -15,7 +15,10 @@ import LocalAuthentication
 }
 
 @MainActor private final class TouchIDAuthentication: ApprovalAuthentication {
-    enum Failure: Error { case unavailable, rejected(Int) }
+    enum Failure: Error {
+        case unavailable
+        case rejected(Int)
+    }
     let context: LAContext
 
     init() {
@@ -27,12 +30,17 @@ import LocalAuthentication
     func authenticate(reason: String) async throws -> MonotonicTimestamp {
         var error: NSError?
         guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error),
-              context.biometryType == .touchID else { throw Failure.unavailable }
+            context.biometryType == .touchID
+        else { throw Failure.unavailable }
         return try await withCheckedThrowingContinuation { continuation in
-            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, error in
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) {
+                success, error in
                 let authenticated = MonotonicTimestamp.now
-                if success { continuation.resume(returning: authenticated) }
-                else { continuation.resume(throwing: Failure.rejected(error?._code ?? 0)) }
+                if success {
+                    continuation.resume(returning: authenticated)
+                } else {
+                    continuation.resume(throwing: Failure.rejected(error?._code ?? 0))
+                }
             }
         }
     }
@@ -54,12 +62,15 @@ import LocalAuthentication
     private var timeout: Task<Void, Never>?
 
     public convenience init(backend: any ApprovalBackend, reason: String) {
-        self.init(backend: backend, reason: reason, authentication: TouchIDAuthentication(),
-                  keys: ApprovalKeyStore(), now: { .now })
+        self.init(
+            backend: backend, reason: reason, authentication: TouchIDAuthentication(),
+            keys: ApprovalKeyStore(), now: { .now })
     }
 
-    init(backend: any ApprovalBackend, reason: String, authentication: any ApprovalAuthentication,
-         keys: ApprovalKeyStore, now: @escaping () -> MonotonicTimestamp) {
+    init(
+        backend: any ApprovalBackend, reason: String, authentication: any ApprovalAuthentication,
+        keys: ApprovalKeyStore, now: @escaping () -> MonotonicTimestamp
+    ) {
         self.backend = backend
         self.reason = reason
         self.authentication = authentication
@@ -110,7 +121,8 @@ import LocalAuthentication
 
     private func checkTiming(requested: MonotonicTimestamp, authenticated: MonotonicTimestamp) throws {
         guard !requested.isZero, authenticated >= requested,
-              try authenticated.duration(since: requested) < .seconds(120),
-              try now().duration(since: authenticated) < .seconds(30) else { throw Failure.invalidAuthentication }
+            try authenticated.duration(since: requested) < .seconds(120),
+            try now().duration(since: authenticated) < .seconds(30)
+        else { throw Failure.invalidAuthentication }
     }
 }

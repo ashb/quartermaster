@@ -127,10 +127,10 @@ pub(crate) fn serve(replies: Vec<Reply>) -> (SocketAddr, Server) {
                 .with_no_client_auth()
                 .with_single_cert(
                     vec![CertificateDer::from(
-                        include_bytes!("../fixtures/tls/dummy-cert.der").to_vec(),
+                        include_bytes!("../../../tests/fixtures/tls/dummy-cert.der").to_vec(),
                     )],
                     PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                        include_bytes!("../fixtures/tls/dummy-key.der").to_vec(),
+                        include_bytes!("../../../tests/fixtures/tls/dummy-key.der").to_vec(),
                     )),
                 )
                 .unwrap();

@@ -1,33 +1,5 @@
-use serde::{Deserialize, Serialize};
-use std::{io, mem::MaybeUninit, time::Duration};
-
-/// A CLOCK_MONOTONIC_RAW sample shared by authenticated same-boot macOS peers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(from = "u64", into = "u64")]
-pub struct MonotonicTimestamp(Duration);
-
-impl From<u64> for MonotonicTimestamp {
-    fn from(nanoseconds: u64) -> Self {
-        Self(Duration::from_nanos(nanoseconds))
-    }
-}
-
-impl From<MonotonicTimestamp> for u64 {
-    fn from(sample: MonotonicTimestamp) -> Self {
-        sample.0.as_nanos().try_into().unwrap()
-    }
-}
-
-impl MonotonicTimestamp {
-    pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
-        self.0.checked_sub(earlier.0)
-    }
-
-    pub fn checked_add(self, duration: Duration) -> Option<Self> {
-        let duration: u64 = duration.as_nanos().try_into().ok()?;
-        u64::from(self).checked_add(duration).map(Self::from)
-    }
-}
+pub use qm_types::MonotonicTimestamp;
+use std::{io, mem::MaybeUninit};
 
 /// Matches the Swift authentication callback's clock; std::time::Instant is opaque across IPC.
 pub fn monotonic_raw() -> io::Result<MonotonicTimestamp> {
@@ -46,5 +18,29 @@ pub fn monotonic_raw() -> io::Result<MonotonicTimestamp> {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/presence_clock.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn monotonic_timestamps_roundtrip_as_the_original_nanosecond_wire_values() {
+        let sample: MonotonicTimestamp = serde_json::from_str("120000000001").unwrap();
+
+        assert_eq!(serde_json::to_string(&sample).unwrap(), "120000000001");
+        let earlier: MonotonicTimestamp = serde_json::from_str("100000000000").unwrap();
+        assert_eq!(
+            sample.checked_duration_since(earlier),
+            Some(Duration::new(20, 1))
+        );
+        assert_eq!(earlier.checked_duration_since(sample), None);
+    }
+
+    #[test]
+    fn monotonic_timestamp_deadlines_reject_wire_range_overflow() {
+        let sample: MonotonicTimestamp = serde_json::from_str("18446744073709551615").unwrap();
+
+        assert!(sample.checked_add(Duration::from_nanos(1)).is_none());
+        assert!(serde_json::from_str::<MonotonicTimestamp>("-1").is_err());
+        assert!(serde_json::from_str::<MonotonicTimestamp>("0.5").is_err());
+    }
+}

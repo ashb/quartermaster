@@ -1,10 +1,9 @@
 use super::{
     dispatch::{self, Acquisition, PreparedGitHubRequest, PreparedSimulationRequest},
-    github::repository::{PreparedMetadata, RepositoryBinding, RepositoryLookup},
+    github::repository::{PreparedMetadata, RepositoryBinding},
     identity::VerifiedPrincipal,
     operation::{OperationId, OperationRegistry},
-    policy::{AuthorizationError, Authorizer},
-    request::Action,
+    policy::Authorizer,
 };
 use qm_providers::VaultSnapshot;
 use std::time::Instant;
@@ -67,25 +66,7 @@ pub(super) fn prepare_metadata(
     snapshot: &VaultSnapshot,
     now: Instant,
 ) -> Result<PreparedMetadata, dispatch::Error> {
-    let input = acquisition(registry, id, principal, authorizer, snapshot, now)?;
-    if !matches!(
-        input.operation.request().action(),
-        Action::ListIssues | Action::ReadIssue
-    ) {
-        return Err(dispatch::Error::Authorization(AuthorizationError::Denied));
-    }
-    authorizer
-        .check_acquisition(input.operation, principal, input.selection, now)
-        .map_err(dispatch::Error::Authorization)?;
-    let config = authorizer
-        .github_configuration()
-        .ok_or(dispatch::Error::Unavailable)?;
-    let lookup = RepositoryLookup::new(
-        config,
-        input.operation.request(),
-        input.selection.clone(),
-        authorizer.policy_generation(),
-    )
-    .map_err(|_| dispatch::Error::Unavailable)?;
-    PreparedMetadata::new(id, lookup, snapshot)
+    PreparedMetadata::acquire(acquisition(
+        registry, id, principal, authorizer, snapshot, now,
+    )?)
 }

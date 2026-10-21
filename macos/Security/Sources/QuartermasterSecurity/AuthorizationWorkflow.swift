@@ -30,8 +30,10 @@ public struct ApprovalChallenge: Codable, Sendable {
     public let expires: MonotonicTimestamp
     public let bytes: Data
 
-    public init(review: ApprovalReview, credentialDigest: Data, authenticated: MonotonicTimestamp,
-                expires: MonotonicTimestamp, bytes: Data) {
+    public init(
+        review: ApprovalReview, credentialDigest: Data, authenticated: MonotonicTimestamp,
+        expires: MonotonicTimestamp, bytes: Data
+    ) {
         self.review = review
         self.credentialDigest = credentialDigest
         self.authenticated = authenticated
@@ -42,7 +44,12 @@ public struct ApprovalChallenge: Codable, Sendable {
 
 public struct AuthorizationWorkflow: Sendable {
     public enum Failure: Error { case invalidReview, invalidState, invalidAuthentication, invalidChallenge, expired }
-    private enum Phase: Sendable { case review, authenticated(MonotonicTimestamp), validated(MonotonicTimestamp), canceled }
+    private enum Phase: Sendable {
+        case review
+        case authenticated(MonotonicTimestamp)
+        case validated(MonotonicTimestamp)
+        case canceled
+    }
     private let review: ApprovalReview
     private var phase: Phase = .review
 
@@ -53,19 +60,21 @@ public struct AuthorizationWorkflow: Sendable {
             let created: MonotonicTimestamp
         }
         guard review.id.count == 32, review.id.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
-              !review.created.isZero, let age = try? now.duration(since: review.created), age < .seconds(120),
-              review.session.count == 16, review.policy.count == 32, review.nonce.count == 32,
-              review.nonce.contains(where: { $0 != 0 }), review.request.count <= 12000,
-              Data(SHA256.hash(data: review.request)) == review.requestDigest,
-              review.provider.field == "LoginPassword", !review.provider.server.isEmpty,
-              !review.provider.account.isEmpty, !review.provider.email.isEmpty,
-              !review.provider.item.isEmpty, !review.provider.role.isEmpty,
-              review.provider.enrollment.count == 32,
-              review.provider.enrollment.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            !review.created.isZero, let age = try? now.duration(since: review.created), age < .seconds(120),
+            review.session.count == 16, review.policy.count == 32, review.nonce.count == 32,
+            review.nonce.contains(where: { $0 != 0 }), review.request.count <= 12000,
+            Data(SHA256.hash(data: review.request)) == review.requestDigest,
+            review.provider.field == "LoginPassword", !review.provider.server.isEmpty,
+            !review.provider.account.isEmpty, !review.provider.email.isEmpty,
+            !review.provider.item.isEmpty, !review.provider.role.isEmpty,
+            review.provider.enrollment.count == 32,
+            review.provider.enrollment.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) })
+        else {
             throw Failure.invalidReview
         }
         guard let claims = try? JSONDecoder().decode(RequestClaims.self, from: review.request),
-              claims.provider == review.provider, claims.operationId == review.id, claims.created == review.created else {
+            claims.provider == review.provider, claims.operationId == review.id, claims.created == review.created
+        else {
             throw Failure.invalidReview
         }
         self.review = review
@@ -74,7 +83,8 @@ public struct AuthorizationWorkflow: Sendable {
     public mutating func recordAuthentication(at authenticated: MonotonicTimestamp, now: MonotonicTimestamp) throws {
         guard case .review = phase else { throw Failure.invalidState }
         guard let pending = try? authenticated.duration(since: review.created), pending < .seconds(120),
-              let age = try? now.duration(since: authenticated), age < .seconds(30) else { throw Failure.invalidAuthentication }
+            let age = try? now.duration(since: authenticated), age < .seconds(30)
+        else { throw Failure.invalidAuthentication }
         phase = .authenticated(authenticated)
     }
 
@@ -82,8 +92,9 @@ public struct AuthorizationWorkflow: Sendable {
         guard case .authenticated(let authenticated) = phase else { throw Failure.invalidState }
         try checkDeadline(authenticated, now: now)
         guard challenge.review == review, challenge.authenticated == authenticated,
-              challenge.expires == (try authenticated.advanced(by: .seconds(30))),
-              challenge.credentialDigest.count == 32, challenge.credentialDigest.contains(where: { $0 != 0 }) else {
+            challenge.expires == (try authenticated.advanced(by: .seconds(30))),
+            challenge.credentialDigest.count == 32, challenge.credentialDigest.contains(where: { $0 != 0 })
+        else {
             throw Failure.invalidChallenge
         }
         let (seconds, attoseconds) = try authenticated.duration(since: review.created).components
@@ -91,7 +102,8 @@ public struct AuthorizationWorkflow: Sendable {
         var bigEndian = nanoseconds.bigEndian
         var offset = Data(repeating: 0, count: 8)
         withUnsafeBytes(of: &bigEndian) { offset.append(contentsOf: $0) }
-        let expected = Data("quartermaster.credential-approval.v1\0allow-once\0".utf8)
+        let expected =
+            Data("quartermaster.credential-approval.v1\0allow-once\0".utf8)
             + review.session + review.policy + review.requestDigest + challenge.credentialDigest + review.nonce + offset
         guard challenge.bytes == expected else { throw Failure.invalidChallenge }
         phase = .validated(authenticated)

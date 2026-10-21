@@ -9,9 +9,10 @@ mod kdf;
 mod vault;
 
 pub use approval::{
-    ApprovalSession, ApprovedRequest, PendingApproval, PendingIntent, RequestBinding,
+    ApprovalSession, ApprovedRequest, AuthenticatedIntent, PendingApproval, PendingIntent,
+    RequestBinding,
 };
-pub use credential::{ApprovedCredentialData, EncryptedCredential, VaultKeys};
+pub use credential::EncryptedCredential;
 pub use kdf::{KdfAlgorithm, KdfLimits, KdfParameters, ValidatedKdfParameters, VaultIdentity};
 pub use vault::{
     CacheError, CredentialField, EnrollmentPhase, ProviderBinding, ProviderError, RbwProvider,

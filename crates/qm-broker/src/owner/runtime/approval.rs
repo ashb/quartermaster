@@ -3,6 +3,7 @@ use crate::owner::{
     dispatch::CredentialSelection,
     identity::VerifiedPrincipal,
     operation::OperationId,
+    protocol::{ApprovalChallenge, ApprovalReview, Reply},
     provider_lifecycle::{CacheIdentity, ProviderGeneration},
 };
 use crate::platform::macos::ipc::{self, ConnectionId};
@@ -14,7 +15,6 @@ use qm_macos::{
 use qm_providers::ApprovalSession;
 use ring::digest::{SHA256, digest};
 use serde::Serialize;
-use serde_json::{Value, json};
 use std::{
     io,
     process::Command,
@@ -37,18 +37,7 @@ pub(super) struct ApprovalDelivery {
     pub(super) completion: mpsc::SyncSender<ApprovalCompletion>,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct ProviderPresentation {
-    pub(super) server: String,
-    pub(super) account: String,
-    pub(super) email: String,
-    pub(super) item: String,
-    pub(super) field: &'static str,
-    pub(super) role: String,
-    pub(super) enrollment: String,
-    pub(super) generation: u64,
-}
+pub(super) use crate::owner::protocol::ProviderPresentation;
 
 impl ProviderPresentation {
     pub(super) fn new(identity: &CacheIdentity, generation: ProviderGeneration) -> Self {
@@ -58,7 +47,7 @@ impl ProviderPresentation {
             account: binding.account_id().into(),
             email: binding.email().into(),
             item: binding.item_id().into(),
-            field: "LoginPassword",
+            field: "LoginPassword".into(),
             role: binding.role().into(),
             enrollment: identity.scope.clone(),
             generation: generation.value(),
@@ -76,19 +65,6 @@ pub(super) struct ReviewContext {
     pub(super) process_chain: Vec<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct ApprovalReview<'a> {
-    pub(super) id: String,
-    pub(super) created: MonotonicTimestamp,
-    pub(super) session: String,
-    pub(super) policy: String,
-    pub(super) nonce: String,
-    pub(super) request: String,
-    pub(super) request_digest: String,
-    pub(super) provider: &'a ProviderPresentation,
-}
-
 impl ApprovalDelivery {
     pub(super) fn created(&self) -> MonotonicTimestamp {
         self.request.context().created
@@ -99,7 +75,7 @@ impl ApprovalDelivery {
         ui: &UiSession,
         policy: [u8; 32],
         nonce: [u8; 32],
-    ) -> ApprovalReview<'_> {
+    ) -> ApprovalReview {
         ApprovalReview {
             id: self.id.to_string(),
             created: self.created(),
@@ -108,7 +84,7 @@ impl ApprovalDelivery {
             nonce: BASE64.encode(nonce),
             request: BASE64.encode(self.request.bytes()),
             request_digest: BASE64.encode(digest(&SHA256, self.request.bytes())),
-            provider: &self.request.context().provider,
+            provider: self.request.context().provider.clone(),
         }
     }
 }
@@ -263,7 +239,7 @@ pub(super) fn complete_native_presence(
     id: OperationId,
     state: &mut OwnerState,
     paths: &ServicePaths,
-) -> io::Result<Value> {
+) -> io::Result<Reply> {
     state.refresh_policy(paths)?;
     let pending = state
         .pending
@@ -312,10 +288,15 @@ pub(super) fn complete_native_presence(
     let expires = authenticated
         .checked_add(Duration::from_secs(30))
         .ok_or_else(|| failure("invalid clock"))?;
-    Ok(json!({"kind": "challenge", "authorization": {
-        "review": pending.review(ui, policy, nonce), "credentialDigest": BASE64.encode(challenge.credential_digest),
-        "authenticated": authenticated, "expires": expires, "bytes": BASE64.encode(challenge.bytes)
-    }}))
+    Ok(Reply::Challenge {
+        authorization: ApprovalChallenge {
+            review: pending.review(ui, policy, nonce),
+            credential_digest: BASE64.encode(challenge.credential_digest),
+            authenticated,
+            expires,
+            bytes: BASE64.encode(challenge.bytes),
+        },
+    })
 }
 
 pub(super) fn native_presence(
@@ -325,7 +306,7 @@ pub(super) fn native_presence(
     connection: &ipc::Connection<'_>,
     shared: &Shared,
     paths: &ServicePaths,
-) -> io::Result<Value> {
+) -> io::Result<Reply> {
     let id = checked(OperationId::parse(id))?;
     let deadline = authenticated
         .checked_add(Duration::from_secs(30))

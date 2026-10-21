@@ -1,4 +1,5 @@
-use super::{ServicePaths, Shared, control::Client, failure};
+use super::{ServicePaths, Shared, failure};
+use crate::owner::protocol::Client;
 use crate::{
     owner::vault::{self, Source},
     platform::macos::ipc,

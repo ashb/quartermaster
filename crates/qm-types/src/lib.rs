@@ -19,3 +19,6 @@ pub enum CredentialError {
     StateUnavailable,
     RandomnessUnavailable,
 }
+
+mod timestamp;
+pub use timestamp::MonotonicTimestamp;

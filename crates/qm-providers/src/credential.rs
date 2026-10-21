@@ -1,11 +1,6 @@
-use crate::approval::Authority;
-use crate::{ApprovalSession, ApprovedRequest, RequestBinding};
 use qm_types::CredentialError;
 use rbw::cipherstring::CipherString;
 use ring::digest::{SHA256, digest};
-use std::sync::Arc;
-use std::time::Instant;
-use zeroize::Zeroizing;
 
 /// Structurally validated ciphertext; authentication happens during decryption.
 pub struct EncryptedCredential {
@@ -77,83 +72,25 @@ impl EncryptedCredential {
     }
 }
 
-pub struct VaultKeys {
-    keys: rbw::locked::Keys,
-    authority: Arc<Authority>,
-}
-
-impl VaultKeys {
-    pub fn restore(session: &ApprovalSession, bytes: &[u8]) -> Result<Self, CredentialError> {
-        if bytes.len() != 64 {
-            return Err(CredentialError::InvalidKeyLength);
-        }
-        let mut locked = rbw::locked::Vec::new();
-        locked.extend(bytes.iter().copied());
-        Ok(Self {
-            keys: rbw::locked::Keys::new(locked),
-            authority: session.authority(),
-        })
-    }
-
-    pub fn decrypt(
-        &self,
-        approval: ApprovedRequest,
-        encrypted: &EncryptedCredential,
-    ) -> Result<ApprovedCredentialData, CredentialError> {
-        approval.check()?;
-        if !approval.belongs_to(&self.authority)
-            || approval.binding().credential_digest != encrypted.digest
-        {
-            return Err(CredentialError::BindingMismatch);
-        }
-        let plaintext = Zeroizing::new(
-            encrypted
-                .cipher
-                .decrypt_symmetric(&self.keys, None)
-                .map_err(|_| CredentialError::DecryptionFailed)?,
-        );
-        Ok(ApprovedCredentialData {
-            approval,
-            plaintext,
-        })
-    }
-}
-
-/// Plaintext is private, zeroized on drop, and accessible only through consuming
-/// dispatch. Dispatch is the revocation admission point; a later revocation cannot
-/// retract a request already admitted to the trusted sink.
-///
-/// ```compile_fail
-/// fn send_twice(data: qm_providers::ApprovedCredentialData) {
-///     data.dispatch(|_, _| ()).unwrap();
-///     data.dispatch(|_, _| ()).unwrap();
-/// }
-/// ```
-pub struct ApprovedCredentialData {
-    approval: ApprovedRequest,
-    plaintext: Zeroizing<Vec<u8>>,
-}
-
-impl ApprovedCredentialData {
-    /// The trusted sink must dispatch the bound request to its verified recipient.
-    /// Rust cannot prevent that sink from copying or leaking the supplied bytes.
-    pub fn dispatch<R>(
-        self,
-        send: impl FnOnce(&RequestBinding, &[u8]) -> R,
-    ) -> Result<R, CredentialError> {
-        self.dispatch_at(Instant::now, send)
-    }
-
-    fn dispatch_at<R>(
-        self,
-        clock: impl FnOnce() -> Instant,
-        send: impl FnOnce(&RequestBinding, &[u8]) -> R,
-    ) -> Result<R, CredentialError> {
-        self.approval.check_at(clock)?;
-        Ok(send(self.approval.binding(), &self.plaintext))
-    }
-}
-
 #[cfg(test)]
-#[path = "../tests/unit/credential.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    const CIPHER: &str = include_str!("../tests/fixtures/dummy.type2");
+
+    #[test]
+    fn malformed_ciphertexts_and_missing_macs_are_rejected_before_decryption() {
+        for input in ["", "!.bad", "2.bad", "7.bad", "4.AAAA", "2.!!!|!!!|!!!"] {
+            assert!(EncryptedCredential::parse(input).is_err());
+        }
+        assert!(matches!(
+            EncryptedCredential::parse(&"2".repeat(8193)),
+            Err(CredentialError::InvalidCiphertext)
+        ));
+        let without_mac = CIPHER.trim().rsplit_once('|').unwrap().0;
+        assert!(matches!(
+            EncryptedCredential::parse(without_mac),
+            Err(CredentialError::UnauthenticatedCiphertext)
+        ));
+    }
+}

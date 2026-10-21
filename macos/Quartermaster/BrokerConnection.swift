@@ -1,11 +1,11 @@
 import CryptoKit
 import Darwin
 import Foundation
-import QuartermasterSecurity
+import LocalAuthentication
 import QuartermasterIPC
+import QuartermasterSecurity
 import Security
 import Synchronization
-import LocalAuthentication
 
 struct BrokerMessage: Encodable, Sendable {
     let kind: String
@@ -59,7 +59,8 @@ final class BrokerConnection: @unchecked Sendable {
     var disconnected: Bool { state.lost.withLock { $0 } }
 
     static var executable: URL {
-        Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/QuartermasterBackend.app/Contents/MacOS/quartermasterd")
+        Bundle.main.bundleURL.appendingPathComponent(
+            "Contents/Helpers/QuartermasterBackend.app/Contents/MacOS/quartermasterd")
     }
 
     static func requirement(for path: URL) throws -> String {
@@ -68,14 +69,20 @@ final class BrokerConnection: @unchecked Sendable {
             throw BrokerFailure.invalidCode
         }
         var information: CFDictionary?
-        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
-              let information = information as? [String: Any],
-              let hash = information[kSecCodeInfoUnique as String] as? Data,
-              [20, 32].contains(hash.count) else { throw BrokerFailure.invalidCode }
+        guard
+            SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information)
+                == errSecSuccess,
+            let information = information as? [String: Any],
+            let hash = information[kSecCodeInfoUnique as String] as? Data,
+            [20, 32].contains(hash.count)
+        else { throw BrokerFailure.invalidCode }
         let text = "cdhash H\"" + hash.map { String(format: "%02x", $0) }.joined() + "\""
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(text as CFString, SecCSFlags(), &requirement) == errSecSuccess,
-              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate | SecCSFlags.noNetworkAccess.rawValue), requirement) == errSecSuccess else {
+            SecStaticCodeCheckValidity(
+                code, SecCSFlags(rawValue: kSecCSStrictValidate | SecCSFlags.noNetworkAccess.rawValue), requirement)
+                == errSecSuccess
+        else {
             throw BrokerFailure.invalidCode
         }
         return text
@@ -92,7 +99,10 @@ final class BrokerConnection: @unchecked Sendable {
         connection.resume()
     }
 
-    func cancel() { state.lost.withLock { $0 = true }; connection.invalidate() }
+    func cancel() {
+        state.lost.withLock { $0 = true }
+        connection.invalidate()
+    }
     deinit { connection.invalidate() }
 
     @MainActor
@@ -101,26 +111,41 @@ final class BrokerConnection: @unchecked Sendable {
         guard bytes.count <= 16384, !disconnected else { throw BrokerFailure.disconnected }
         return try await withCheckedThrowingContinuation { continuation in
             let completion = Mutex<CheckedContinuation<BrokerReply, any Error>?>(continuation)
-            let timeout: Double = fields.kind.hasPrefix("vault") && fields.kind != "vaultStatus" ? 120 : (context == nil ? 5 : 30)
+            let timeout: Double =
+                fields.kind.hasPrefix("vault") && fields.kind != "vaultStatus" ? 120 : (context == nil ? 5 : 30)
             queue.asyncAfter(deadline: .now() + timeout) { [self] in
-                if let pending = completion.withLock({ value in defer { value = nil }; return value }) {
+                if let pending = completion.withLock({ value in
+                    defer { value = nil }
+                    return value
+                }) {
                     cancel()
                     pending.resume(throwing: BrokerFailure.timeout)
                 }
             }
             let remote = connection.remoteObjectProxyWithErrorHandler { _ in
-                if let pending = completion.withLock({ value in defer { value = nil }; return value }) {
+                if let pending = completion.withLock({ value in
+                    defer { value = nil }
+                    return value
+                }) {
                     pending.resume(throwing: BrokerFailure.disconnected)
                 }
             }
             guard let remote = remote as? QuartermasterContextProtocol else {
-                if let pending = completion.withLock({ value in defer { value = nil }; return value }) {
+                if let pending = completion.withLock({ value in
+                    defer { value = nil }
+                    return value
+                }) {
                     pending.resume(throwing: BrokerFailure.invalidMessage)
                 }
                 return
             }
             let receive: @Sendable (Data) -> Void = { data in
-                guard let pending = completion.withLock({ value in defer { value = nil }; return value }) else { return }
+                guard
+                    let pending = completion.withLock({ value in
+                        defer { value = nil }
+                        return value
+                    })
+                else { return }
                 do {
                     guard data.count <= 16384 else { throw BrokerFailure.invalidMessage }
                     let decoder = JSONDecoder()
@@ -130,8 +155,11 @@ final class BrokerConnection: @unchecked Sendable {
                     pending.resume(returning: reply)
                 } catch { pending.resume(throwing: error) }
             }
-            if let context { remote.authenticate(bytes, context: context, reply: receive) }
-            else { remote.send(bytes, reply: receive) }
+            if let context {
+                remote.authenticate(bytes, context: context, reply: receive)
+            } else {
+                remote.send(bytes, reply: receive)
+            }
         }
     }
 
@@ -152,12 +180,16 @@ final class BrokerPending: ApprovalBackend {
         let id = review.id
         let bytes = review.request
         let request = try JSONDecoder().decode(DialogRequest.self, from: bytes)
-        let readGrant = try ReadGrantReview.parse(request: bytes, role: review.provider.role, uid: geteuid(), now: Date())
-        guard request.peer != nil, !request.processChain.isEmpty, request.processChain.count <= 6 else { throw BrokerFailure.invalidMessage }
+        let readGrant = try ReadGrantReview.parse(
+            request: bytes, role: review.provider.role, uid: geteuid(), now: Date())
+        guard request.peer != nil, !request.processChain.isEmpty, request.processChain.count <= 6 else {
+            throw BrokerFailure.invalidMessage
+        }
         if readGrant == nil {
             guard request.repository == "quartermaster/demo", request.issue == 42, request.method == "PATCH",
-              request.path == "/api/v3/repos/quartermaster/demo/issues/42", request.body == "{\"state\":\"closed\"}",
-              request.origin == "https://github.example.invalid" else { throw BrokerFailure.invalidMessage }
+                request.path == "/api/v3/repos/quartermaster/demo/issues/42", request.body == "{\"state\":\"closed\"}",
+                request.origin == "https://github.example.invalid"
+            else { throw BrokerFailure.invalidMessage }
         }
         self.client = client
         self.id = id
@@ -168,8 +200,11 @@ final class BrokerPending: ApprovalBackend {
 
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {
         try workflow.recordAuthentication(at: authenticated, now: .now)
-        let reply = try await client.call(BrokerMessage(kind: "presence", id: id, authenticated: authenticated), context: context)
-        guard reply.kind == "challenge", let authorization = reply.authorization else { throw BrokerFailure.invalidMessage }
+        let reply = try await client.call(
+            BrokerMessage(kind: "presence", id: id, authenticated: authenticated), context: context)
+        guard reply.kind == "challenge", let authorization = reply.authorization else {
+            throw BrokerFailure.invalidMessage
+        }
         return try workflow.validate(authorization, now: .now)
     }
 

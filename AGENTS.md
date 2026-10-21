@@ -26,12 +26,16 @@ probe does not establish the corresponding integration or release behaviour.
 
 ## Builds and tests
 
-- Use the existing `Justfile`: `just test` runs Rust and Swift tests; `just check`
-  also checks formatting and Clippy. Inspect recipes before running interactive
-  commands.
+- Use `just test` for Rust and Swift tests and `prek run --all-files` for Rust
+  formatting, Clippy and Swift formatting. `just check` runs both. Keep hook
+  definitions in native `prek.toml` configs, with Swift hooks under `macos/`.
+  Inspect recipes before running interactive commands.
 - Test substantive, reusable authorization, parsing, cryptographic and lifecycle
   behaviour with native Rust tests and Swift Testing. Do not commit tests for
   experimental probes or build orchestration.
+- Keep Rust unit tests in inline `#[cfg(test)]` modules alongside their
+  implementation. Reserve crate `tests/` directories for integration tests and
+  fixtures; use normal modules under `src/` for shared unit-test helpers.
 - Record hardware and live-provider qualification separately from automated
   fixture tests. Skipped tests and mocked authentication do not qualify OS
   behaviour.

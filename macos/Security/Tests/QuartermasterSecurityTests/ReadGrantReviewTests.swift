@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+
 @testable import QuartermasterSecurity
 
 private func grantRequest(changing change: (inout [String: Any]) -> Void = { _ in }) throws -> Data {
@@ -7,30 +8,38 @@ private func grantRequest(changing change: (inout [String: Any]) -> Void = { _ i
         "method": "GET", "path": "/repos/example/one/issues", "body": "",
         "repository": "example/one", "repositoryId": 123, "origin": "https://api.github.com",
         "peer": ["cdHash": String(repeating: "1", count: 40)],
-        "authorization": ["purpose": "quartermaster.issue-read-grant.v1", "grant": [
-            "id": String(repeating: "a", count: 32), "uid": 501,
-            "codeHash": String(repeating: "1", count: 40), "action": "issueReads",
-            "repository": "example/one", "role": "github-write", "expiresUnix": 4600, "budget": 100,
-        ]],
+        "authorization": [
+            "purpose": "quartermaster.issue-read-grant.v1",
+            "grant": [
+                "id": String(repeating: "a", count: 32), "uid": 501,
+                "codeHash": String(repeating: "1", count: 40), "action": "issueReads",
+                "repository": "example/one", "role": "github-write", "expiresUnix": 4600, "budget": 100,
+            ],
+        ],
     ]
     change(&request)
     return try JSONSerialization.data(withJSONObject: request)
 }
 
 @Test func readGrantReviewDescribesTheCompletePermission() throws {
-    let grant = try ReadGrantReview(request: grantRequest(), role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
+    let grant = try ReadGrantReview(
+        request: grantRequest(), role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
     #expect(grant.repository == "example/one")
     #expect(grant.repositoryID == 123)
     #expect(grant.budget == 100)
     #expect(grant.expires == Date(timeIntervalSince1970: 4600))
-    #expect(grant.principalScope == "All instances of this executable running as your macOS user share this request budget.")
+    #expect(
+        grant.principalScope == "All instances of this executable running as your macOS user share this request budget."
+    )
     #expect(!grant.isSimulation)
 }
 
 @Test func simulationReadGrantHasAnExplicitlySeparateDestination() throws {
-    let url = try #require(Bundle.module.url(forResource: "simulation-read-grant", withExtension: "json", subdirectory: "Fixtures"))
+    let url = try #require(
+        Bundle.module.url(forResource: "simulation-read-grant", withExtension: "json", subdirectory: "Fixtures"))
     let bytes = try Data(contentsOf: url)
-    let grant = try ReadGrantReview(request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
+    let grant = try ReadGrantReview(
+        request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
     #expect(grant.isSimulation)
     #expect(grant.repositoryID == nil)
 }
@@ -49,9 +58,13 @@ func simulationGrantRejectsAnythingOutsideTheFixedDummyRead(_ field: String) thr
         if field == "repository" {
             request[field] = "example/one"
             grant[field] = "example/one"
-        } else if field == "path" { request[field] = "/repos/quartermaster/demo/issues/42" }
-        else if field == "issue" { request[field] = 43 }
-        else { request[field] = 123 }
+        } else if field == "path" {
+            request[field] = "/repos/quartermaster/demo/issues/42"
+        } else if field == "issue" {
+            request[field] = 43
+        } else {
+            request[field] = 123
+        }
         authorization["grant"] = grant
         request["authorization"] = authorization
     }
@@ -60,7 +73,10 @@ func simulationGrantRejectsAnythingOutsideTheFixedDummyRead(_ field: String) thr
     }
 }
 
-@Test(arguments: ["purpose", "action", "repository", "role", "codeHash", "uid", "budget", "expiresUnix", "method", "origin", "path", "repositoryId"])
+@Test(arguments: [
+    "purpose", "action", "repository", "role", "codeHash", "uid", "budget", "expiresUnix", "method", "origin", "path",
+    "repositoryId",
+])
 func readGrantReviewRejectsMisrepresentedOrUnboundedPermissions(_ field: String) throws {
     let bytes = try grantRequest { request in
         var authorization = request["authorization"] as! [String: Any]

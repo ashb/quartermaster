@@ -35,7 +35,7 @@ pub(crate) fn snapshot_at(
         "kdf": {"algorithm":"Pbkdf2", "iterations":1, "memory_mib":null, "parallelism":null}
     }))
     .unwrap();
-    let cipher = include_str!("../../../qm-providers/tests/fixtures/dummy.type2").trim();
+    let cipher = include_str!("../../../../qm-providers/tests/fixtures/dummy.type2").trim();
     let mut payload = serde_json::to_vec(&json!({
         "cipher": cipher, "selected_key": (0..64).collect::<Vec<u8>>(),
         "vault_key": (0..64).collect::<Vec<u8>>(), "protected_key": cipher,
