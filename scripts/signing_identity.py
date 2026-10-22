@@ -61,12 +61,12 @@ def resolve_development_identity(repository: Path, team: str | None = None) -> S
     return SigningIdentity(selected_team, fingerprint.upper(), sha1)
 
 
-def verify_bundle_certificate(bundle: Path, certificate_sha256: str, repository: Path) -> None:
+def verify_bundle_certificate(bundle: Path, certificate_sha256: str) -> None:
     subprocess.run(
         ["/usr/bin/codesign", "--verify", "--strict", str(bundle)],
         capture_output=True, text=True, check=True, timeout=15,
     )
-    with tempfile.TemporaryDirectory(prefix="signing-certificate-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="qm-signing-certificate-") as temporary:
         prefix = Path(temporary) / "certificate"
         subprocess.run(
             ["/usr/bin/codesign", "--display", f"--extract-certificates={prefix}", str(bundle)],
@@ -95,7 +95,7 @@ def main() -> None:
             if re.fullmatch(r"[A-Fa-f0-9]{64}", fingerprint) is None:
                 raise ValueError("Expected certificate SHA-256 must contain 64 hexadecimal characters")
             for bundle in arguments.bundles:
-                verify_bundle_certificate(bundle, fingerprint.upper(), repository)
+                verify_bundle_certificate(bundle, fingerprint.upper())
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         parser.exit(1, f"{error}\n")
 

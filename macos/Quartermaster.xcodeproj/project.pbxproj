@@ -28,7 +28,7 @@
             productRefGroup = A00000000000000000000003;
             projectDirPath = "";
             projectRoot = "";
-            packageReferences = (A00000000000000000000060);
+            packageReferences = (A00000000000000000000060, A00000000000000000000064);
             targets = (A00000000000000000000010, A00000000000000000000011);
         };
         A00000000000000000000002 = {
@@ -78,7 +78,7 @@
         A0000000000000000000000B = {
             isa = PBXFileReference;
             lastKnownFileType = sourcecode.swift;
-            path = Quartermaster/ApprovalDialog.swift;
+            path = ApprovalUI/ApprovalDialog.swift;
             sourceTree = "<group>";
         };
         A00000000000000000000008 = {
@@ -95,7 +95,7 @@
             buildRules = ();
             dependencies = (A00000000000000000000031);
             name = Quartermaster;
-            packageProductDependencies = (A00000000000000000000061);
+            packageProductDependencies = (A00000000000000000000061, A00000000000000000000065);
             productName = Quartermaster;
             productReference = A00000000000000000000007;
             productType = "com.apple.product-type.application";
@@ -114,7 +114,7 @@
         A00000000000000000000020 = {
             isa = PBXSourcesBuildPhase;
             buildActionMask = 2147483647;
-            files = (A00000000000000000000023, A00000000000000000000027, A0000000000000000000002A, A0000000000000000000002B);
+            files = (A00000000000000000000023, A0000000000000000000002A, A0000000000000000000002B);
             runOnlyForDeploymentPostprocessing = 0;
         };
         A00000000000000000000021 = {
@@ -146,10 +146,6 @@
             isa = PBXBuildFile;
             fileRef = A00000000000000000000008;
             settings = { ATTRIBUTES = (CodeSignOnCopy); };
-        };
-        A00000000000000000000027 = {
-            isa = PBXBuildFile;
-            fileRef = A0000000000000000000000B;
         };
         A00000000000000000000028 = {
             isa = PBXShellScriptBuildPhase;
@@ -225,12 +221,25 @@
         A00000000000000000000062 = {
             isa = PBXFrameworksBuildPhase;
             buildActionMask = 2147483647;
-            files = (A00000000000000000000063);
+            files = (A00000000000000000000063, A00000000000000000000066);
             runOnlyForDeploymentPostprocessing = 0;
         };
         A00000000000000000000063 = {
             isa = PBXBuildFile;
             productRef = A00000000000000000000061;
+        };
+        A00000000000000000000064 = {
+            isa = XCLocalSwiftPackageReference;
+            relativePath = .;
+        };
+        A00000000000000000000065 = {
+            isa = XCSwiftPackageProductDependency;
+            package = A00000000000000000000064;
+            productName = QuartermasterApprovalUI;
+        };
+        A00000000000000000000066 = {
+            isa = PBXBuildFile;
+            productRef = A00000000000000000000065;
         };
         A00000000000000000000041 = {
             isa = XCConfigurationList;

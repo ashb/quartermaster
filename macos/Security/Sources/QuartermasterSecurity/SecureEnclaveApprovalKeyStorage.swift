@@ -4,8 +4,24 @@ import LocalAuthentication
 import Security
 
 final class SecureEnclaveApprovalKeyStorage: ApprovalKeyStorage {
-    private let tag = Data("dev.quartermaster.approval.debug.v1".utf8)
-    private let enrollmentService = "dev.quartermaster.approval.debug.enrollment.v1"
+    private let tag: Data
+    private let enrollmentService: String
+    private let accessGroup: String?
+    private let lockDirectory: URL?
+
+    init() {
+        tag = Data("dev.quartermaster.approval.debug.v1".utf8)
+        enrollmentService = "dev.quartermaster.approval.debug.enrollment.v1"
+        accessGroup = nil
+        lockDirectory = nil
+    }
+
+    init(namespace: String, accessGroup: String, lockDirectory: URL) {
+        tag = Data(namespace.utf8)
+        enrollmentService = namespace + ".enrollment"
+        self.accessGroup = accessGroup
+        self.lockDirectory = lockDirectory
+    }
 
     private func noInteraction(_ query: [CFString: Any]) -> [CFString: Any] {
         let context = LAContext()
@@ -16,10 +32,15 @@ final class SecureEnclaveApprovalKeyStorage: ApprovalKeyStorage {
     }
 
     func withExclusiveAccess<T>(_ body: () throws -> T) throws -> T {
-        let support = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true)
-        let directory = support.appendingPathComponent("Quartermaster/Development", isDirectory: true)
+        let directory: URL
+        if let lockDirectory {
+            directory = lockDirectory
+        } else {
+            let support = try FileManager.default.url(
+                for: .applicationSupportDirectory, in: .userDomainMask,
+                appropriateFor: nil, create: true)
+            directory = support.appendingPathComponent("Quartermaster/Development", isDirectory: true)
+        }
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
@@ -42,15 +63,17 @@ final class SecureEnclaveApprovalKeyStorage: ApprovalKeyStorage {
         return try body()
     }
 
-    private func keyQuery(_ applicationTag: Data) -> [CFString: Any] {
-        [
+    var keyQuery: [CFString: Any] {
+        var query: [CFString: Any] = [
             kSecClass: kSecClassKey, kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom,
-            kSecAttrApplicationTag: applicationTag, kSecUseDataProtectionKeychain: true,
+            kSecAttrApplicationTag: tag, kSecUseDataProtectionKeychain: true,
         ]
+        if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
+        return query
     }
 
     private func key() throws -> SecKey? {
-        var query = keyQuery(tag)
+        var query = keyQuery
         query[kSecAttrKeyClass] = kSecAttrKeyClassPrivate
         query[kSecMatchLimit] = kSecMatchLimitAll
         query[kSecReturnRef] = true
@@ -92,7 +115,7 @@ final class SecureEnclaveApprovalKeyStorage: ApprovalKeyStorage {
             throw ApprovalKeyError.security(
                 "access_control", Int32(error.map { CFErrorGetCode($0.takeRetainedValue()) } ?? 0))
         }
-        let attributes: [CFString: Any] = [
+        var attributes: [CFString: Any] = [
             kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom, kSecAttrKeySizeInBits: 256,
             kSecAttrTokenID: kSecAttrTokenIDSecureEnclave, kSecUseDataProtectionKeychain: true,
             kSecPrivateKeyAttrs: [
@@ -101,17 +124,20 @@ final class SecureEnclaveApprovalKeyStorage: ApprovalKeyStorage {
                 kSecAttrAccessControl: access,
             ],
         ]
+        if let accessGroup { attributes[kSecAttrAccessGroup] = accessGroup }
         guard let key = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
             throw ApprovalKeyError.security("create", Int32(error.map { CFErrorGetCode($0.takeRetainedValue()) } ?? 0))
         }
         return try publicBytes(key)
     }
 
-    private var enrollmentQuery: [CFString: Any] {
-        [
+    var enrollmentQuery: [CFString: Any] {
+        var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword, kSecAttrService: enrollmentService,
             kSecAttrAccount: "public-key", kSecUseDataProtectionKeychain: true,
         ]
+        if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
+        return query
     }
 
     func enrollment() throws -> Data? {
@@ -140,11 +166,11 @@ final class SecureEnclaveApprovalKeyStorage: ApprovalKeyStorage {
         }
     }
 
-    func deleteKey() throws { try delete(keyQuery(tag)) }
+    func deleteKey() throws { try delete(keyQuery) }
     func deleteEnrollment() throws { try delete(enrollmentQuery) }
 
     func sign(_ message: Data, context: LAContext) throws -> Data {
-        var query = keyQuery(tag)
+        var query = keyQuery
         query[kSecAttrKeyClass] = kSecAttrKeyClassPrivate
         query[kSecReturnRef] = true
         query[kSecUseAuthenticationContext] = context

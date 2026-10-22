@@ -30,6 +30,11 @@ public final class ApprovalKeyStore {
         storage = SecureEnclaveApprovalKeyStorage()
     }
 
+    public init(namespace: String, accessGroup: String, lockDirectory: URL) {
+        storage = SecureEnclaveApprovalKeyStorage(
+            namespace: namespace, accessGroup: accessGroup, lockDirectory: lockDirectory)
+    }
+
     init(storage: any ApprovalKeyStorage) {
         self.storage = storage
     }

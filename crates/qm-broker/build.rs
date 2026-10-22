@@ -1,12 +1,11 @@
 fn main() {
-    println!("cargo:rerun-if-changed=native/context_xpc.h");
-    println!("cargo:rerun-if-changed=native/context_xpc.m");
+    println!("cargo:rerun-if-changed=native/protocol.m");
     let protocol = "../../macos/Security/Sources/QuartermasterIPC";
     println!("cargo:rerun-if-changed={protocol}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
-            .file("native/context_xpc.m")
-            .file(format!("{protocol}/context_protocol.m"))
+            // NSXPC requires Clang's extended protocol signatures for reply blocks.
+            .file("native/protocol.m")
             .include(format!("{protocol}/include"))
             .flag("-fobjc-arc")
             .flag("-fblocks")

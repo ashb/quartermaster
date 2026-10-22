@@ -5,14 +5,14 @@ import LocalAuthenticationEmbeddedUI
 import QuartermasterSecurity
 import SwiftUI
 
-enum DialogPresentationLease {
-    enum Failure: Error {
+public enum DialogPresentationLease {
+    public enum Failure: Error {
         case alreadyPresented
         case invalidLock
         case system(Int32)
     }
 
-    static func acquire() throws -> Int32 {
+    public static func acquire() throws -> Int32 {
         let support = try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true)
@@ -45,7 +45,7 @@ enum DialogPresentationLease {
     }
 }
 
-struct DialogPeer: Codable, Equatable {
+public struct DialogPeer: Codable, Equatable {
     let pid: UInt32
     let executable: String
     let signingIdentifier: String
@@ -56,22 +56,28 @@ struct DialogPeer: Codable, Equatable {
     let commandLine: String?
 }
 
-struct DialogRequest: Codable, Equatable {
-    let repository: String
-    let issue: UInt64?
-    let method: String
-    let path: String
-    let body: String
-    let processChain: [String]
-    var origin: String? = nil
-    var peer: DialogPeer? = nil
+public struct DialogRequest: Codable, Equatable {
+    public let repository: String
+    public let issue: UInt64?
+    public let method: String
+    public let path: String
+    public let body: String
+    public let processChain: [String]
+    public var origin: String? = nil
+    public var peer: DialogPeer? = nil
 
 }
 
-struct ApprovalPresentation {
+public struct ApprovalPresentation {
     let request: DialogRequest
     let provider: ApprovalProviderIdentity
     let readGrant: ReadGrantReview?
+
+    public init(request: DialogRequest, provider: ApprovalProviderIdentity, readGrant: ReadGrantReview?) {
+        self.request = request
+        self.provider = provider
+        self.readGrant = readGrant
+    }
 
     var operationTitle: String {
         readGrant == nil ? "Close issue #\(request.issue.map(String.init) ?? "?")" : "Allow issue reads"
@@ -248,15 +254,15 @@ struct ApprovalDialogView: View {
 }
 
 @MainActor
-final class ApprovalDialog: NSObject, NSWindowDelegate {
-    let controller: ApprovalController
-    let window: NSWindow
-    var onClose: (() -> Void)?
+public final class ApprovalDialog: NSObject, NSWindowDelegate {
+    public let controller: ApprovalController
+    public let window: NSWindow
+    public var onClose: (() -> Void)?
 
-    init(backend: BrokerPending) {
-        let presentation = ApprovalPresentation(
-            request: backend.request, provider: backend.provider, readGrant: backend.readGrant)
-        controller = ApprovalController(backend: backend, reason: presentation.authenticationReason)
+    public init(
+        presentation: ApprovalPresentation, backend: any ApprovalBackend, keys: ApprovalKeyStore = ApprovalKeyStore()
+    ) {
+        controller = ApprovalController(backend: backend, reason: presentation.authenticationReason, keys: keys)
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 596, height: 460),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -271,12 +277,12 @@ final class ApprovalDialog: NSObject, NSWindowDelegate {
                 close: { [weak window] in window?.performClose(nil) }))
     }
 
-    func cancel() {
+    public func cancel() {
         controller.cancel()
         window.performClose(nil)
     }
 
-    func windowWillClose(_ notification: Notification) {
+    public func windowWillClose(_ notification: Notification) {
         controller.cancel()
         onClose?()
     }

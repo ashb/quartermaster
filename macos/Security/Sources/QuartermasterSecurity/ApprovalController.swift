@@ -61,10 +61,10 @@ import LocalAuthentication
     private let now: () -> MonotonicTimestamp
     private var timeout: Task<Void, Never>?
 
-    public convenience init(backend: any ApprovalBackend, reason: String) {
+    public convenience init(backend: any ApprovalBackend, reason: String, keys: ApprovalKeyStore = ApprovalKeyStore()) {
         self.init(
             backend: backend, reason: reason, authentication: TouchIDAuthentication(),
-            keys: ApprovalKeyStore(), now: { .now })
+            keys: keys, now: { .now })
     }
 
     init(

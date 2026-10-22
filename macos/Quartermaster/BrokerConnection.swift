@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import LocalAuthentication
+import QuartermasterApprovalUI
 import QuartermasterIPC
 import QuartermasterSecurity
 import Security

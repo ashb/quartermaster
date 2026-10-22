@@ -2,19 +2,10 @@
 
 ## Build and check
 
-The current target is an Apple Silicon Mac running macOS 26, with full Xcode
-selected. Install Rust with rustfmt and Clippy, just, and uv with Python 3.12
+The current target is an Apple Silicon Mac running macOS 26, with Xcode
+Command Line Tools selected. Install Rust with rustfmt and Clippy, just, and uv with Python 3.12
 or later.
-The GitHub examples also need `gh`; the development app requires full Xcode.
-
-Select Xcode before building:
-
-```sh
-sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
-```
-
-Command Line Tools alone are insufficient. If Swift tests cannot find Xcode's
-testing frameworks, select Xcode this way rather than setting only `DEVELOPER_DIR`.
+The GitHub examples also need `gh`; integration tests need `jq`.
 
 Run these from the repository root:
 
@@ -40,15 +31,26 @@ team = "YOURTEAMID"
 certificate_sha256 = "<64 hexadecimal characters>"
 ```
 
-This file is ignored by Git. Xcode handles provisioning for the UI and backend
-with their separate keychain groups. Both targets and the signing helper check
-the exact selected certificate.
+This file is ignored by Git. Obtain development provisioning profiles for the
+UI and backend through Xcode, matching their
+[UI](../macos/Quartermaster/Info.plist) and
+[backend](../macos/Quartermaster/Backend-Info.plist) bundle IDs and the groups in
+their [UI](../macos/Quartermaster/Quartermaster.entitlements) and
+[backend](../macos/Quartermaster/Backend.entitlements) entitlements. The signing helper
+searches Xcode's profile directories and the previous signed build. To select
+profiles explicitly:
+
+```sh
+QM_FRONTEND_PROFILE=/path/to/frontend.provisionprofile \
+QM_BACKEND_PROFILE=/path/to/backend.provisionprofile \
+  just build-signed
+```
 
 Once signing is configured:
 
 ```sh
 just run
-open target/xcode/Build/Products/Debug/Quartermaster.app
+open target/macos/signed/Quartermaster.app
 ```
 
 `just run` builds, signs and starts the backend. Opening the app shows the
@@ -60,6 +62,37 @@ Quit the UI through its menu, then use `just stop` to stop the backend. It is
 started for the logged-in user; login startup is not configured.
 
 To use a vault and make real requests, follow [GitHub setup](github.md).
+
+## Integration tests
+
+```sh
+just test-integration
+```
+
+This tests Swift/Rust IPC without a fingerprint. It requires a logged-in macOS
+GUI session and Swift command-line tools.
+
+The hardware cases use disposable keys and the normal approval dialog. Run them
+when ready to authenticate, after preparing a signed app as above:
+
+```sh
+just test-integration hardware
+just test-integration frontend-exit
+```
+
+The first checks cache unwrap and request signing with one fingerprint. The
+second checks cleanup when the authenticated frontend exits. Logs and artefacts
+are saved under `target/integration/`.
+
+To finish building and signing before an attended test:
+
+```sh
+just test-integration hardware --build-only
+just test-integration --run-prepared /path/printed/by/the/build
+```
+
+Hardware cases are separate from `just test`, whose Swift key tests use an
+in-memory keychain. Passing those tests does not exercise Touch ID hardware.
 
 ## Troubleshooting
 
@@ -84,7 +117,7 @@ from the vault. Discarding the local cache does not modify the source vault.
 To inspect the approval key without creating one:
 
 ```sh
-target/xcode/Build/Products/Debug/Quartermaster.app/Contents/MacOS/Quartermaster --approval-key-status
+target/macos/signed/Quartermaster.app/Contents/MacOS/Quartermaster --approval-key-status
 ```
 
 For intentional approval-key recovery, quit the UI and stop the backend before

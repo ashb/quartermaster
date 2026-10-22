@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import QuartermasterApprovalUI
 import QuartermasterSecurity
 
 @MainActor
@@ -100,7 +101,9 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
                                 pending.cancel()
                                 continue
                             }
-                            let dialog = ApprovalDialog(backend: pending)
+                            let presentation = ApprovalPresentation(
+                                request: pending.request, provider: pending.provider, readGrant: pending.readGrant)
+                            let dialog = ApprovalDialog(presentation: presentation, backend: pending)
                             dialog.onClose = { [weak self] in
                                 self?.active = nil
                                 self?.releasePresentation()
