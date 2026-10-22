@@ -1332,6 +1332,66 @@ mod tests {
     }
 
     #[test]
+    fn cache_lock_contention_reports_busy_without_blocking_cancellation_or_losing_warm_state() {
+        let (_directory, paths, _key, state, _receive) = fixture();
+        let id = state.pending.as_ref().unwrap().id.to_string();
+        let digest = state.provider.snapshot().unwrap().credential_digest();
+        let cache = super::super::persistence::store(&paths.root).unwrap();
+        let before = (cache.load().unwrap(), cache.load_enrollment().unwrap());
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.root.join("vault/vault.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let shared = Arc::new((Mutex::new(state), Condvar::new()));
+        let worker_state = Arc::clone(&shared);
+        let worker_paths = paths.clone();
+        let (send, receive) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut state = worker_state.0.lock().unwrap();
+            send.send(handle(Client::VaultStatus {}, &mut state, &worker_paths))
+                .unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            drop(lock);
+            worker.join().unwrap();
+            panic!("cache contention blocked the owner mutex");
+        }
+        worker.join().unwrap();
+        let Reply::VaultStatus(status) = result.unwrap().unwrap() else {
+            panic!("expected vault status");
+        };
+        assert_eq!(status.state, crate::VaultState::Busy);
+        let mut state = shared.0.try_lock().unwrap();
+        assert_eq!(
+            state.provider.snapshot().unwrap().credential_digest(),
+            digest
+        );
+        assert!(matches!(
+            handle(Client::Cancel { id }, &mut state, &paths).unwrap(),
+            Reply::Canceled
+        ));
+        assert!(state.pending.is_none());
+        assert_eq!(
+            state.provider.snapshot().unwrap().credential_digest(),
+            digest
+        );
+        drop(lock);
+        assert_eq!(
+            (cache.load().unwrap(), cache.load_enrollment().unwrap()),
+            before
+        );
+        assert!(
+            matches!(handle(Client::VaultStatus {}, &mut state, &paths).unwrap(), Reply::VaultStatus(status) if status.state == crate::VaultState::OnlineUnlocked)
+        );
+    }
+
+    #[test]
     fn locking_the_vault_revokes_outstanding_approval_authority() {
         let (_directory, paths, key, mut state, receive) = fixture();
         let message = proof(&mut state, &paths, &key);

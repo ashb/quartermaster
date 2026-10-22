@@ -16,6 +16,7 @@ pub trait BackupExclusion {
     fn exclude_and_verify(&self, file: &File) -> io::Result<()>;
 }
 
+/// Cache lock contention returns [`io::ErrorKind::WouldBlock`] instead of waiting.
 pub struct CacheStore<B> {
     directory: File,
     backup: B,
@@ -122,7 +123,7 @@ impl<B: BackupExclusion> CacheStore<B> {
         let file = self
             .open_file(c"vault.lock", libc::O_RDWR | libc::O_CREAT)?
             .ok_or_else(|| io::Error::other("missing cache lock"))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(file)
@@ -357,30 +358,83 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_writers_publish_complete_snapshots_under_the_same_lock() {
+    fn concurrent_writers_publish_complete_snapshots_or_report_contention() {
         let directory = directory();
         let root = directory.path().canonicalize().unwrap();
         let first = CacheStore::open(&root, BackupFixture::default()).unwrap();
         let second = CacheStore::open(&root, BackupFixture::default()).unwrap();
         let reader = CacheStore::open(&root, BackupFixture::default()).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
         let writer = |store: CacheStore<BackupFixture>, byte: u8| {
+            let start = std::sync::Arc::clone(&start);
             std::thread::spawn(move || {
+                start.wait();
+                let mut published = 0;
                 for _ in 0..10 {
-                    store.save(&vec![byte; 8192]).unwrap();
+                    match store.save(&vec![byte; 8192]) {
+                        Ok(()) => published += 1,
+                        Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                    }
                 }
+                published
             })
         };
         let first = writer(first, 1);
         let second = writer(second, 2);
-        for _ in 0..10 {
-            if let Some(bytes) = reader.load().unwrap() {
-                assert_eq!(bytes.len(), 8192);
-                assert!(bytes.iter().all(|byte| *byte == bytes[0]));
-                assert!([1, 2].contains(&bytes[0]));
-            }
+        assert!(first.join().unwrap() + second.join().unwrap() > 0);
+        let bytes = reader.load().unwrap().unwrap();
+        assert_eq!(bytes.len(), 8192);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+        assert!([1, 2].contains(&bytes[0]));
+    }
+
+    #[test]
+    fn cache_lock_contention_rejects_access_without_waiting_or_changing_files() {
+        let directory = directory();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CacheStore::open(&root, BackupFixture::default()).unwrap();
+        store.save(b"original encrypted snapshot").unwrap();
+        store.save_enrollment(b"original enrollment").unwrap();
+
+        for operation in 0..6 {
+            let contender = CacheStore::open(&root, BackupFixture::default()).unwrap();
+            let lock = store.lock().unwrap();
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = match operation {
+                    0 => contender.load().map(|_| ()),
+                    1 => contender.load_enrollment().map(|_| ()),
+                    2 => contender.save(b"replacement encrypted snapshot"),
+                    3 => contender.save_enrollment(b"replacement enrollment"),
+                    4 => contender.discard(),
+                    5 => contender.discard_enrollment(),
+                    _ => unreachable!(),
+                };
+                send.send(result).unwrap();
+            });
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            drop(lock);
+            worker.join().unwrap();
+
+            assert!(
+                matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock),
+                "operation {operation} did not report contention before the lock was released"
+            );
+            assert_eq!(
+                store.load().unwrap().unwrap(),
+                b"original encrypted snapshot"
+            );
+            assert_eq!(
+                store.load_enrollment().unwrap().unwrap(),
+                b"original enrollment"
+            );
         }
-        first.join().unwrap();
-        second.join().unwrap();
+
+        store.save(b"replacement after lock release").unwrap();
+        assert_eq!(
+            store.load().unwrap().unwrap(),
+            b"replacement after lock release"
+        );
     }
 
     #[test]

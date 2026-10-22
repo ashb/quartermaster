@@ -27,6 +27,7 @@ pub const LIMITS: KdfLimits = KdfLimits {
 #[derive(Debug)]
 pub enum Error {
     Storage,
+    StorageBusy,
     Provider(ProviderError),
     Cache(CacheError),
     Key(CacheKeyError),
@@ -34,8 +35,11 @@ pub enum Error {
     Lifecycle(provider_lifecycle::Error),
 }
 impl From<io::Error> for Error {
-    fn from(_: io::Error) -> Self {
-        Self::Storage
+    fn from(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::WouldBlock => Self::StorageBusy,
+            _ => Self::Storage,
+        }
     }
 }
 impl From<ProviderError> for Error {
@@ -196,7 +200,7 @@ pub fn error_reply(error: Error) -> CacheStatus {
         _ => format!("{error:?}"),
     };
     let state = match &error {
-        Error::Lifecycle(provider_lifecycle::Error::Busy) => VaultState::Busy,
+        Error::StorageBusy | Error::Lifecycle(provider_lifecycle::Error::Busy) => VaultState::Busy,
         Error::Lifecycle(
             provider_lifecycle::Error::Superseded | provider_lifecycle::Error::Locked,
         ) => VaultState::Locked,
