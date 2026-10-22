@@ -77,22 +77,23 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
                 guard process.terminationStatus == 0 else { throw BrokerFailure.disconnected }
                 let connection = try BrokerConnection()
                 client = connection
-                let hello = try await connection.call(BrokerMessage(kind: "hello"))
-                guard hello.kind == "hello", hello.profile == "development" else { throw BrokerFailure.invalidMessage }
+                let hello = try await connection.call(.hello)
+                guard case .hello("development") = hello else { throw BrokerFailure.invalidMessage }
                 let publicKey = try ApprovalKeyStore().loadOrCreate()
-                let enrolled = try await connection.call(BrokerMessage(kind: "enroll", publicKey: publicKey))
-                guard enrolled.kind == "enrolled" else { throw BrokerFailure.invalidMessage }
+                let enrolled = try await connection.call(.enroll(publicKey: publicKey))
+                guard case .enrolled = enrolled else { throw BrokerFailure.invalidMessage }
                 if vaultSource != nil { enrollVault() }
                 while !Task.isCancelled {
                     guard !connection.disconnected else { throw BrokerFailure.disconnected }
                     if active == nil && !controls.busy {
-                        let reply = try await connection.call(BrokerMessage(kind: "next"))
-                        if reply.kind == "review" {
+                        let reply = try await connection.call(.next)
+                        switch reply {
+                        case .review(let review):
                             if controls.busy {
-                                _ = try await connection.call(BrokerMessage(kind: "cancel", id: reply.approval?.id))
+                                _ = try await connection.call(.cancel(id: review.id))
                                 continue
                             }
-                            let pending = try BrokerPending(client: connection, reply: reply)
+                            let pending = try BrokerPending(client: connection, review: review)
                             do { presentation = try DialogPresentationLease.acquire() } catch DialogPresentationLease
                                 .Failure.alreadyPresented
                             {
@@ -108,8 +109,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
                             dialog.window.center()
                             dialog.window.makeKeyAndOrderFront(nil)
                             NSApplication.shared.activate(ignoringOtherApps: true)
-                        } else if reply.kind != "idle" {
-                            throw BrokerFailure.invalidMessage
+                        case .idle: break
+                        default: throw BrokerFailure.invalidMessage
                         }
                     }
                     try await Task.sleep(for: .milliseconds(200))
@@ -163,17 +164,17 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
             return
         }
         let itemId = item.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = BrokerMessage(
-            kind: "vaultLogin", server: server.stringValue, email: email.stringValue, password: password.stringValue,
-            itemId: itemId.isEmpty ? nil : itemId)
+        let request = BrokerCommand.vaultLogin(
+            server: server.stringValue, email: email.stringValue, password: password.stringValue,
+            itemID: itemId.isEmpty ? nil : itemId)
         password.stringValue = ""
         await executeVault(request, reenroll: true)
     }
 
-    @objc private func vaultStatus() { performVault(BrokerMessage(kind: "vaultStatus"), reenroll: false) }
-    @objc private func unlockVault() { performVault(BrokerMessage(kind: "vaultUnlock"), reenroll: true) }
-    @objc private func syncVault() { performVault(BrokerMessage(kind: "vaultSync"), reenroll: false) }
-    @objc private func lockVault() { performVault(BrokerMessage(kind: "vaultLock"), reenroll: true) }
+    @objc private func vaultStatus() { performVault(.vaultStatus, reenroll: false) }
+    @objc private func unlockVault() { performVault(.vaultUnlock, reenroll: true) }
+    @objc private func syncVault() { performVault(.vaultSync, reenroll: false) }
+    @objc private func lockVault() { performVault(.vaultLock, reenroll: true) }
     @objc private func revokeReads() {
         guard client != nil else { return }
         statusItem?.button?.title = "QM [DEBUG] · revocation pending"
@@ -189,11 +190,11 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
         defer { statusItem?.button?.title = "QM [DEBUG]" }
         do {
             guard let client else { throw BrokerFailure.disconnected }
-            let reply = try await client.call(BrokerMessage(kind: "revokeReadGrants"))
-            guard reply.kind == "readGrantsRevoked" else { throw BrokerFailure.invalidMessage }
+            let reply = try await client.call(.revokeReadGrants)
+            guard case .readGrantsRevoked = reply else { throw BrokerFailure.invalidMessage }
             let key = try ApprovalKeyStore().loadOrCreate()
-            let enrolled = try await client.call(BrokerMessage(kind: "enroll", publicKey: key))
-            guard enrolled.kind == "enrolled" else { throw BrokerFailure.invalidMessage }
+            let enrolled = try await client.call(.enroll(publicKey: key))
+            guard case .enrolled = enrolled else { throw BrokerFailure.invalidMessage }
         } catch {
             let alert = NSAlert()
             alert.messageText = "Could not revoke read access"
@@ -221,36 +222,36 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
         alert.addButton(withTitle: "Discard cache")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            performVault(BrokerMessage(kind: "vaultDiscard"), reenroll: true)
+            performVault(.vaultDiscard, reenroll: true)
         }
     }
 
-    private func performVault(_ request: BrokerMessage, reenroll: Bool) {
+    private func performVault(_ request: BrokerCommand, reenroll: Bool) {
         guard !controls.busy, active == nil, client != nil else { return }
         Task { await controls.perform { await self.executeVault(request, reenroll: reenroll) } }
     }
 
-    private func executeVault(_ request: BrokerMessage, reenroll: Bool) async {
+    private func executeVault(_ request: BrokerCommand, reenroll: Bool) async {
         guard let client else { return }
         do {
             let reply = try await client.call(request)
-            guard reply.kind == "vaultStatus" else { throw BrokerFailure.invalidMessage }
+            guard case .vaultStatus(let status) = reply else { throw BrokerFailure.invalidMessage }
             if reenroll {
                 let key = try ApprovalKeyStore().loadOrCreate()
-                let enrolled = try await client.call(BrokerMessage(kind: "enroll", publicKey: key))
-                guard enrolled.kind == "enrolled" else { throw BrokerFailure.invalidMessage }
+                let enrolled = try await client.call(.enroll(publicKey: key))
+                guard case .enrolled = enrolled else { throw BrokerFailure.invalidMessage }
             }
-            if let binding = reply.binding {
+            if let binding = status.binding {
                 vaultSource = (binding.server, binding.email)
-                selectedVaultItem = binding.item_id
+                selectedVaultItem = binding.itemID
             }
             let alert = NSAlert()
-            alert.messageText = "Vault: \(reply.state ?? "unknown")"
-            if let binding = reply.binding {
+            alert.messageText = "Vault: \(status.state.rawValue)"
+            if let binding = status.binding {
                 alert.informativeText =
-                    "Account: \(binding.email)\nAccount ID: \(binding.account_id)\nLogin item ID: \(binding.item_id)\nRole: \(binding.role)"
+                    "Account: \(binding.email)\nAccount ID: \(binding.accountID)\nLogin item ID: \(binding.itemID)\nRole: \(binding.role)"
             } else {
-                alert.informativeText = reply.error ?? "No vault is enrolled."
+                alert.informativeText = status.error ?? "No vault is enrolled."
             }
             alert.runModal()
         } catch {

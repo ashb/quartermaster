@@ -224,6 +224,86 @@ pub(super) fn encode_reply(reply: &Reply) -> Result<Vec<u8>, ControlError> {
 mod tests {
     use super::*;
 
+    fn wire_fixtures() -> serde_json::Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../macos/Security/Tests/QuartermasterSecurityTests/Fixtures/broker-protocol.json"
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn swift_command_fixtures_preserve_fields_and_require_each_mandatory_payload() {
+        for fixture in wire_fixtures()["commands"].as_array().unwrap() {
+            let command = decode_client(&serde_json::to_vec(fixture).unwrap()).unwrap();
+            let decoded = serde_json::to_value(command).unwrap();
+            for (key, expected) in fixture.as_object().unwrap() {
+                assert_eq!(decoded.get(key), Some(expected), "field {key}");
+                if key != "itemId" {
+                    let mut missing = fixture.clone();
+                    missing.as_object_mut().unwrap().remove(key);
+                    assert!(matches!(
+                        decode_client(&serde_json::to_vec(&missing).unwrap()),
+                        Err(ControlError::InvalidMessage)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rust_reply_encoding_matches_the_shared_swift_wire_fixtures() {
+        for fixture in wire_fixtures()["replies"].as_array().unwrap() {
+            let reply = match fixture["kind"].as_str().unwrap() {
+                "hello" => Reply::Hello {
+                    profile: "development",
+                },
+                "enrolled" => Reply::Enrolled,
+                "idle" => Reply::Idle,
+                "review" => Reply::Review {
+                    approval: serde_json::from_value(fixture["approval"].clone()).unwrap(),
+                },
+                "challenge" => Reply::Challenge {
+                    authorization: serde_json::from_value(fixture["authorization"].clone())
+                        .unwrap(),
+                },
+                "accepted" => Reply::Accepted,
+                "canceled" => Reply::Canceled,
+                "alreadyAdmitted" => Reply::AlreadyAdmitted,
+                "unknownOperation" => Reply::UnknownOperation,
+                "readGrantsRevoked" => Reply::ReadGrantsRevoked,
+                "error" => Reply::Error {
+                    code: serde_json::from_value(fixture["code"].clone()).unwrap(),
+                },
+                "vaultStatus" => Reply::VaultStatus(crate::CacheStatus {
+                    kind: crate::StatusKind::VaultStatus,
+                    state: match fixture["state"].as_str().unwrap() {
+                        "locked" => crate::VaultState::Locked,
+                        "busy" => crate::VaultState::Busy,
+                        other => panic!("unexpected fixture vault state {other}"),
+                    },
+                    binding: fixture
+                        .get("binding")
+                        .map(|binding| serde_json::from_value(binding.clone()).unwrap()),
+                    last_sync: fixture.get("lastSync").map(|value| {
+                        time::OffsetDateTime::from_unix_timestamp(value.as_i64().unwrap()).unwrap()
+                    }),
+                    error: fixture
+                        .get("error")
+                        .map(|value| value.as_str().unwrap().to_owned()),
+                    observation: fixture.get("observation").map(|value| {
+                        assert_eq!(value, "persisted_cache");
+                        crate::StatusObservation::PersistedCache
+                    }),
+                }),
+                other => panic!("unexpected fixture reply {other}"),
+            };
+            let encoded: serde_json::Value =
+                serde_json::from_slice(&encode_reply(&reply).unwrap()).unwrap();
+            assert_eq!(&encoded, fixture);
+        }
+    }
+
     #[test]
     fn active_payload_codec_accepts_commands_and_rejects_missing_forged_or_oversized_payloads() {
         assert!(matches!(

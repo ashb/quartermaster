@@ -7,45 +7,6 @@ import QuartermasterSecurity
 import Security
 import Synchronization
 
-struct BrokerMessage: Encodable, Sendable {
-    let kind: String
-    var id: String? = nil
-    var publicKey: Data? = nil
-    var authenticated: MonotonicTimestamp? = nil
-    var signature: Data? = nil
-    var server: String? = nil
-    var email: String? = nil
-    var password: String? = nil
-    var itemId: String? = nil
-}
-
-struct VaultBinding: Decodable, Sendable {
-    let server: String
-    let email: String
-    let account_id: String
-    let item_id: String
-    let role: String
-}
-
-struct BrokerReply: Decodable, Sendable {
-    let kind: String
-    let profile: String?
-    let id: String?
-    let created: MonotonicTimestamp?
-    let session: Data?
-    let policy: Data?
-    let requestDigest: Data?
-    let credentialDigest: Data?
-    let request: Data?
-    let challenge: Data?
-    let state: String?
-    let error: String?
-    let binding: VaultBinding?
-    let lastSync: Date?
-    let approval: ApprovalReview?
-    let authorization: ApprovalChallenge?
-}
-
 enum BrokerFailure: Error { case invalidCode, invalidMessage, disconnected, timeout }
 
 final class BrokerConnection: @unchecked Sendable {
@@ -106,14 +67,12 @@ final class BrokerConnection: @unchecked Sendable {
     deinit { connection.invalidate() }
 
     @MainActor
-    func call(_ fields: BrokerMessage, context: LAContext? = nil) async throws -> BrokerReply {
-        let bytes = try JSONEncoder().encode(fields)
-        guard bytes.count <= 16384, !disconnected else { throw BrokerFailure.disconnected }
+    func call(_ command: BrokerCommand, context: LAContext? = nil) async throws -> BrokerReply {
+        let bytes = try command.encoded()
+        guard !disconnected else { throw BrokerFailure.disconnected }
         return try await withCheckedThrowingContinuation { continuation in
             let completion = Mutex<CheckedContinuation<BrokerReply, any Error>?>(continuation)
-            let timeout: Double =
-                fields.kind.hasPrefix("vault") && fields.kind != "vaultStatus" ? 120 : (context == nil ? 5 : 30)
-            queue.asyncAfter(deadline: .now() + timeout) { [self] in
+            queue.asyncAfter(deadline: .now() + command.timeout) { [self] in
                 if let pending = completion.withLock({ value in
                     defer { value = nil }
                     return value
@@ -147,12 +106,7 @@ final class BrokerConnection: @unchecked Sendable {
                     })
                 else { return }
                 do {
-                    guard data.count <= 16384 else { throw BrokerFailure.invalidMessage }
-                    let decoder = JSONDecoder()
-                    decoder.dateDecodingStrategy = .secondsSince1970
-                    let reply = try decoder.decode(BrokerReply.self, from: data)
-                    guard reply.kind != "error" else { throw BrokerFailure.invalidMessage }
-                    pending.resume(returning: reply)
+                    pending.resume(returning: try BrokerReply.decodeSuccess(data))
                 } catch { pending.resume(throwing: error) }
             }
             if let context {
@@ -174,8 +128,7 @@ final class BrokerPending: ApprovalBackend {
     let readGrant: ReadGrantReview?
     private var workflow: AuthorizationWorkflow
 
-    init(client: BrokerConnection, reply: BrokerReply) throws {
-        guard reply.kind == "review", let review = reply.approval else { throw BrokerFailure.invalidMessage }
+    init(client: BrokerConnection, review: ApprovalReview) throws {
         workflow = try AuthorizationWorkflow(review: review, now: .now)
         let id = review.id
         let bytes = review.request
@@ -201,8 +154,8 @@ final class BrokerPending: ApprovalBackend {
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {
         try workflow.recordAuthentication(at: authenticated, now: .now)
         let reply = try await client.call(
-            BrokerMessage(kind: "presence", id: id, authenticated: authenticated), context: context)
-        guard reply.kind == "challenge", let authorization = reply.authorization else {
+            .presence(id: id, authenticated: authenticated), context: context)
+        guard case .challenge(let authorization) = reply else {
             throw BrokerFailure.invalidMessage
         }
         return try workflow.validate(authorization, now: .now)
@@ -210,12 +163,12 @@ final class BrokerPending: ApprovalBackend {
 
     func submit(_ signature: Data) async throws {
         try workflow.checkSubmission(now: .now)
-        let reply = try await client.call(BrokerMessage(kind: "proof", id: id, signature: signature))
-        guard reply.kind == "accepted" else { throw BrokerFailure.invalidMessage }
+        let reply = try await client.call(.proof(id: id, signature: signature))
+        guard case .accepted = reply else { throw BrokerFailure.invalidMessage }
     }
 
     func cancel() {
         workflow.cancel()
-        Task { _ = try? await client.call(BrokerMessage(kind: "cancel", id: id)) }
+        Task { _ = try? await client.call(.cancel(id: id)) }
     }
 }
