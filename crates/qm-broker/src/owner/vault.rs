@@ -6,6 +6,7 @@ use crate::{CacheStatus, StatusKind, VaultState};
 use qm_macos::cache_key::{
     CacheKeyError, CacheKeyScope, DeviceCacheKey, NativeAuthenticationContext, WrappedCacheKey,
 };
+use qm_macos::cache_store::{BackupExclusion, CacheStore, TimeMachineExclusion};
 use qm_providers::{
     CacheError, EnrollmentPhase, KdfLimits, ProviderError, SealedSnapshot, VaultEnrollment,
     VaultSnapshot,
@@ -72,6 +73,10 @@ pub(super) struct Source {
 impl Source {
     pub(super) fn capture(root: &Path) -> Result<Self, Error> {
         let store = store(root)?;
+        Self::capture_store(&store)
+    }
+
+    pub(super) fn capture_store<B: BackupExclusion>(store: &CacheStore<B>) -> Result<Self, Error> {
         let encoded = store.load_enrollment()?;
         let cache = store.load()?;
         let mut hash = Context::new(&SHA256);
@@ -172,6 +177,17 @@ pub fn status(root: &Path, snapshot: Option<&VaultSnapshot>) -> CacheStatus {
     }
 }
 
+pub(super) fn locked_status() -> CacheStatus {
+    CacheStatus {
+        kind: StatusKind::VaultStatus,
+        state: VaultState::Locked,
+        binding: None,
+        last_sync: None,
+        error: None,
+        observation: None,
+    }
+}
+
 fn status_inner(root: &Path, snapshot: Option<&VaultSnapshot>) -> Result<CacheStatus, Error> {
     let enrollment = enrollment(&store(root)?)?;
     let state = match (&enrollment, snapshot) {
@@ -234,14 +250,26 @@ pub(super) struct SealIntent {
     manifest: VaultEnrollment,
 }
 
+#[cfg(test)]
 pub(super) fn begin_persistence(
     root: &Path,
     provider: &ProviderState,
     operation: &mut ProviderOperation,
     snapshot: &VaultSnapshot,
 ) -> Result<SealIntent, Error> {
-    let source = Source::capture(root)?;
+    let cache = store(root)?.transaction()?;
+    let source = Source::capture_store(&cache)?;
     provider.check(operation, source.revision)?;
+    let intent = persistence_intent(&cache, source, snapshot)?;
+    provider.revise_source(operation, Source::capture_store(&cache)?.revision)?;
+    Ok(intent)
+}
+
+pub(super) fn persistence_intent<B: BackupExclusion>(
+    cache: &CacheStore<B>,
+    source: Source,
+    snapshot: &VaultSnapshot,
+) -> Result<SealIntent, Error> {
     let manifest = match source.manifest {
         Some(manifest) => {
             if manifest.binding() != snapshot.binding() {
@@ -262,8 +290,7 @@ pub(super) fn begin_persistence(
                 .map_err(|_| Error::Storage)?;
             let scope = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
             let manifest = VaultEnrollment::begin(snapshot.binding().clone(), scope)?;
-            store(root)?.save_enrollment(&manifest.encode()?)?;
-            provider.revise_source(operation, Source::capture(root)?.revision)?;
+            cache.save_enrollment(&manifest.encode()?)?;
             manifest
         }
     };
@@ -326,35 +353,71 @@ impl SealIntent {
     }
 }
 
+pub(super) struct Publication<B> {
+    cache: CacheStore<B>,
+    prepared: PreparedCache,
+    source: Source,
+}
+
+impl<B: BackupExclusion> Publication<B> {
+    pub(super) fn new(cache: CacheStore<B>, prepared: PreparedCache) -> Result<Self, Error> {
+        let cache = cache.transaction()?;
+        let source = Source::capture_store(&cache)?;
+        Ok(Self {
+            cache,
+            prepared,
+            source,
+        })
+    }
+
+    pub(super) fn admit(
+        &mut self,
+        provider: &mut ProviderState,
+        operation: ProviderOperation,
+    ) -> Result<provider_lifecycle::Update, Error> {
+        Ok(provider.prepare_update(
+            operation,
+            self.source.revision,
+            self.prepared.snapshot.take().unwrap(),
+        )?)
+    }
+
+    pub(super) fn publish(mut self) -> Result<CacheIdentity, Error> {
+        let synchronized_at = self.prepared.sealed.synchronized_at();
+        if self.prepared.key.created {
+            self.cache
+                .save_enrollment(&self.prepared.manifest.encode()?)?;
+            self.prepared.key.created = false;
+        }
+        let mut ready = self.prepared.manifest.clone();
+        ready.record_ready(synchronized_at)?;
+        self.cache.save(self.prepared.sealed.as_bytes())?;
+        self.cache.save_enrollment(&ready.encode()?)?;
+        Source::capture_store(&self.cache)?.identity()
+    }
+}
+
+pub(super) fn publication(
+    root: &Path,
+    prepared: PreparedCache,
+) -> Result<Publication<TimeMachineExclusion>, Error> {
+    Publication::new(store(root)?, prepared)
+}
+
+#[cfg(test)]
 pub(super) fn publish_update(
     root: &Path,
     provider: &mut ProviderState,
     operation: ProviderOperation,
-    prepared: &mut PreparedCache,
+    prepared: PreparedCache,
 ) -> Result<(), Error> {
-    let source = match Source::capture(root) {
-        Ok(source) => source,
-        Err(error) => {
-            provider.release(&operation);
-            return Err(error);
-        }
-    };
-    let snapshot = prepared.snapshot.take().unwrap();
-    let synchronized_at = snapshot.synchronized_at();
-    let update = provider.prepare_update(operation, source.revision, snapshot)?;
-    let cache = store(root)?;
-    if prepared.key.created {
-        cache.save_enrollment(&prepared.manifest.encode()?)?;
-        prepared.key.created = false;
-    }
-    let mut ready = prepared.manifest.clone();
-    ready.record_ready(synchronized_at)?;
-    cache.save(prepared.sealed.as_bytes())?;
-    cache.save_enrollment(&ready.encode()?)?;
-    update.install(Source::capture(root)?.identity()?)?;
+    let mut publication = publication(root, prepared)?;
+    let update = publication.admit(provider, operation)?;
+    update.install(provider, publication.publish()?)?;
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn finish_unlock(
     root: &Path,
     provider: &mut ProviderState,
@@ -371,6 +434,7 @@ pub(super) fn finish_unlock(
     Ok(provider.finish_unlock(operation, &identity, snapshot)?)
 }
 
+#[cfg(test)]
 pub(super) fn finish_discard(
     root: &Path,
     provider: &mut ProviderState,
@@ -564,7 +628,7 @@ mod tests {
                 [9; 16],
                 identity.synchronized_at + std::time::Duration::from_secs(1),
             );
-            let mut prepared = fixture::prepared(&root, refreshed);
+            let prepared = fixture::prepared(&root, refreshed);
             let cache = store(&root).unwrap();
             let before = (cache.load().unwrap(), cache.load_enrollment().unwrap());
             match event {
@@ -581,7 +645,7 @@ mod tests {
             }
 
             assert!(matches!(
-                publish_update(&root, &mut provider, refresh, &mut prepared),
+                publish_update(&root, &mut provider, refresh, prepared),
                 Err(Error::Lifecycle(provider_lifecycle::Error::Superseded))
             ));
             assert!(provider.snapshot().is_none());
@@ -609,9 +673,9 @@ mod tests {
             [9; 16],
             identity.synchronized_at + std::time::Duration::from_secs(1),
         );
-        let mut prepared = fixture::prepared(&root, refreshed);
+        let prepared = fixture::prepared(&root, refreshed);
 
-        publish_update(&root, &mut provider, refresh, &mut prepared).unwrap();
+        publish_update(&root, &mut provider, refresh, prepared).unwrap();
 
         let persisted = Source::capture(&root).unwrap();
         let opened = SealedSnapshot::decode(
@@ -649,7 +713,7 @@ mod tests {
             [9; 16],
             identity.synchronized_at + std::time::Duration::from_secs(1),
         );
-        let mut prepared = fixture::prepared(&root, refreshed);
+        let prepared = fixture::prepared(&root, refreshed);
         let cache = store(&root).unwrap();
         let mut enrollment: Value =
             serde_json::from_slice(&cache.load_enrollment().unwrap().unwrap()).unwrap();
@@ -660,7 +724,7 @@ mod tests {
         let before = (cache.load().unwrap(), cache.load_enrollment().unwrap());
 
         assert!(matches!(
-            publish_update(&root, &mut provider, refresh, &mut prepared),
+            publish_update(&root, &mut provider, refresh, prepared),
             Err(Error::Lifecycle(provider_lifecycle::Error::Changed))
         ));
         assert_eq!(

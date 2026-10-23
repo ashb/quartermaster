@@ -1,4 +1,5 @@
-use super::{ServicePaths, Shared, approval::request_approval, checked, failure};
+use super::error::{Error, Fault, Result};
+use super::{ServicePaths, Shared, approval::request_approval};
 use crate::owner::{
     deadline::Deadline,
     dispatch::{self, CredentialSelection, PreparedOperation},
@@ -71,18 +72,21 @@ pub(super) fn handle_http(
     stream: &mut UnixStream,
     shared: &Shared,
     paths: &ServicePaths,
-) -> io::Result<()> {
+) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let session = shared
         .0
         .lock()
-        .map_err(|_| failure("state unavailable"))?
+        .map_err(|_| Error::State(Fault::StateUnavailable))?
         .authorizer
         .session();
     let (principal, peer) = VerifiedPrincipal::capture(stream, session)?;
     let principal = Arc::new(principal);
     let result = handle_verified_http(stream, shared, paths, &principal, peer);
-    let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
+    let mut state = shared
+        .0
+        .lock()
+        .map_err(|_| Error::State(Fault::StateUnavailable))?;
     if state
         .pending
         .as_ref()
@@ -100,27 +104,56 @@ pub(super) fn handle_verified_http(
     paths: &ServicePaths,
     principal: &Arc<VerifiedPrincipal>,
     peer: PeerIdentity,
-) -> io::Result<()> {
+) -> Result<()> {
     let config = {
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-        state.refresh_policy(paths)?;
+        let policy = paths.load_policy();
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.refresh_policy(&policy)?;
         state.authorizer.github_configuration().cloned()
     };
     let request = http_request::read_configured(stream, config.as_ref())?;
     let created = presence_now()?;
+    let cold = {
+        let state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state
+            .provider
+            .snapshot()
+            .is_none()
+            .then_some(state.provider.generation())
+    };
+    let binding = if cold.is_some() {
+        crate::owner::vault::Source::capture(&paths.root).map(|source| source.binding())
+    } else {
+        Ok(None)
+    };
     let (id, interactive) = {
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-        let outcome = state.authorize(principal, request, paths)?;
+        let policy = paths.load_policy();
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        if cold.is_some_and(|generation| generation != state.provider.generation()) {
+            return Err(Error::State(Fault::ProviderChanged));
+        }
+        let outcome = state.authorize(principal, request, &policy, binding)?;
         let interactive = matches!(&outcome, AuthorizationOutcome::RequireApproval(_));
-        let id = checked(state.operations.register(outcome, Instant::now()))?;
+        let id = state.operations.register(outcome, Instant::now())?;
         if !interactive {
             let snapshot = state
                 .provider
                 .snapshot()
-                .ok_or_else(|| failure("vault is locked"))?;
+                .ok_or_else(|| Error::State(Fault::VaultLocked))?;
             let selection =
                 CredentialSelection::at_generation(snapshot, state.provider.generation());
-            checked(state.operations.select_credential(id, principal, selection))?;
+            state
+                .operations
+                .select_credential(id, principal, selection)?;
         }
         (id, interactive)
     };
@@ -129,26 +162,24 @@ pub(super) fn handle_verified_http(
     }
     let receive = request_approval(id, principal, peer, created, shared, paths)?;
     loop {
-        checked(
-            shared
-                .0
-                .lock()
-                .map_err(|_| failure("state unavailable"))?
-                .operations
-                .check_wait(id, principal, Instant::now()),
-        )?;
+        shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?
+            .operations
+            .check_wait(id, principal, Instant::now())?;
         if !connected(stream) {
-            return Err(failure("request disconnected"));
+            return Err(Error::State(Fault::Canceled));
         }
         match receive.recv_timeout(Duration::from_millis(25)) {
             Ok(ready) => {
                 if ready.id != id || ready.principal.binding() != principal.binding() {
-                    return Err(failure("wrong operation completion"));
+                    return Err(Error::State(Fault::InvalidOperation));
                 }
                 return execute_ready(stream, shared, paths, principal, id);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(failure("approval cancelled")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Error::State(Fault::Canceled)),
         }
     }
 }
@@ -159,41 +190,57 @@ pub(super) fn execute_ready(
     paths: &ServicePaths,
     principal: &VerifiedPrincipal,
     id: OperationId,
-) -> io::Result<()> {
+) -> Result<()> {
     let mode = {
-        let state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-        checked(state.operations.request(id, principal))?.mode()
+        let state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.operations.request(id, principal)?.mode()
     };
     if mode == Mode::Github {
         return execute_github(stream, shared, paths, principal, id);
     }
     let (request, upstream) = {
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-        (state.prepare(id, principal, paths)?, state.upstream.clone())
+        let policy = paths.load_policy();
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        (
+            state.prepare(id, principal, &policy)?,
+            state.upstream.clone(),
+        )
     };
     let transport = upstream.connect()?;
     let prepared = PreparedOperation::new(request, transport);
     if prepared.id() != id {
-        return Err(failure("wrong prepared operation"));
+        return Err(Error::State(Fault::InvalidOperation));
     }
     let handoff = {
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
+        let policy = paths.load_policy();
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
         if !connected(stream) {
-            return Err(failure("request disconnected"));
+            return Err(Error::State(Fault::Canceled));
         }
-        state.handoff(prepared, principal, paths)
+        state.handoff(prepared, principal, &policy)
     };
     let outcome = match handoff {
         Ok(receipt) => receipt.response(),
-        Err(dispatch::Error::Uncertain) => return response(stream, OperationResponse::Uncertain),
-        Err(error) => return Err(failure(format!("{error}"))),
+        Err(Error::Dispatch(dispatch::Error::Uncertain)) => {
+            return response(stream, OperationResponse::Uncertain).map_err(Error::from);
+        }
+        Err(error) => return Err(error),
     };
     shared
         .0
         .lock()
-        .map_err(|_| failure("state unavailable"))?
+        .map_err(|_| Error::State(Fault::StateUnavailable))?
         .finish(id, &outcome)?;
-    response(stream, outcome)
+    response(stream, outcome).map_err(Error::from)
 }
 
 pub(super) fn execute_github(
@@ -202,76 +249,96 @@ pub(super) fn execute_github(
     paths: &ServicePaths,
     principal: &VerifiedPrincipal,
     mut id: OperationId,
-) -> io::Result<()> {
+) -> Result<()> {
     let (deadline, connector) = {
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-        state.refresh_policy(paths)?;
-        let deadline = checked(state.operations.read_deadline(
-            id,
-            principal,
-            &state.authorizer,
-            Instant::now(),
-        ))?;
+        let policy = paths.load_policy();
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.refresh_policy(&policy)?;
+        let deadline =
+            state
+                .operations
+                .read_deadline(id, principal, &state.authorizer, Instant::now())?;
         (deadline, state.github.clone())
     };
     let mut visited = Vec::new();
     for redirects in 0..=3 {
         let metadata = {
-            let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-            let digest = checked(state.operations.request(id, principal))?.digest();
+            let policy = paths.load_policy();
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
+            let digest = state.operations.request(id, principal)?.digest();
             if visited.contains(&digest) {
-                return Err(failure("redirect loop denied"));
+                return Err(Error::State(Fault::RedirectLoop));
             }
             visited.push(digest);
-            state.prepare_metadata(id, principal, paths)?
+            state.prepare_metadata(id, principal, &policy)?
         };
         let prepared = connector.connect(deadline)?.stage_metadata(metadata)?;
         let receipt = {
-            let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
+            let policy = paths.load_policy();
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
             if !connected(stream) {
-                return Err(failure("request disconnected"));
+                return Err(Error::State(Fault::Canceled));
             }
-            state.handoff_metadata(prepared, principal, paths)?
+            state.handoff_metadata(prepared, principal, &policy)?
         };
         let binding = match receipt.response() {
             Ok(binding) => binding,
             Err(crate::owner::github::response::MetadataFailure::Public(public)) => {
-                return response_until(stream, OperationResponse::Github(public), deadline);
+                return response_until(stream, OperationResponse::Github(public), deadline)
+                    .map_err(Error::from);
             }
             Err(crate::owner::github::response::MetadataFailure::Invalid) => {
-                return Err(failure("repository verification failed"));
+                return Err(Error::State(Fault::RepositoryMismatch));
             }
         };
         let request = {
-            let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-            state.prepare_github(id, principal, paths, binding)?
+            let policy = paths.load_policy();
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
+            state.prepare_github(id, principal, &policy, binding)?
         };
-        let prepared = checked(PreparedOperation::github(
-            request,
-            connector.connect(deadline)?,
-        ))?;
+        let prepared = PreparedOperation::github(request, connector.connect(deadline)?)?;
         let receipt = {
-            let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
+            let policy = paths.load_policy();
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
             if !connected(stream) {
-                return Err(failure("request disconnected"));
+                return Err(Error::State(Fault::Canceled));
             }
-            checked(state.handoff(prepared, principal, paths))?
+            state.handoff(prepared, principal, &policy)?
         };
         let outcome = receipt.response();
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
+        let policy = paths.load_policy();
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
         state.finish(id, &outcome)?;
         match outcome {
             OperationResponse::Redirect(redirect) => {
                 if redirects == 3 {
-                    return Err(failure("redirect limit exceeded"));
+                    return Err(Error::State(Fault::RedirectLimit));
                 }
-                id = state.redirect(*redirect, principal, paths)?;
+                id = state.redirect(*redirect, principal, &policy)?;
             }
             response_body => {
                 drop(state);
-                return response_until(stream, response_body, deadline);
+                return response_until(stream, response_body, deadline).map_err(Error::from);
             }
         }
     }
-    Err(failure("redirect limit exceeded"))
+    Err(Error::State(Fault::RedirectLimit))
 }

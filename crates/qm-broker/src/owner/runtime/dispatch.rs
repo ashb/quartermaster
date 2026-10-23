@@ -1,4 +1,5 @@
-use super::{ServicePaths, checked, failure, state::OwnerState};
+use super::error::{Error, Fault, Result};
+use super::{PolicyInput, state::OwnerState};
 use crate::owner::{
     dispatch::{
         self, InFlightOperation, PreparedGitHubRequest, PreparedOperation,
@@ -23,29 +24,29 @@ impl OwnerState {
         &mut self,
         prepared: PreparedOperation,
         principal: &VerifiedPrincipal,
-        paths: &ServicePaths,
-    ) -> Result<InFlightOperation, dispatch::Error> {
-        self.handoff_with_clock(prepared, principal, paths, presence_now)
+        policy: &PolicyInput,
+    ) -> Result<InFlightOperation> {
+        self.handoff_with_clock(prepared, principal, policy, presence_now)
     }
 
     pub(super) fn handoff_with_clock(
         &mut self,
         prepared: PreparedOperation,
         principal: &VerifiedPrincipal,
-        paths: &ServicePaths,
+        policy: &PolicyInput,
         clock: impl FnOnce() -> io::Result<MonotonicTimestamp>,
-    ) -> Result<InFlightOperation, dispatch::Error> {
-        self.refresh_policy(paths)
-            .map_err(|_| dispatch::Error::Unavailable)?;
-        self.operations
-            .check_provider_generation(prepared.id(), principal, self.provider.generation())
-            .map_err(dispatch::Error::Operation)?;
+    ) -> Result<InFlightOperation> {
+        self.refresh_policy(policy)?;
+        self.operations.check_provider_generation(
+            prepared.id(),
+            principal,
+            self.provider.generation(),
+        )?;
         if let Some(pending) = self.pending.as_ref().filter(|p| p.id == prepared.id()) {
-            let now = clock().map_err(|_| dispatch::Error::Unavailable)?;
+            let now = clock()?;
             let offset = self
                 .operations
-                .authentication_offset(pending.id, &pending.principal)
-                .map_err(dispatch::Error::Operation)?;
+                .authentication_offset(pending.id, &pending.principal)?;
             if pending
                 .created()
                 .checked_add(offset)
@@ -53,128 +54,119 @@ impl OwnerState {
                 .is_none_or(|age| age >= Duration::from_secs(30))
             {
                 self.cancel_pending();
-                return Err(dispatch::Error::Authorization(
-                    crate::owner::policy::AuthorizationError::Expired,
-                ));
+                return Err(crate::owner::policy::AuthorizationError::Expired.into());
             }
         }
         let snapshot = self
             .provider
             .snapshot()
-            .ok_or(dispatch::Error::CredentialMismatch)?;
-        prepared.handoff(
-            &mut self.operations,
-            &mut self.authorizer,
-            principal,
-            snapshot,
-        )
+            .ok_or(Error::Dispatch(dispatch::Error::CredentialMismatch))?;
+        prepared
+            .handoff(
+                &mut self.operations,
+                &mut self.authorizer,
+                principal,
+                snapshot,
+            )
+            .map_err(Error::from)
     }
 
     pub(super) fn prepare(
         &mut self,
         id: OperationId,
         principal: &VerifiedPrincipal,
-        paths: &ServicePaths,
-    ) -> io::Result<PreparedSimulationRequest> {
-        self.refresh_policy(paths)?;
-        checked(self.operations.check_provider_generation(
-            id,
-            principal,
-            self.provider.generation(),
-        ))?;
+        policy: &PolicyInput,
+    ) -> Result<PreparedSimulationRequest> {
+        self.refresh_policy(policy)?;
+        self.operations
+            .check_provider_generation(id, principal, self.provider.generation())?;
         let snapshot = self
             .provider
             .snapshot()
-            .ok_or_else(|| failure("vault is locked"))?;
-        checked(crate::owner::execution::prepare_simulation(
+            .ok_or_else(|| Error::State(Fault::VaultLocked))?;
+        crate::owner::execution::prepare_simulation(
             &self.operations,
             id,
             principal,
             &self.authorizer,
             snapshot,
             Instant::now(),
-        ))
+        )
+        .map_err(Error::from)
     }
 
-    pub(super) fn finish(
-        &mut self,
-        id: OperationId,
-        response: &OperationResponse,
-    ) -> io::Result<()> {
-        checked(self.operations.finish(id, response.completion()))
+    pub(super) fn finish(&mut self, id: OperationId, response: &OperationResponse) -> Result<()> {
+        self.operations
+            .finish(id, response.completion())
+            .map_err(Error::from)
     }
 
     pub(super) fn prepare_metadata(
         &mut self,
         id: OperationId,
         principal: &VerifiedPrincipal,
-        paths: &ServicePaths,
-    ) -> io::Result<PreparedMetadata> {
-        self.refresh_policy(paths)?;
-        checked(self.operations.check_provider_generation(
-            id,
-            principal,
-            self.provider.generation(),
-        ))?;
+        policy: &PolicyInput,
+    ) -> Result<PreparedMetadata> {
+        self.refresh_policy(policy)?;
+        self.operations
+            .check_provider_generation(id, principal, self.provider.generation())?;
         let snapshot = self
             .provider
             .snapshot()
-            .ok_or_else(|| failure("vault is locked"))?;
-        checked(crate::owner::execution::prepare_metadata(
+            .ok_or_else(|| Error::State(Fault::VaultLocked))?;
+        crate::owner::execution::prepare_metadata(
             &self.operations,
             id,
             principal,
             &self.authorizer,
             snapshot,
             Instant::now(),
-        ))
+        )
+        .map_err(Error::from)
     }
 
     pub(super) fn handoff_metadata(
         &mut self,
         prepared: PreparedMetadataTransport,
         principal: &VerifiedPrincipal,
-        paths: &ServicePaths,
-    ) -> io::Result<InFlightMetadata> {
-        self.refresh_policy(paths)?;
-        checked(self.operations.check_provider_generation(
+        policy: &PolicyInput,
+    ) -> Result<InFlightMetadata> {
+        self.refresh_policy(policy)?;
+        self.operations.check_provider_generation(
             prepared.request().id(),
             principal,
             self.provider.generation(),
-        ))?;
+        )?;
         let snapshot = self
             .provider
             .snapshot()
-            .ok_or_else(|| failure("vault is locked"))?;
+            .ok_or_else(|| Error::State(Fault::VaultLocked))?;
         prepared.validate()?;
-        let admission = checked(self.operations.admit_metadata(
+        let admission = self.operations.admit_metadata(
             prepared.request(),
             principal,
             &self.authorizer,
             snapshot,
             Instant::now(),
-        ))?;
-        prepared.handoff(admission)
+        )?;
+        prepared.handoff(admission).map_err(Error::from)
     }
 
     pub(super) fn prepare_github(
         &mut self,
         id: OperationId,
         principal: &VerifiedPrincipal,
-        paths: &ServicePaths,
+        policy: &PolicyInput,
         binding: RepositoryBinding,
-    ) -> io::Result<PreparedGitHubRequest> {
-        self.refresh_policy(paths)?;
-        checked(self.operations.check_provider_generation(
-            id,
-            principal,
-            self.provider.generation(),
-        ))?;
+    ) -> Result<PreparedGitHubRequest> {
+        self.refresh_policy(policy)?;
+        self.operations
+            .check_provider_generation(id, principal, self.provider.generation())?;
         let snapshot = self
             .provider
             .snapshot()
-            .ok_or_else(|| failure("vault is locked"))?;
-        checked(crate::owner::execution::prepare_github(
+            .ok_or_else(|| Error::State(Fault::VaultLocked))?;
+        crate::owner::execution::prepare_github(
             &self.operations,
             id,
             principal,
@@ -182,37 +174,36 @@ impl OwnerState {
             snapshot,
             binding,
             Instant::now(),
-        ))
+        )
+        .map_err(Error::from)
     }
 
     pub(super) fn redirect(
         &mut self,
         redirect: crate::owner::transport::ReadRedirect,
         principal: &VerifiedPrincipal,
-        paths: &ServicePaths,
-    ) -> io::Result<OperationId> {
-        self.refresh_policy(paths)?;
+        policy: &PolicyInput,
+    ) -> Result<OperationId> {
+        self.refresh_policy(policy)?;
         let snapshot = self
             .provider
             .snapshot()
-            .ok_or_else(|| failure("vault is locked"))?;
+            .ok_or_else(|| Error::State(Fault::VaultLocked))?;
         if redirect.selection.generation() != self.provider.generation()
             || !redirect.selection.matches_snapshot(snapshot)
         {
-            return Err(failure("provider selection changed"));
+            return Err(Error::State(Fault::ProviderChanged));
         }
         let outcome = self
             .authorizer
             .authorize(principal, redirect.target, Instant::now())
-            .map_err(|_| failure("redirect denied"))?;
+            .map_err(|_| Error::State(Fault::RedirectDenied))?;
         if !matches!(&outcome, AuthorizationOutcome::Allowed(_)) {
-            return Err(failure("redirect requires approval"));
+            return Err(Error::State(Fault::RedirectRequiresApproval));
         }
-        let id = checked(self.operations.register(outcome, Instant::now()))?;
-        checked(
-            self.operations
-                .select_credential(id, principal, redirect.selection),
-        )?;
+        let id = self.operations.register(outcome, Instant::now())?;
+        self.operations
+            .select_credential(id, principal, redirect.selection)?;
         Ok(id)
     }
 }

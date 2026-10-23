@@ -2,6 +2,8 @@ mod context;
 mod listener;
 mod peer;
 mod protocol;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use crate::platform::HostSessionEvent;
 use context::Generation;
@@ -11,12 +13,39 @@ use std::{
     io,
     marker::PhantomData,
     rc::Rc,
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, mpsc},
 };
 
 const MESSAGE_LIMIT: usize = 16_384;
-const REJECTED: &[u8] = br#"{"kind":"error"}"#;
-type Handler = dyn for<'a> Fn(Event<'a>) -> io::Result<Vec<u8>> + Send + Sync;
+const REJECTED: &[u8] = br#"{"kind":"error","code":"unavailable"}"#;
+type Handler = dyn for<'a> Fn(Event<'a>) -> io::Result<Response> + Send + Sync;
+
+pub(crate) enum Response {
+    Immediate(Vec<u8>),
+    Deferred(mpsc::Receiver<Vec<u8>>),
+}
+
+impl From<Vec<u8>> for Response {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Immediate(bytes)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PeerHandle {
+    peer: Weak<PeerState>,
+    id: ConnectionId,
+}
+
+impl PeerHandle {
+    pub(crate) fn id(&self) -> ConnectionId {
+        self.id
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.peer.upgrade().is_some_and(|peer| peer.is_connected())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ConnectionId(u64);
@@ -30,6 +59,13 @@ pub(crate) struct Connection<'a> {
 impl Connection<'_> {
     pub(crate) fn id(&self) -> ConnectionId {
         self.peer.id
+    }
+
+    pub(crate) fn handle(&self) -> PeerHandle {
+        PeerHandle {
+            peer: Arc::downgrade(self.peer),
+            id: self.id(),
+        }
     }
 
     pub(crate) fn release_context(&self) {
@@ -77,16 +113,11 @@ pub(crate) enum Event<'a> {
     HostSession(HostSessionEvent),
 }
 
-pub(crate) fn serve(
+pub(crate) fn listen(
     service: &str,
     requirement: &str,
-    handler: impl for<'a> Fn(Event<'a>) -> io::Result<Vec<u8>> + Send + Sync + 'static,
-) -> io::Result<()> {
-    let _listener = listener::Listener::new(service, requirement, Arc::new(handler))?;
-    loop {
-        objc2::rc::autoreleasepool(|_| {
-            let until = objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(60.0);
-            objc2_foundation::NSRunLoop::currentRunLoop().runUntilDate(&until);
-        });
-    }
+    events: crate::platform::lifecycle::HostEvents,
+    handler: impl for<'a> Fn(Event<'a>) -> io::Result<Response> + Send + Sync + 'static,
+) -> io::Result<listener::Listener> {
+    listener::Listener::new(service, requirement, events, Arc::new(handler))
 }

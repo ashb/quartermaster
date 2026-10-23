@@ -328,7 +328,8 @@ mod tests {
         let listener = Listener::new(
             &config.service,
             &config.client_requirement,
-            Arc::new(move |event| {
+            crate::platform::lifecycle::HostEvents::default(),
+            Arc::new(move |event: Event<'_>| {
                 let Event::Message {
                     connection,
                     context,

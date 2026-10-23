@@ -1,5 +1,5 @@
 use super::{
-    Connection, ConnectionId, Event, Handler, MESSAGE_LIMIT, REJECTED,
+    Connection, ConnectionId, Event, Handler, MESSAGE_LIMIT, REJECTED, Response,
     context::{ContextQueue, Generation, IncomingContext},
     listener::Server,
     protocol::{QuartermasterContextProtocol, ReplyBlock},
@@ -113,10 +113,10 @@ impl PeerState {
             }
             state.closed = true;
         }
+        self.contexts.clear();
         let _ = catch_unwind(AssertUnwindSafe(|| {
             (self.handler)(Event::Disconnected(self.id))
         }));
-        self.contexts.clear();
     }
 
     pub(super) fn invalidate(&self) {
@@ -131,6 +131,7 @@ impl PeerState {
         payload: &[u8],
         authenticated: Option<(Generation, &LAContext)>,
         reply: NativeReply,
+        slot: RequestSlot,
     ) {
         if !self.is_connected() {
             if let Some((generation, _)) = authenticated {
@@ -157,7 +158,22 @@ impl PeerState {
             })
         }));
         let response = match result {
-            Ok(Ok(response)) if response.len() <= MESSAGE_LIMIT => response,
+            Ok(Ok(Response::Immediate(response))) if response.len() <= MESSAGE_LIMIT => response,
+            Ok(Ok(Response::Deferred(receive))) if authenticated.is_none() => {
+                // Only owned bytes cross into Rust async work. The native reply and
+                // admission slot stay in this bounded native dispatch adapter.
+                DispatchQueue::global_queue(dispatch2::GlobalQueueIdentifier::QualityOfService(
+                    dispatch2::DispatchQoS::Utility,
+                ))
+                .exec_async(move || {
+                    let _slot = slot;
+                    let response = receive.recv_timeout(std::time::Duration::from_secs(120));
+                    objc2::rc::autoreleasepool(|_| {
+                        reply.send(response.as_deref().unwrap_or(REJECTED))
+                    });
+                });
+                return;
+            }
             _ => {
                 if let Some((generation, _)) = authenticated {
                     self.contexts.release(generation);
@@ -188,13 +204,15 @@ impl PeerState {
             Some(context) => {
                 self.contexts
                     .authenticate(context, move |authenticated| match authenticated {
-                        Some(authenticated) => slot.0.invoke(&payload, Some(authenticated), reply),
+                        Some(authenticated) => {
+                            Arc::clone(&slot.0).invoke(&payload, Some(authenticated), reply, slot)
+                        }
                         None => reply.send(REJECTED),
                     })
             }
             None => self.control.exec_async(move || {
                 objc2::rc::autoreleasepool(|_| {
-                    slot.0.invoke(&payload, None, reply);
+                    Arc::clone(&slot.0).invoke(&payload, None, reply, slot);
                 });
             }),
         }

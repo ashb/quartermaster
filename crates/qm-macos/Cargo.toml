@@ -10,6 +10,8 @@ qm-types.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFArray", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-io-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc"] }
 ring = "=0.17.14"
 security-framework = { version = "=3.7.0", features = ["OSX_10_15"] }
 security-framework-sys = { version = "2.15", features = ["OSX_10_15"] }

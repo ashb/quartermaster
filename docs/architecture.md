@@ -121,6 +121,26 @@ explains retained refresh state and rollback limits. Account/item verification
 and redirected authentication follow the
 [Vaultwarden redirect decision](decisions/0002-vaultwarden-redirects.md).
 
+## Runtime and persistence
+
+The macOS main thread runs a blocking native event loop with a registered wake
+source. One Tokio runtime owns socket admission and provider futures; blocking
+transport/storage work has bounded worker capacity. Native authentication
+contexts remain on the peer's serial queue and authenticated connection
+generation. Async work receives owned data and reply channels.
+
+The authority mutex serializes authorization transitions. A separate cache
+transaction lock covers preparation and publication, so filesystem work does not
+block cancellation or authority checks. Publication admission checks the original
+operation generation and source revision under the authority mutex; writes and
+fsync happen outside it. Installation rechecks generation after the write.
+
+Admission samples the kernel console generation, monotonic sleep/wake stamps
+and login UUID alongside notification-driven revocation. These private macOS
+properties need qualification on supported OS versions and can conservatively
+revoke work on other console updates. UTC sync timestamps and shared macOS
+monotonic samples have distinct types and clock lifetimes.
+
 ## Caller attribution
 
 The broker verifies the socket peer's running code through its kernel audit

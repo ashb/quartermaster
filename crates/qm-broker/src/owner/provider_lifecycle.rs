@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use qm_providers::{ProviderBinding, VaultSnapshot};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use time::OffsetDateTime;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,6 +59,7 @@ pub(super) struct ProviderOperation {
     generation: ProviderGeneration,
     revision: PersistedRevision,
     work: Work,
+    _lifetime: Arc<()>,
 }
 
 struct UnlockedSnapshot {
@@ -69,6 +70,7 @@ struct UnlockedSnapshot {
 struct ActiveWork {
     id: u64,
     canceled: bool,
+    lifetime: Weak<()>,
 }
 
 #[derive(Default)]
@@ -123,19 +125,26 @@ impl ProviderState {
         work: Work,
         revision: PersistedRevision,
     ) -> Result<ProviderOperation, Error> {
-        if self.active.is_some() {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.lifetime.strong_count() != 0)
+        {
             return Err(Error::Busy);
         }
         self.next_id = self.next_id.checked_add(1).ok_or(Error::Exhausted)?;
+        let lifetime = Arc::new(());
         self.active = Some(ActiveWork {
             id: self.next_id,
             canceled: false,
+            lifetime: Arc::downgrade(&lifetime),
         });
         Ok(ProviderOperation {
             id: self.next_id,
             generation: self.generation,
             revision,
             work,
+            _lifetime: lifetime,
         })
     }
 
@@ -264,7 +273,7 @@ impl ProviderState {
         operation: ProviderOperation,
         current: PersistedRevision,
         snapshot: VaultSnapshot,
-    ) -> Result<Update<'_>, Error> {
+    ) -> Result<Update, Error> {
         let validation = self.check(&operation, current).and_then(|()| {
             let (binding, minimum_sync) = match &operation.work {
                 Work::Refresh(expected) => (Some(&expected.binding), expected.synchronized_at),
@@ -290,7 +299,6 @@ impl ProviderState {
             }
         };
         Ok(Update {
-            state: self,
             operation,
             snapshot: Some(snapshot),
             generation,
@@ -298,15 +306,21 @@ impl ProviderState {
     }
 }
 
-pub(super) struct Update<'a> {
-    state: &'a mut ProviderState,
+pub(super) struct Update {
     operation: ProviderOperation,
     snapshot: Option<VaultSnapshot>,
     generation: ProviderGeneration,
 }
 
-impl Update<'_> {
-    pub(super) fn install(mut self, identity: CacheIdentity) -> Result<(), Error> {
+impl Update {
+    pub(super) fn install(
+        mut self,
+        state: &mut ProviderState,
+        identity: CacheIdentity,
+    ) -> Result<(), Error> {
+        let check = state.check(&self.operation, self.operation.revision);
+        state.release(&self.operation);
+        check?;
         if let Work::Refresh(original) = &self.operation.work
             && (identity.binding != original.binding
                 || identity.scope != original.scope
@@ -317,18 +331,12 @@ impl Update<'_> {
         if !identity.matches(self.snapshot.as_ref().unwrap()) {
             return Err(Error::Changed);
         }
-        self.state.unlocked = Some(UnlockedSnapshot {
+        state.unlocked = Some(UnlockedSnapshot {
             snapshot: Arc::new(self.snapshot.take().unwrap()),
             identity,
         });
-        self.state.generation = self.generation;
+        state.generation = self.generation;
         Ok(())
-    }
-}
-
-impl Drop for Update<'_> {
-    fn drop(&mut self) {
-        self.state.release(&self.operation);
     }
 }
 
@@ -512,7 +520,7 @@ mod tests {
         state
             .prepare_update(ticket, original.revision, refreshed)
             .unwrap()
-            .install(committed.clone())
+            .install(&mut state, committed.clone())
             .unwrap();
 
         assert_ne!(state.generation(), generation);

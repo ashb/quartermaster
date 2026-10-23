@@ -1,4 +1,5 @@
-use super::{ServicePaths, Shared, checked, failure, state::OwnerState};
+use super::error::{Error, Fault, Result};
+use super::{ServicePaths, Shared, state::OwnerState};
 use crate::owner::{
     dispatch::CredentialSelection,
     identity::VerifiedPrincipal,
@@ -16,7 +17,6 @@ use qm_providers::ApprovalSession;
 use ring::digest::{SHA256, digest};
 use serde::Serialize;
 use std::{
-    io,
     process::Command,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
@@ -103,24 +103,33 @@ pub(super) fn request_approval(
     created: MonotonicTimestamp,
     shared: &Shared,
     paths: &ServicePaths,
-) -> io::Result<mpsc::Receiver<ApprovalCompletion>> {
+) -> Result<mpsc::Receiver<ApprovalCompletion>> {
+    let generation = shared
+        .0
+        .lock()
+        .map_err(|_| Error::State(Fault::StateUnavailable))?
+        .provider
+        .generation();
+    let source = crate::owner::vault::Source::capture(&paths.root)?;
+    let identity = source.identity()?;
     let (operation, authorization, frozen) = {
-        let state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-        let source = crate::owner::vault::Source::capture(&paths.root)
-            .map_err(|_| failure("cache unavailable"))?;
-        let identity = source
-            .identity()
-            .map_err(|_| failure("cache unavailable"))?;
+        let state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        if state.provider.generation() != generation {
+            return Err(Error::State(Fault::ProviderChanged));
+        }
         if identity.binding.field() != &qm_providers::CredentialField::LoginPassword {
-            return Err(failure("unsupported credential field"));
+            return Err(Error::State(Fault::UnsupportedField));
         }
         (
-            checked(state.operations.request(id, principal))?.clone(),
-            checked(state.operations.grant_claims(id, principal))?,
+            state.operations.request(id, principal)?.clone(),
+            state.operations.grant_claims(id, principal)?,
             FrozenProvider {
                 source: Some(source),
                 identity,
-                generation: state.provider.generation(),
+                generation,
             },
         )
     };
@@ -139,31 +148,38 @@ pub(super) fn request_approval(
         .status()?
         .success()
     {
-        return Err(failure("cannot launch approval app"));
+        return Err(Error::State(Fault::LaunchFailed));
     }
-    let state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-    let (mut state, _) = shared
+    let state = shared
+        .0
+        .lock()
+        .map_err(|_| Error::State(Fault::StateUnavailable))?;
+    let (state, _) = shared
         .1
         .wait_timeout_while(state, Duration::from_secs(15), |s| s.ui.is_none())
-        .map_err(|_| failure("state unavailable"))?;
-    state.refresh_policy(paths)?;
+        .map_err(|_| Error::State(Fault::StateUnavailable))?;
+    drop(state);
+    let current = crate::owner::vault::Source::capture(&paths.root)?;
+    let policy = paths.load_policy();
+    let mut state = shared
+        .0
+        .lock()
+        .map_err(|_| Error::State(Fault::StateUnavailable))?;
+    state.refresh_policy(&policy)?;
     if state.pending.is_some() {
-        return Err(failure("another approval is pending"));
+        return Err(Error::State(Fault::ApprovalPending));
     }
     if state.provider.generation() != frozen.generation
-        || crate::owner::vault::Source::capture(&paths.root)
-            .map_err(|_| failure("cache unavailable"))?
-            .revision
-            != frozen.identity.revision
+        || current.revision != frozen.identity.revision
     {
-        return Err(failure("provider selection changed"));
+        return Err(Error::State(Fault::ProviderChanged));
     }
-    checked(state.operations.bind_review(id, principal, &document))?;
+    state.operations.bind_review(id, principal, &document)?;
     let OwnerState { operations, ui, .. } = &mut *state;
     let ui = ui
         .as_ref()
-        .ok_or_else(|| failure("approval UI did not connect"))?;
-    checked(operations.begin_approval(id, principal, &ui.session))?;
+        .ok_or_else(|| Error::State(Fault::UiDisconnected))?;
+    operations.begin_approval(id, principal, &ui.session)?;
     let (completion, receive) = mpsc::sync_channel(1);
     state.pending = Some(ApprovalDelivery {
         id,
@@ -181,113 +197,103 @@ pub(super) fn begin_native_presence(
     id: OperationId,
     authenticated: MonotonicTimestamp,
     state: &mut OwnerState,
-    paths: &ServicePaths,
-) -> io::Result<
+    policy: &super::PolicyInput,
+    current: Result<CacheIdentity, crate::owner::vault::Error>,
+) -> Result<
     Option<(
         crate::owner::vault::Source,
         crate::owner::provider_lifecycle::ProviderOperation,
     )>,
 > {
-    state.refresh_policy(paths)?;
+    state.refresh_policy(policy)?;
+    state.ensure_interactive()?;
     let pending = state
         .pending
         .as_mut()
         .filter(|pending| pending.id == id)
-        .ok_or_else(|| failure("no matching pending request"))?;
+        .ok_or_else(|| Error::State(Fault::PendingMissing))?;
     if !pending.delivered {
-        return Err(failure("review has not been presented"));
+        return Err(Error::State(Fault::ReviewNotPresented));
     }
     let anchor = Instant::now();
     let age = presence_now()?
         .checked_duration_since(authenticated)
         .filter(|age| *age < Duration::from_secs(30))
-        .ok_or_else(|| failure("expired authentication"))?;
+        .ok_or_else(|| Error::State(Fault::ApprovalExpired))?;
     let offset = authenticated
         .checked_duration_since(pending.created())
         .filter(|offset| *offset < Duration::from_secs(120))
-        .ok_or_else(|| failure("expired pending request"))?;
+        .ok_or_else(|| Error::State(Fault::ApprovalExpired))?;
     let frozen = &mut pending.provider;
-    if frozen.generation != state.provider.generation()
-        || crate::owner::vault::Source::capture(&paths.root)
-            .and_then(|source| source.identity())
-            .map_err(|_| failure("cache unavailable"))?
-            != frozen.identity
-    {
-        return Err(failure("provider selection changed"));
+    if frozen.generation != state.provider.generation() || current? != frozen.identity {
+        return Err(Error::State(Fault::ProviderChanged));
     }
     let at = anchor
         .checked_sub(age + Duration::from_millis(1))
-        .ok_or_else(|| failure("invalid presence clock"))?;
-    checked(
-        state
-            .operations
-            .authentication(id, &pending.principal, at, anchor, offset),
-    )?;
+        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
+    state
+        .operations
+        .authentication(id, &pending.principal, at, anchor, offset)?;
     if state.provider.snapshot().is_some() {
-        checked(state.provider.snapshot_for(&frozen.identity))?;
+        state.provider.snapshot_for(&frozen.identity)?;
         return Ok(None);
     }
-    let operation = checked(state.provider.begin_unlock(frozen.identity.clone()))?;
+    let operation = state.provider.begin_unlock(frozen.identity.clone())?;
     let source = frozen
         .source
         .take()
-        .ok_or_else(|| failure("cache already being opened"))?;
+        .ok_or_else(|| Error::State(Fault::CacheOpening))?;
     Ok(Some((source, operation)))
 }
 
 pub(super) fn complete_native_presence(
     id: OperationId,
     state: &mut OwnerState,
-    paths: &ServicePaths,
-) -> io::Result<Reply> {
-    state.refresh_policy(paths)?;
+    policy: &super::PolicyInput,
+    current: Result<CacheIdentity, crate::owner::vault::Error>,
+) -> Result<Reply> {
+    state.refresh_policy(policy)?;
     let pending = state
         .pending
         .as_ref()
         .filter(|pending| pending.id == id)
-        .ok_or_else(|| failure("request cancelled"))?;
-    let offset = checked(
-        state
-            .operations
-            .authentication_offset(id, &pending.principal),
-    )?;
+        .ok_or_else(|| Error::State(Fault::Canceled))?;
+    let offset = state
+        .operations
+        .authentication_offset(id, &pending.principal)?;
     let authenticated = pending
         .created()
         .checked_add(offset)
-        .ok_or_else(|| failure("invalid authentication clock"))?;
+        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
     if presence_now()?
         .checked_duration_since(authenticated)
         .is_none_or(|age| age >= Duration::from_secs(30))
     {
-        return Err(failure("authentication expired"));
+        return Err(Error::State(Fault::ApprovalExpired));
     }
     let frozen = &pending.provider;
-    let snapshot = checked(state.provider.snapshot_for(&frozen.identity))?;
-    let current = crate::owner::vault::Source::capture(&paths.root)
-        .and_then(|source| source.identity())
-        .map_err(|_| failure("cache unavailable"))?;
+    let snapshot = state.provider.snapshot_for(&frozen.identity)?;
+    let current = current?;
     if frozen.generation != state.provider.generation() || current != frozen.identity {
-        return Err(failure("provider selection changed"));
+        return Err(Error::State(Fault::ProviderChanged));
     }
     let selection = CredentialSelection::at_generation(snapshot, state.provider.generation());
-    let challenge = checked(
-        state
-            .operations
-            .challenge(id, &pending.principal, selection),
-    )?;
+    let challenge = state
+        .operations
+        .challenge(id, &pending.principal, selection)?;
     let authenticated = pending
         .created()
         .checked_add(challenge.offset)
-        .ok_or_else(|| failure("invalid authentication clock"))?;
+        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
     let ui = state
         .ui
         .as_ref()
-        .ok_or_else(|| failure("UI disconnected"))?;
-    let policy = checked(state.authorizer.policy_digest())?;
-    let nonce = checked(state.operations.approval_nonce(id, &pending.principal))?;
+        .ok_or_else(|| Error::State(Fault::UiDisconnected))?;
+    let policy = state.authorizer.policy_digest()?;
+    let nonce = state.operations.approval_nonce(id, &pending.principal)?;
     let expires = authenticated
         .checked_add(Duration::from_secs(30))
-        .ok_or_else(|| failure("invalid clock"))?;
+        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
     Ok(Reply::Challenge {
         authorization: ApprovalChallenge {
             review: pending.review(ui, policy, nonce),
@@ -306,53 +312,65 @@ pub(super) fn native_presence(
     connection: &ipc::Connection<'_>,
     shared: &Shared,
     paths: &ServicePaths,
-) -> io::Result<Reply> {
-    let id = checked(OperationId::parse(id))?;
+) -> Result<Reply> {
+    let id = OperationId::parse(id)?;
     let deadline = authenticated
         .checked_add(Duration::from_secs(30))
-        .ok_or_else(|| failure("invalid authentication deadline"))?;
+        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
     let lease = connection.context_lease(deadline)?;
+    let current =
+        crate::owner::vault::Source::capture(&paths.root).and_then(|source| source.identity());
+    let policy = paths.load_policy();
     let work = {
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
         if !connection.is_connected()
             || state
                 .ui
                 .as_ref()
                 .is_none_or(|ui| ui.connection != Some(connection.id()))
         {
-            return Err(failure("UI disconnected"));
+            return Err(Error::State(Fault::UiDisconnected));
         }
-        let work = begin_native_presence(id, authenticated, &mut state, paths)?;
+        let work = begin_native_presence(id, authenticated, &mut state, &policy, current)?;
         state.pending.as_mut().unwrap().context_lease = Some(lease);
         work
     };
     if let Some((source, operation)) = work {
-        let result = presence_now().and_then(|now| {
+        let result = presence_now().map_err(Error::from).and_then(|now| {
             if now
                 .checked_duration_since(authenticated)
                 .is_none_or(|age| age >= Duration::from_secs(30))
             {
-                return Err(failure("authentication expired"));
+                return Err(Error::State(Fault::ApprovalExpired));
             }
-            source
-                .unlock_authenticated(context)
-                .map_err(|_| failure("cache authentication failed"))
+            source.unlock_authenticated(context).map_err(Error::from)
         });
-        let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
+        let identity =
+            crate::owner::vault::Source::capture(&paths.root).and_then(|source| source.identity());
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.ensure_host_session()?;
         match result {
-            Ok(snapshot) => crate::owner::vault::finish_unlock(
-                &paths.root,
-                &mut state.provider,
-                operation,
-                snapshot,
-            )
-            .map_err(|_| failure("cache unlock superseded"))?,
-            Err(_) => {
+            Ok(snapshot) => state
+                .provider
+                .finish_unlock(operation, &identity?, snapshot)?,
+            Err(error) => {
                 state.provider.release(&operation);
-                return Err(failure("cache authentication failed"));
+                return Err(error);
             }
         }
     }
-    let mut state = shared.0.lock().map_err(|_| failure("state unavailable"))?;
-    complete_native_presence(id, &mut state, paths)
+    let current =
+        crate::owner::vault::Source::capture(&paths.root).and_then(|source| source.identity());
+    let policy = paths.load_policy();
+    let mut state = shared
+        .0
+        .lock()
+        .map_err(|_| Error::State(Fault::StateUnavailable))?;
+    complete_native_presence(id, &mut state, &policy, current)
 }

@@ -20,6 +20,7 @@ pub trait BackupExclusion {
 pub struct CacheStore<B> {
     directory: File,
     backup: B,
+    transaction: Option<File>,
 }
 
 impl<B: BackupExclusion> CacheStore<B> {
@@ -43,7 +44,20 @@ impl<B: BackupExclusion> CacheStore<B> {
         if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
             return Err(io::Error::other("unsafe cache directory"));
         }
-        Ok(Self { directory, backup })
+        Ok(Self {
+            directory,
+            backup,
+            transaction: None,
+        })
+    }
+
+    /// Hold the cache lock across manifest and snapshot operations. Contention
+    /// returns immediately; dropping the store releases the transaction.
+    pub fn transaction(mut self) -> io::Result<Self> {
+        if self.transaction.is_none() {
+            self.transaction = self.lock()?;
+        }
+        Ok(self)
     }
 
     pub fn save(&self, bytes: &[u8]) -> io::Result<()> {
@@ -119,14 +133,17 @@ impl<B: BackupExclusion> CacheStore<B> {
         self.directory.sync_all()
     }
 
-    fn lock(&self) -> io::Result<File> {
+    fn lock(&self) -> io::Result<Option<File>> {
+        if self.transaction.is_some() {
+            return Ok(None);
+        }
         let file = self
             .open_file(c"vault.lock", libc::O_RDWR | libc::O_CREAT)?
             .ok_or_else(|| io::Error::other("missing cache lock"))?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(file)
+        Ok(Some(file))
     }
 
     fn open_file(&self, name: &CStr, flags: i32) -> io::Result<Option<File>> {
@@ -238,6 +255,34 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory
+    }
+
+    #[test]
+    fn a_transaction_serializes_manifest_and_snapshot_until_the_store_is_dropped() {
+        let directory = directory();
+        let path = directory.path().canonicalize().unwrap();
+        let store = CacheStore::open(&path, BackupFixture::default())
+            .unwrap()
+            .transaction()
+            .unwrap()
+            .transaction()
+            .unwrap();
+        store.save_enrollment(b"manifest").unwrap();
+        store.save(b"snapshot").unwrap();
+        assert_eq!(
+            store.load_enrollment().unwrap().as_deref(),
+            Some(b"manifest".as_slice())
+        );
+        let competing = CacheStore::open(&path, BackupFixture::default()).unwrap();
+        assert_eq!(
+            competing.load().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(store);
+        assert_eq!(
+            competing.load().unwrap().as_deref(),
+            Some(b"snapshot".as_slice())
+        );
     }
 
     #[test]

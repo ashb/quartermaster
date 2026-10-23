@@ -4,6 +4,7 @@ use super::{
     protocol,
 };
 use crate::platform::HostSessionEvent;
+use crate::platform::lifecycle::HostEvents;
 use block2::RcBlock;
 use objc2::{
     AnyThread, DefinedClass, define_class, msg_send,
@@ -37,18 +38,21 @@ pub(super) struct Server {
     pub(super) handler: Arc<Handler>,
     peers: Mutex<BTreeMap<ConnectionId, Arc<PeerState>>>,
     closed: AtomicBool,
+    events: HostEvents,
 }
 
 impl Server {
-    pub(super) fn new(handler: Arc<Handler>) -> Arc<Self> {
+    pub(super) fn new(events: HostEvents, handler: Arc<Handler>) -> Arc<Self> {
         Arc::new(Self {
             handler,
             peers: Mutex::default(),
             closed: AtomicBool::new(false),
+            events,
         })
     }
 
-    fn close(&self) {
+    pub(super) fn close(&self) {
+        self.events.fail();
         self.closed.store(true, Ordering::Release);
         let peers = std::mem::take(&mut *self.peers.lock().unwrap());
         for peer in peers.into_values() {
@@ -61,6 +65,7 @@ impl Server {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
+        self.events.record(event);
         let _ = catch_unwind(AssertUnwindSafe(|| {
             (self.handler)(Event::HostSession(event))
         }));
@@ -124,7 +129,7 @@ define_class!(
     #[unsafe(super = NSObject)]
     #[name = "QuartermasterRustListener"]
     #[ivars = Arc<Server>]
-    struct Delegate;
+    pub(super) struct Delegate;
 
     unsafe impl NSObjectProtocol for Delegate {}
 
@@ -158,13 +163,13 @@ define_class!(
 );
 
 impl Delegate {
-    fn new(state: Arc<Server>) -> Retained<Self> {
+    pub(super) fn new(state: Arc<Server>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(state);
         unsafe { msg_send![super(this), init] }
     }
 }
 
-pub(super) struct Listener {
+pub(crate) struct Listener {
     listener: Retained<NSXPCListener>,
     delegate: Retained<Delegate>,
     workspace: Retained<NSNotificationCenter>,
@@ -172,7 +177,12 @@ pub(super) struct Listener {
 }
 
 impl Listener {
-    pub(super) fn new(service: &str, requirement: &str, handler: Arc<Handler>) -> io::Result<Self> {
+    pub(super) fn new<R: Into<super::Response> + 'static>(
+        service: &str,
+        requirement: &str,
+        events: HostEvents,
+        handler: Arc<impl for<'a> Fn(Event<'a>) -> io::Result<R> + Send + Sync + 'static>,
+    ) -> io::Result<Self> {
         if service.contains('\0') || requirement.contains('\0') {
             return Err(io::Error::other("invalid native listener configuration"));
         }
@@ -187,7 +197,10 @@ impl Listener {
             &NSString::from_str(service),
         );
         listener.setConnectionCodeSigningRequirement(&NSString::from_str(requirement));
-        let delegate = Delegate::new(Server::new(handler));
+        let delegate = Delegate::new(Server::new(
+            events,
+            Arc::new(move |event| handler(event).map(Into::into)),
+        ));
         let workspace = NSWorkspace::sharedWorkspace().notificationCenter();
         let distributed = NSDistributedNotificationCenter::defaultCenter();
         unsafe {
@@ -238,110 +251,17 @@ impl Drop for Listener {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{DataReplyEncoding, Fixture, send, start_send};
     use super::super::{
-        ContextLease, MESSAGE_LIMIT, REJECTED, protocol::QuartermasterContextProtocol,
+        ContextLease, MESSAGE_LIMIT, REJECTED, Response, protocol::QuartermasterContextProtocol,
     };
     use super::*;
-    use block2::ManualBlockEncoding;
-    use objc2::{rc::Retained, runtime::ProtocolObject};
     use objc2_foundation::NSData;
     use objc2_local_authentication::LAContext;
     use std::{
         sync::{atomic::AtomicUsize, mpsc},
         time::{Duration, Instant},
     };
-
-    struct Fixture {
-        listener: Retained<NSXPCListener>,
-        _delegate: Retained<Delegate>,
-        server: Arc<Server>,
-    }
-
-    impl Fixture {
-        fn new(
-            handler: impl for<'a> Fn(Event<'a>) -> io::Result<Vec<u8>> + Send + Sync + 'static,
-        ) -> Self {
-            let requirement =
-                qm_macos::peer_identity::requirement_for_path(&std::env::current_exe().unwrap())
-                    .unwrap();
-            Self::with_requirement(handler, &requirement)
-        }
-
-        fn with_requirement(
-            handler: impl for<'a> Fn(Event<'a>) -> io::Result<Vec<u8>> + Send + Sync + 'static,
-            requirement: &str,
-        ) -> Self {
-            let listener = NSXPCListener::anonymousListener();
-            listener.setConnectionCodeSigningRequirement(&NSString::from_str(requirement));
-            let server = Server::new(Arc::new(handler));
-            let delegate = Delegate::new(Arc::clone(&server));
-            listener.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-            listener.resume();
-            Self {
-                listener,
-                _delegate: delegate,
-                server,
-            }
-        }
-
-        fn client(&self) -> Retained<NSXPCConnection> {
-            let client = NSXPCConnection::initWithListenerEndpoint(
-                NSXPCConnection::alloc(),
-                &self.listener.endpoint(),
-            );
-            client.setRemoteObjectInterface(Some(&protocol::interface()));
-            client.resume();
-            client
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            self.server.close();
-            self.listener.invalidate();
-        }
-    }
-
-    struct DataReplyEncoding;
-
-    // XPC requires the concrete object class in the reply block's argument metadata.
-    unsafe impl ManualBlockEncoding for DataReplyEncoding {
-        type Arguments = (std::ptr::NonNull<NSData>,);
-        type Return = ();
-        const ENCODING_CSTR: &'static std::ffi::CStr = cr#"v16@?0@"NSData"8"#;
-    }
-
-    fn start_send(
-        client: &NSXPCConnection,
-        bytes: &[u8],
-        context: Option<&LAContext>,
-    ) -> mpsc::Receiver<io::Result<Vec<u8>>> {
-        let (send, receive) = mpsc::sync_channel(1);
-        let failed = send.clone();
-        let error = RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSError>| {
-            let _ = failed.send(Err(io::Error::other("native XPC request failed")));
-        });
-        let reply = RcBlock::with_encoding::<_, _, _, DataReplyEncoding>(
-            move |data: std::ptr::NonNull<NSData>| {
-                let _ = send.send(Ok(unsafe { data.as_ref() }.to_vec()));
-            },
-        );
-        let proxy: Retained<ProtocolObject<dyn QuartermasterContextProtocol>> =
-            unsafe { Retained::cast_unchecked(client.remoteObjectProxyWithErrorHandler(&error)) };
-        let message = NSData::with_bytes(bytes);
-        match context {
-            Some(context) => proxy.authenticate(Some(&message), Some(context), Some(&reply)),
-            None => proxy.send(Some(&message), Some(&reply)),
-        }
-        receive
-    }
-
-    fn send(client: &NSXPCConnection, bytes: &[u8], context: Option<&LAContext>) -> Vec<u8> {
-        start_send(client, bytes, context)
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-    }
 
     #[test]
     fn missing_native_arguments_cannot_reach_the_handler() {
@@ -465,7 +385,7 @@ mod tests {
     #[test]
     fn code_requirement_and_connection_limit_are_enforced_before_message_delivery() {
         let denied = Fixture::with_requirement(
-            |_| panic!("rejected peer reached handler"),
+            |_| -> io::Result<Vec<u8>> { panic!("rejected peer reached handler") },
             "identifier \"quartermaster.no-such-client\"",
         );
         let client = denied.client();
@@ -557,5 +477,72 @@ mod tests {
             assert_eq!(send(&client, b"retry", Some(&second)), b"accepted");
             client.invalidate();
         }
+    }
+
+    #[test]
+    fn deferred_work_releases_the_control_queue_but_keeps_its_admission_slot() {
+        let (entered, ready) = mpsc::sync_channel(1);
+        let (complete, result) = mpsc::sync_channel(1);
+        let result = Mutex::new(Some(result));
+        let fixture = Fixture::new(move |event| {
+            if let Event::Message { payload, .. } = event {
+                if payload == b"provider" {
+                    entered.send(()).unwrap();
+                    return Ok(Response::Deferred(result.lock().unwrap().take().unwrap()));
+                }
+                return Ok(Response::Immediate(payload.to_vec()));
+            }
+            Ok(Response::Immediate(Vec::new()))
+        });
+        let client = fixture.client();
+        let provider = start_send(&client, b"provider", None);
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(send(&client, b"cancel", None), b"cancel");
+        complete.send(b"completed".to_vec()).unwrap();
+        assert_eq!(
+            provider
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            b"completed"
+        );
+        client.invalidate();
+    }
+
+    #[test]
+    fn failed_async_work_rejects_the_reply_and_releases_capacity() {
+        let fixture = Fixture::new(|event| {
+            if let Event::Message { payload, .. } = event {
+                if payload == b"failed" {
+                    let (_, receive) = mpsc::sync_channel(1);
+                    return Ok(Response::Deferred(receive));
+                }
+                return Ok(Response::Immediate(payload.to_vec()));
+            }
+            Ok(Response::Immediate(Vec::new()))
+        });
+        let client = fixture.client();
+        assert_eq!(send(&client, b"failed", None), REJECTED);
+        assert_eq!(send(&client, b"available", None), b"available");
+        client.invalidate();
+    }
+
+    #[test]
+    fn authenticated_requests_cannot_defer_their_borrowed_context() {
+        let calls = AtomicUsize::new(0);
+        let fixture = Fixture::new(move |event| {
+            if matches!(event, Event::Message { .. }) && calls.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                let (_, receive) = mpsc::sync_channel(1);
+                return Ok(Response::Deferred(receive));
+            }
+            Ok(Response::Immediate(b"accepted".to_vec()))
+        });
+        let client = fixture.client();
+        let first = unsafe { LAContext::new() };
+        assert_eq!(send(&client, b"defer", Some(&first)), REJECTED);
+        let second = unsafe { LAContext::new() };
+        assert_eq!(send(&client, b"retry", Some(&second)), b"accepted");
+        client.invalidate();
     }
 }

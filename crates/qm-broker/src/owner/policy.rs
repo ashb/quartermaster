@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum AuthorizationError {
     InvalidPolicy,
     Denied,
@@ -52,7 +52,7 @@ impl SessionPolicy {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct Policy {
     version: u8,
     writes: PolicyDecision,
@@ -76,7 +76,7 @@ impl Policy {
         self
     }
 
-    fn digest(&self) -> [u8; 32] {
+    pub(super) fn digest(&self) -> [u8; 32] {
         let mut hash = ring::digest::Context::new(&SHA256);
         hash.update(&serde_json::to_vec(self).expect("policy contains only serializable data"));
         if let Some(config) = &self.github {
@@ -261,15 +261,20 @@ impl Authorizer {
             self.grants.clamp_expiry(wall_now, now, anchor);
             return Ok(false);
         }
+        self.invalidate_policy()?;
+        let policy = decoded?;
+        self.policy = Some(policy);
+        Ok(true)
+    }
+
+    pub(super) fn invalidate_policy(&mut self) -> Result<(), AuthorizationError> {
         self.policy = None;
         self.grants = GrantTable::default();
         self.policy_generation = self
             .policy_generation
             .checked_add(1)
             .ok_or(AuthorizationError::InvalidPolicy)?;
-        let policy = decoded?;
-        self.policy = Some(policy);
-        Ok(true)
+        Ok(())
     }
 
     pub(super) fn authorize(

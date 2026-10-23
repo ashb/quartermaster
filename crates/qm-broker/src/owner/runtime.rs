@@ -1,40 +1,36 @@
 mod approval;
 mod control;
 mod dispatch;
+mod error;
+
 mod http;
+mod policy_source;
 mod state;
 mod vault_workflow;
 
-use crate::owner::{protocol::ControlError, transport::OperationResponse};
+use crate::owner::transport::OperationResponse;
+use error::{Error, Fault, Result};
 use ring::rand::{SecureRandom, SystemRandom};
 use state::OwnerState;
 use std::{
     fs::{self, OpenOptions},
-    io,
     os::{
         fd::AsRawFd,
         unix::{
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
+            net::UnixListener,
         },
     },
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
-    thread,
 };
 
 const SERVICE: &str = "dev.quartermaster.debug.backend";
 const PROFILE: &str = "development";
 
-fn failure(message: impl Into<String>) -> io::Error {
-    io::Error::other(message.into())
-}
-fn checked<T, E: Into<ControlError>>(result: Result<T, E>) -> io::Result<T> {
-    result.map_err(|error| io::Error::other(error.into()))
-}
-fn random<const N: usize>() -> io::Result<[u8; N]> {
+fn random<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0; N];
-    checked(SystemRandom::new().fill(&mut bytes))?;
+    SystemRandom::new().fill(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -42,57 +38,29 @@ fn random<const N: usize>() -> io::Result<[u8; N]> {
 struct ServicePaths {
     app: PathBuf,
     root: PathBuf,
+    policy: Arc<policy_source::PolicySource>,
+}
+
+type PolicyInput =
+    std::result::Result<policy_source::Observation, crate::owner::policy::AuthorizationError>;
+
+impl ServicePaths {
+    fn load_policy(&self) -> PolicyInput {
+        self.policy
+            .read(|| crate::owner::persistence::policy(&self.root))
+    }
 }
 
 type Shared = Arc<(Mutex<OwnerState>, Condvar)>;
 
-fn serve_connections(
-    incoming: impl Iterator<Item = io::Result<UnixStream>>,
-    shared: Shared,
-    paths: ServicePaths,
-) -> io::Result<()> {
-    thread::scope(|scope| {
-        let (send, receive) = mpsc::sync_channel::<UnixStream>(8);
-        let receive = Arc::new(Mutex::new(receive));
-        let mut workers = Vec::new();
-        for _ in 0..4 {
-            let receive = Arc::clone(&receive);
-            let shared = Arc::clone(&shared);
-            let paths = paths.clone();
-            workers.push(scope.spawn(move || -> io::Result<()> {
-                loop {
-                    let next = receive
-                        .lock()
-                        .map_err(|_| failure("ingress unavailable"))?
-                        .recv();
-                    let Ok(mut stream) = next else {
-                        return Ok(());
-                    };
-                    if let Err(error) = http::handle_http(&mut stream, &shared, &paths) {
-                        eprintln!("Request denied: {error}");
-                        let _ = http::response(&mut stream, OperationResponse::Denied);
-                    }
-                }
-            }));
-        }
-        for stream in incoming {
-            send.send(stream?)
-                .map_err(|_| failure("ingress workers stopped"))?;
-        }
-        drop(send);
-        for worker in workers {
-            worker
-                .join()
-                .map_err(|_| failure("ingress worker stopped"))??;
-        }
-        Ok(())
-    })
-}
-
-pub(super) fn serve(options: crate::ServiceOptions) -> io::Result<()> {
+pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
+    if objc2::MainThreadMarker::new().is_none() {
+        return Err(Error::State(Fault::MainThreadRequired));
+    }
     let paths = ServicePaths {
         app: options.bundle_root,
         root: options.storage_root,
+        policy: Arc::default(),
     };
     let lock = OpenOptions::new()
         .create(true)
@@ -103,29 +71,111 @@ pub(super) fn serve(options: crate::ServiceOptions) -> io::Result<()> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(paths.root.join("backend.lock"))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(failure("backend already running"));
+        return Err(Error::State(Fault::AlreadyRunning));
     }
     let socket = paths.root.join("github.sock");
     if let Ok(metadata) = fs::symlink_metadata(&socket) {
         if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(failure("unsafe socket path"));
+            return Err(Error::State(Fault::InvalidSocket));
         }
         fs::remove_file(&socket)?;
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    let shared = Arc::new((Mutex::new(OwnerState::new()?), Condvar::new()));
-    let xpc_shared = Arc::clone(&shared);
-    let xpc_paths = paths.clone();
-    thread::spawn(move || {
-        let result = control::serve_xpc(xpc_shared, xpc_paths);
-        if let Err(error) = result {
-            eprintln!("XPC unavailable: {error}");
-            std::process::exit(1);
+    let shared = Arc::new((Mutex::new(OwnerState::for_service()?), Condvar::new()));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(8)
+        .thread_name("quartermaster-runtime")
+        .enable_all()
+        .build()?;
+    let event_loop = crate::platform::macos::event_loop::EventLoop::new()?;
+    let native = control::listen(Arc::clone(&shared), paths.clone(), runtime.handle().clone())?;
+    listener.set_nonblocking(true)?;
+    let listener = {
+        let _entered = runtime.enter();
+        tokio::net::UnixListener::from_std(listener)?
+    };
+    let ingress_shared = Arc::clone(&shared);
+    let stop = event_loop.stop_handle();
+    let (finished, completion) = mpsc::sync_channel(1);
+    let ingress = runtime.spawn(async move {
+        struct StopOnDrop(crate::platform::macos::event_loop::Stop);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.stop();
+            }
         }
+        let _stop = StopOnDrop(stop);
+        let _ = finished.send(serve_ingress(listener, ingress_shared, paths).await);
     });
     println!("Quartermaster listening at {}.", socket.display());
-    serve_connections(listener.incoming(), shared, paths)
+    let result = event_loop.run().map_err(Error::from);
+    shared
+        .0
+        .lock()
+        .map_err(|_| Error::State(Fault::StateUnavailable))?
+        .end_host_session()?;
+    shared.1.notify_all();
+    drop(native);
+    ingress.abort();
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    fs::remove_file(socket)?;
+    result.and_then(|()| {
+        completion
+            .try_recv()
+            .unwrap_or_else(|_| Err(Error::State(Fault::IngressUnavailable)))
+    })
+}
+
+async fn serve_ingress(
+    listener: tokio::net::UnixListener,
+    shared: Shared,
+    paths: ServicePaths,
+) -> Result<()> {
+    let (send, receive) = tokio::sync::mpsc::channel::<tokio::net::UnixStream>(8);
+    let receive = Arc::new(tokio::sync::Mutex::new(receive));
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let receive = Arc::clone(&receive);
+        let shared = Arc::clone(&shared);
+        let paths = paths.clone();
+        workers.spawn(async move {
+            loop {
+                let Some(stream) = receive.lock().await.recv().await else {
+                    return Ok::<(), Error>(());
+                };
+                let mut stream = stream.into_std()?;
+                stream.set_nonblocking(false)?;
+                let shared = Arc::clone(&shared);
+                let paths = paths.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = http::handle_http(&mut stream, &shared, &paths) {
+                        eprintln!("Request denied: {error}");
+                        let _ = http::response(&mut stream, OperationResponse::Denied);
+                    }
+                })
+                .await?;
+            }
+        });
+    }
+    loop {
+        tokio::select! {
+            result = workers.join_next() => {
+                return match result {
+                    Some(Ok(Err(error))) => Err(error),
+                    _ => Err(Error::State(Fault::IngressUnavailable)),
+                };
+            }
+            incoming = listener.accept() => {
+                let (stream, _) = incoming?;
+                match send.try_send(stream) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {},
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Err(Error::State(Fault::IngressUnavailable)),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +205,8 @@ use {
     serde_json::{Value, json},
     std::{
         io::{Read, Write},
+        os::unix::net::UnixStream,
+        thread,
         time::{Duration, Instant},
     },
     time::OffsetDateTime,
@@ -179,7 +231,8 @@ mod authentication_tests {
         let (directory, paths, key, mut state, receive) = tests::fixture_with_cache(cold);
         let id = state.pending.as_ref().unwrap().id;
         state.pending.as_mut().unwrap().delivered = false;
-        let Reply::Review { approval } = handle(Client::Next {}, &mut state, &paths).unwrap()
+        let Reply::Review { approval } =
+            handle(Client::Next {}, &mut state, &paths.load_policy()).unwrap()
         else {
             panic!("expected approval review");
         };
@@ -202,7 +255,9 @@ mod authentication_tests {
             fixture.id,
             authenticated,
             &mut fixture.state,
-            &fixture.paths,
+            &fixture.paths.load_policy(),
+            crate::owner::vault::Source::capture(&fixture.paths.root)
+                .and_then(|source| source.identity()),
         )
         .unwrap();
         if let Some((source, operation)) = work {
@@ -216,9 +271,14 @@ mod authentication_tests {
             )
             .unwrap();
         }
-        let Reply::Challenge { authorization } =
-            complete_native_presence(fixture.id, &mut fixture.state, &fixture.paths).unwrap()
-        else {
+        let Reply::Challenge { authorization } = complete_native_presence(
+            fixture.id,
+            &mut fixture.state,
+            &fixture.paths.load_policy(),
+            crate::owner::vault::Source::capture(&fixture.paths.root)
+                .and_then(|source| source.identity()),
+        )
+        .unwrap() else {
             panic!("expected approval challenge");
         };
         (authenticated, serde_json::to_value(authorization).unwrap())
@@ -259,7 +319,7 @@ mod authentication_tests {
         assert!(
             fixture
                 .state
-                .prepare(fixture.id, &principal, &fixture.paths)
+                .prepare(fixture.id, &principal, &fixture.paths.load_policy())
                 .is_err()
         );
         assert_eq!(
@@ -273,25 +333,25 @@ mod authentication_tests {
                 signature: BASE64.encode(signature.as_ref()),
             },
             &mut fixture.state,
-            &fixture.paths,
+            &fixture.paths.load_policy(),
         )
         .unwrap();
         let ready = fixture.receive.try_recv().unwrap();
         let frame = fixture
             .state
-            .prepare(ready.id, &ready.principal, &fixture.paths)
+            .prepare(ready.id, &ready.principal, &fixture.paths.load_policy())
             .unwrap();
         let prepared = PreparedOperation::new(frame, fixture.state.upstream.connect().unwrap());
         let response = fixture
             .state
-            .handoff(prepared, &ready.principal, &fixture.paths)
+            .handoff(prepared, &ready.principal, &fixture.paths.load_policy())
             .unwrap()
             .response();
         assert_eq!(response, OperationResponse::IssueClosed);
         assert!(
             fixture
                 .state
-                .prepare(fixture.id, &principal, &fixture.paths)
+                .prepare(fixture.id, &principal, &fixture.paths.load_policy())
                 .is_err()
         );
         assert_eq!(
@@ -310,7 +370,7 @@ mod authentication_tests {
         assert!(
             fixture
                 .state
-                .prepare(fixture.id, &principal, &fixture.paths)
+                .prepare(fixture.id, &principal, &fixture.paths.load_policy())
                 .is_err()
         );
         assert_eq!(
@@ -335,7 +395,9 @@ mod authentication_tests {
                 fixture.id,
                 presence_now().unwrap(),
                 &mut fixture.state,
-                &fixture.paths
+                &fixture.paths.load_policy(),
+                crate::owner::vault::Source::capture(&fixture.paths.root)
+                    .and_then(|source| source.identity())
             )
             .is_err()
         );
@@ -354,7 +416,9 @@ mod authentication_tests {
                 fixture.id,
                 presence_now().unwrap(),
                 &mut fixture.state,
-                &fixture.paths,
+                &fixture.paths.load_policy(),
+                crate::owner::vault::Source::capture(&fixture.paths.root)
+                    .and_then(|source| source.identity()),
             )
             .unwrap()
             .unwrap();
@@ -380,7 +444,14 @@ mod authentication_tests {
                 .is_err()
             );
             assert!(
-                complete_native_presence(fixture.id, &mut fixture.state, &fixture.paths).is_err()
+                complete_native_presence(
+                    fixture.id,
+                    &mut fixture.state,
+                    &fixture.paths.load_policy(),
+                    crate::owner::vault::Source::capture(&fixture.paths.root)
+                        .and_then(|source| source.identity())
+                )
+                .is_err()
             );
             assert!(fixture.state.provider.snapshot().is_none());
             assert_eq!(
@@ -399,7 +470,9 @@ mod authentication_tests {
                 fixture.id,
                 presence_now().unwrap(),
                 &mut fixture.state,
-                &fixture.paths,
+                &fixture.paths.load_policy(),
+                crate::owner::vault::Source::capture(&fixture.paths.root)
+                    .and_then(|source| source.identity()),
             )
             .unwrap()
             .unwrap();
@@ -411,7 +484,7 @@ mod authentication_tests {
                         id: fixture.id.to_string(),
                     },
                     &mut fixture.state,
-                    &fixture.paths,
+                    &fixture.paths.load_policy(),
                 )
                 .unwrap();
                 assert!(matches!(reply, Reply::Canceled));
@@ -427,7 +500,14 @@ mod authentication_tests {
 
             assert!(fixture.state.provider.snapshot().is_some());
             assert!(
-                complete_native_presence(fixture.id, &mut fixture.state, &fixture.paths).is_err()
+                complete_native_presence(
+                    fixture.id,
+                    &mut fixture.state,
+                    &fixture.paths.load_policy(),
+                    crate::owner::vault::Source::capture(&fixture.paths.root)
+                        .and_then(|source| source.identity())
+                )
+                .is_err()
             );
             assert!(fixture.receive.try_recv().is_err());
             assert_eq!(
@@ -460,6 +540,7 @@ mod github_tests {
         let paths = ServicePaths {
             app: root.path().join("nonexistent.app"),
             root: root.path().to_owned(),
+            policy: Arc::default(),
         };
         let (server, client) = UnixStream::pair().unwrap();
         let peer = PeerIdentity::capture(&server).unwrap();
@@ -482,7 +563,7 @@ mod github_tests {
         fs::write(&path, br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one","writes":true}]}"#).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         let mut state = OwnerState::new().unwrap();
-        state.refresh_policy(&paths).unwrap();
+        state.refresh_policy(&paths.load_policy()).unwrap();
         state
             .authorizer
             .seed_fixture_grants(&serde_json::to_vec(&policy).unwrap());
@@ -506,7 +587,7 @@ mod github_tests {
         shared: &Shared,
         paths: &ServicePaths,
         target: &str,
-    ) -> io::Result<String> {
+    ) -> Result<String> {
         client.write_all(format!("GET {target} HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer untrusted-caller-token\r\n\r\n").as_bytes()).unwrap();
         handle_http(server, shared, paths)?;
         server.shutdown(std::net::Shutdown::Write).unwrap();
@@ -745,7 +826,7 @@ mod github_tests {
         let (_root, paths, shared, mut server, client) = setup(address, 2);
         let (id, principal, connector) = {
             let mut state = shared.0.lock().unwrap();
-            state.refresh_policy(&paths).unwrap();
+            state.refresh_policy(&paths.load_policy()).unwrap();
             let (principal, _) =
                 VerifiedPrincipal::capture(&server, state.authorizer.session()).unwrap();
             let config = state.authorizer.github_configuration().unwrap();
@@ -756,7 +837,15 @@ mod github_tests {
                 Some(config),
             )
             .unwrap();
-            let outcome = state.authorize(&principal, request, &paths).unwrap();
+            let outcome = state
+                .authorize(
+                    &principal,
+                    request,
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding()),
+                )
+                .unwrap();
             let id = state.operations.register(outcome, Instant::now()).unwrap();
             let selection = CredentialSelection::at_generation(
                 state.provider.snapshot().unwrap(),
@@ -773,7 +862,7 @@ mod github_tests {
             .0
             .lock()
             .unwrap()
-            .prepare_metadata(id, &principal, &paths)
+            .prepare_metadata(id, &principal, &paths.load_policy())
             .unwrap();
         let prepared = connector
             .connect(deadline)
@@ -784,14 +873,14 @@ mod github_tests {
             .0
             .lock()
             .unwrap()
-            .handoff_metadata(prepared, &principal, &paths)
+            .handoff_metadata(prepared, &principal, &paths.load_policy())
             .unwrap();
         let binding = receipt.response().unwrap();
         let request = shared
             .0
             .lock()
             .unwrap()
-            .prepare_github(id, &principal, &paths, binding)
+            .prepare_github(id, &principal, &paths.load_policy(), binding)
             .unwrap();
         let prepared =
             PreparedOperation::github(request, connector.connect(deadline).unwrap()).unwrap();
@@ -799,7 +888,7 @@ mod github_tests {
             .0
             .lock()
             .unwrap()
-            .handoff(prepared, &principal, &paths)
+            .handoff(prepared, &principal, &paths.load_policy())
             .unwrap();
         let public = receipt.response();
         assert!(matches!(public, OperationResponse::Github(_)));
@@ -848,7 +937,8 @@ mod tests {
             state.authorize(
                 &principal,
                 crate::owner::test_support::read_request(),
-                &paths
+                &paths.load_policy(),
+                crate::owner::vault::Source::capture(&paths.root).map(|source| source.binding())
             ),
             Ok(AuthorizationOutcome::RequireApproval(_))
         ));
@@ -899,7 +989,9 @@ mod tests {
                 state.authorize(
                     &principal,
                     crate::owner::test_support::read_request(),
-                    &paths
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding())
                 ),
                 Ok(AuthorizationOutcome::RequireApproval(_))
             ));
@@ -923,7 +1015,9 @@ mod tests {
                 state.authorize(
                     &principal,
                     crate::owner::test_support::read_request(),
-                    &paths
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding())
                 ),
                 Ok(AuthorizationOutcome::Allowed(_))
             ));
@@ -939,7 +1033,8 @@ mod tests {
             .authorize(
                 &principal,
                 crate::owner::test_support::read_request(),
-                &paths,
+                &paths.load_policy(),
+                crate::owner::vault::Source::capture(&paths.root).map(|source| source.binding()),
             )
             .unwrap();
         let AuthorizationOutcome::RequireApproval(requirement) = outcome else {
@@ -1001,6 +1096,7 @@ mod tests {
         let paths = ServicePaths {
             app: "/unused.app".into(),
             root: directory.path().canonicalize().unwrap(),
+            policy: Arc::default(),
         };
         let random = SystemRandom::new();
         let document =
@@ -1014,7 +1110,7 @@ mod tests {
                 public_key: BASE64.encode(key.public_key()),
             },
             &mut state,
-            &paths,
+            &paths.load_policy(),
         )
         .unwrap();
         let created = presence_now().unwrap();
@@ -1084,7 +1180,7 @@ mod tests {
             delivered: false,
             completion,
         });
-        handle(Client::Next {}, &mut state, &paths).unwrap();
+        handle(Client::Next {}, &mut state, &paths.load_policy()).unwrap();
         (directory, paths, key, state, receive)
     }
 
@@ -1096,30 +1192,26 @@ mod tests {
         state: &mut OwnerState,
         ready: &ApprovalCompletion,
         paths: &ServicePaths,
-    ) -> io::Result<Admission> {
-        let prepared = state.prepare(ready.id, &ready.principal, paths)?;
-        checked(
-            state
-                .operations
-                .ready(ready.id, &ready.principal, &prepared),
-        )?;
+    ) -> Result<Admission> {
+        let prepared = state.prepare(ready.id, &ready.principal, &paths.load_policy())?;
+        state
+            .operations
+            .ready(ready.id, &ready.principal, &prepared)?;
         let snapshot = state
             .provider
             .snapshot()
-            .ok_or_else(|| failure("vault is locked"))?;
-        checked(
-            state
-                .operations
-                .check_snapshot(ready.id, &ready.principal, snapshot),
-        )?;
-        let admission = checked(state.operations.admit(
+            .ok_or_else(|| Error::State(Fault::VaultLocked))?;
+        state
+            .operations
+            .check_snapshot(ready.id, &ready.principal, snapshot)?;
+        let admission = state.operations.admit(
             ready.id,
             &ready.principal,
             &mut state.authorizer,
             Instant::now(),
-        ))?;
+        )?;
         if !admission.accepts(&prepared) {
-            return Err(failure("prepared request changed"));
+            return Err(Error::State(Fault::InvalidOperation));
         }
         Ok(admission)
     }
@@ -1128,13 +1220,24 @@ mod tests {
         thread::sleep(Duration::from_millis(2));
         let id = state.pending.as_ref().unwrap().id;
         assert!(
-            begin_native_presence(id, presence_now().unwrap(), state, paths)
-                .unwrap()
-                .is_none()
+            begin_native_presence(
+                id,
+                presence_now().unwrap(),
+                state,
+                &paths.load_policy(),
+                crate::owner::vault::Source::capture(&paths.root)
+                    .and_then(|source| source.identity())
+            )
+            .unwrap()
+            .is_none()
         );
-        let Reply::Challenge { authorization } =
-            complete_native_presence(id, state, paths).unwrap()
-        else {
+        let Reply::Challenge { authorization } = complete_native_presence(
+            id,
+            state,
+            &paths.load_policy(),
+            crate::owner::vault::Source::capture(&paths.root).and_then(|source| source.identity()),
+        )
+        .unwrap() else {
             panic!("expected approval challenge");
         };
         let challenge = BASE64.decode(authorization.bytes).unwrap();
@@ -1179,7 +1282,7 @@ mod tests {
                 public_key: BASE64.encode(key.public_key()),
             },
             &mut state,
-            &paths,
+            &paths.load_policy(),
         )
         .unwrap();
         state.disconnect_ui();
@@ -1196,7 +1299,7 @@ mod tests {
                     public_key: BASE64.encode(replacement.public_key())
                 },
                 &mut state,
-                &paths
+                &paths.load_policy()
             )
             .is_err()
         );
@@ -1219,7 +1322,7 @@ mod tests {
             signature: signature.clone(),
         };
         assert!(matches!(
-            handle(message, &mut state, &paths).unwrap(),
+            handle(message, &mut state, &paths.load_policy()).unwrap(),
             Reply::Accepted
         ));
         let grant = receive.try_recv().unwrap();
@@ -1228,7 +1331,7 @@ mod tests {
             admission.request().action(),
             http_request::Action::CloseIssue
         );
-        assert!(handle(replay, &mut state, &paths).is_err());
+        assert!(handle(replay, &mut state, &paths.load_policy()).is_err());
         assert!(receive.try_recv().is_err());
     }
 
@@ -1246,7 +1349,7 @@ mod tests {
                         signature: BASE64.encode([1; 64])
                     },
                     &mut state,
-                    &paths
+                    &paths.load_policy()
                 )
                 .is_err()
             );
@@ -1265,7 +1368,9 @@ mod tests {
                     .checked_add(Duration::from_secs(1))
                     .unwrap(),
                 &mut state,
-                &paths
+                &paths.load_policy(),
+                crate::owner::vault::Source::capture(&paths.root)
+                    .and_then(|source| source.identity())
             )
             .is_err()
         );
@@ -1284,7 +1389,7 @@ mod tests {
                 id: request_id(&state),
             },
             &mut state,
-            &paths,
+            &paths.load_policy(),
         )
         .unwrap();
         assert!(state.pending.is_none());
@@ -1296,7 +1401,7 @@ mod tests {
                     signature: String::new()
                 },
                 &mut state,
-                &paths
+                &paths.load_policy()
             )
             .is_err()
         );
@@ -1306,7 +1411,7 @@ mod tests {
     fn ui_session_loss_revokes_a_minted_but_undispatched_grant() {
         let (_directory, paths, key, mut state, receive) = fixture();
         let message = proof(&mut state, &paths, &key);
-        handle(message, &mut state, &paths).unwrap();
+        handle(message, &mut state, &paths.load_policy()).unwrap();
         let grant = receive.try_recv().unwrap();
         state.disconnect_ui();
         assert!(admit_test(&mut state, &grant, &paths).is_err());
@@ -1318,17 +1423,18 @@ mod tests {
         let paths = ServicePaths {
             app: "/unused.app".into(),
             root: directory.path().canonicalize().unwrap(),
+            policy: Arc::default(),
         };
-        let mut state = OwnerState::new().unwrap();
+        let shared = Arc::new((Mutex::new(OwnerState::new().unwrap()), Condvar::new()));
 
-        let reply = handle(Client::VaultStatus {}, &mut state, &paths).unwrap();
+        let reply = Reply::VaultStatus(vault_workflow::cache_status(&paths.root, &shared).unwrap());
         let reply: Value = serde_json::from_slice(&encode_reply(&reply).unwrap()).unwrap();
 
         assert_eq!(reply["kind"], "vaultStatus");
         assert_eq!(reply["state"], "unenrolled");
         assert!(reply.get("password").is_none());
         assert!(reply.get("token").is_none());
-        assert!(state.provider.snapshot().is_none());
+        assert!(shared.0.lock().unwrap().provider.snapshot().is_none());
     }
 
     #[test]
@@ -1352,9 +1458,11 @@ mod tests {
         let worker_paths = paths.clone();
         let (send, receive) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
-            let mut state = worker_state.0.lock().unwrap();
-            send.send(handle(Client::VaultStatus {}, &mut state, &worker_paths))
-                .unwrap();
+            send.send(
+                vault_workflow::cache_status(&worker_paths.root, &worker_state)
+                    .map(Reply::VaultStatus),
+            )
+            .unwrap();
         });
         let result = receive.recv_timeout(Duration::from_secs(2));
         if result.is_err() {
@@ -1373,7 +1481,7 @@ mod tests {
             digest
         );
         assert!(matches!(
-            handle(Client::Cancel { id }, &mut state, &paths).unwrap(),
+            handle(Client::Cancel { id }, &mut state, &paths.load_policy()).unwrap(),
             Reply::Canceled
         ));
         assert!(state.pending.is_none());
@@ -1386,19 +1494,23 @@ mod tests {
             (cache.load().unwrap(), cache.load_enrollment().unwrap()),
             before
         );
-        assert!(
-            matches!(handle(Client::VaultStatus {}, &mut state, &paths).unwrap(), Reply::VaultStatus(status) if status.state == crate::VaultState::OnlineUnlocked)
-        );
+        drop(state);
+        assert!(matches!(
+            vault_workflow::cache_status(&paths.root, &shared)
+                .unwrap()
+                .state,
+            crate::VaultState::OnlineUnlocked
+        ));
     }
 
     #[test]
     fn locking_the_vault_revokes_outstanding_approval_authority() {
         let (_directory, paths, key, mut state, receive) = fixture();
         let message = proof(&mut state, &paths, &key);
-        handle(message, &mut state, &paths).unwrap();
+        handle(message, &mut state, &paths.load_policy()).unwrap();
         let grant = receive.try_recv().unwrap();
 
-        handle(Client::VaultLock {}, &mut state, &paths).unwrap();
+        handle(Client::VaultLock {}, &mut state, &paths.load_policy()).unwrap();
 
         assert!(state.pending.is_none());
         assert!(state.provider.snapshot().is_none());
@@ -1410,14 +1522,14 @@ mod tests {
     fn acknowledged_cancellation_after_proof_prevents_dispatch() {
         let (_directory, paths, key, mut state, receive) = fixture();
         let message = proof(&mut state, &paths, &key);
-        handle(message, &mut state, &paths).unwrap();
+        handle(message, &mut state, &paths.load_policy()).unwrap();
         let grant = receive.try_recv().unwrap();
         let reply = handle(
             Client::Cancel {
                 id: request_id(&state),
             },
             &mut state,
-            &paths,
+            &paths.load_policy(),
         )
         .unwrap();
         let mut requests = 0;
@@ -1437,13 +1549,18 @@ mod tests {
             let (_directory, paths, key, mut state, receive) = fixture();
             let message = proof(&mut state, &paths, &key);
             let id = request_id(&state);
-            handle(message, &mut state, &paths).unwrap();
+            handle(message, &mut state, &paths.load_policy()).unwrap();
             let ready = receive.try_recv().unwrap();
             if admitted {
                 admit_test(&mut state, &ready, &paths).unwrap();
             }
             for _ in 0..2 {
-                let reply = handle(Client::Cancel { id: id.clone() }, &mut state, &paths).unwrap();
+                let reply = handle(
+                    Client::Cancel { id: id.clone() },
+                    &mut state,
+                    &paths.load_policy(),
+                )
+                .unwrap();
                 if admitted {
                     assert!(matches!(reply, Reply::AlreadyAdmitted));
                 } else {
@@ -1456,7 +1573,7 @@ mod tests {
                         id: "unknown".into()
                     },
                     &mut state,
-                    &paths
+                    &paths.load_policy()
                 )
                 .unwrap(),
                 Reply::UnknownOperation
@@ -1484,7 +1601,7 @@ mod tests {
                 };
                 thread::spawn(move || {
                     barrier.wait();
-                    handle(message, &mut state.lock().unwrap(), &paths).is_ok()
+                    handle(message, &mut state.lock().unwrap(), &paths.load_policy()).is_ok()
                 })
             })
             .collect();
@@ -1505,7 +1622,7 @@ mod tests {
     fn restarting_the_owner_cannot_replay_a_previous_ready_operation() {
         let (_directory, paths, key, mut state, receive) = fixture();
         let message = proof(&mut state, &paths, &key);
-        handle(message, &mut state, &paths).unwrap();
+        handle(message, &mut state, &paths.load_policy()).unwrap();
         let ready = receive.try_recv().unwrap();
         let mut restarted = OwnerState::new().unwrap();
 
@@ -1521,6 +1638,7 @@ mod tests {
         let paths = ServicePaths {
             app: "/must-not-be-launched.app".into(),
             root: root.path().to_path_buf(),
+            policy: Arc::default(),
         };
         let mut state = OwnerState::new().unwrap();
         let expires = (OffsetDateTime::now_utc() + Duration::from_secs(60)).unix_timestamp() as u64;
@@ -1538,7 +1656,9 @@ mod tests {
                 .authorize(
                     &principal,
                     super::super::test_support::read_request(),
-                    &paths,
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding()),
                 )
                 .unwrap()
             else {
@@ -1555,7 +1675,9 @@ mod tests {
                 .authorize(
                     &principal,
                     super::super::test_support::read_request(),
-                    &paths
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding())
                 )
                 .is_err()
         );
@@ -1573,9 +1695,11 @@ mod tests {
         assert!(state.ui.is_none());
         assert!(state.provider.snapshot().is_none());
         assert_ne!(state.provider.generation(), generation);
-        assert!(handle(Client::Hello {}, &mut state, &paths).is_err());
-        assert!(handle(Client::VaultStatus {}, &mut state, &paths).is_ok());
-        state.refresh_policy(&paths).unwrap();
+        assert!(handle(Client::Hello {}, &mut state, &paths.load_policy()).is_err());
+        let shared = Arc::new((Mutex::new(state), Condvar::new()));
+        assert!(vault_workflow::cache_status(&paths.root, &shared).is_ok());
+        let mut state = shared.0.lock().unwrap();
+        state.refresh_policy(&paths.load_policy()).unwrap();
         assert!(matches!(
             state.authorizer.authorize(
                 &principal,
@@ -1592,6 +1716,7 @@ mod tests {
         let paths = ServicePaths {
             root: root.path().to_owned(),
             app: "/unused.app".into(),
+            policy: Arc::default(),
         };
         let mut state = OwnerState::new().unwrap();
         let principal =
@@ -1611,7 +1736,8 @@ mod tests {
             .authorize(
                 &principal,
                 crate::owner::test_support::read_request(),
-                &paths,
+                &paths.load_policy(),
+                crate::owner::vault::Source::capture(&paths.root).map(|source| source.binding()),
             )
             .unwrap();
         let id = state.operations.register(outcome, Instant::now()).unwrap();
@@ -1623,10 +1749,14 @@ mod tests {
             .operations
             .select_credential(id, &principal, selection)
             .unwrap();
-        let request = state.prepare(id, &principal, &paths).unwrap();
+        let request = state.prepare(id, &principal, &paths.load_policy()).unwrap();
         let prepared = PreparedOperation::new(request, state.upstream.connect().unwrap());
         state.end_host_session().unwrap();
-        assert!(state.handoff(prepared, &principal, &paths).is_err());
+        assert!(
+            state
+                .handoff(prepared, &principal, &paths.load_policy())
+                .is_err()
+        );
         assert_eq!(
             super::super::transport::fixture::observe(&state.upstream).1,
             0
@@ -1640,6 +1770,7 @@ mod tests {
             crate::platform::HostSessionEvent::Wake,
             crate::platform::HostSessionEvent::ScreenLock,
             crate::platform::HostSessionEvent::Inactive,
+            crate::platform::HostSessionEvent::ConsoleChange,
         ] {
             let (_directory, paths, _key, mut state, _receive) = fixture();
             let principal = Arc::clone(&state.pending.as_ref().unwrap().principal);
@@ -1660,7 +1791,9 @@ mod tests {
                 .authorize(
                     &principal,
                     crate::owner::test_support::read_request(),
-                    &paths,
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding()),
                 )
                 .unwrap();
             let read = state.operations.register(outcome, Instant::now()).unwrap();
@@ -1671,10 +1804,13 @@ mod tests {
                 .select_credential(read, &principal, selection)
                 .unwrap();
             let prepared = PreparedOperation::new(
-                state.prepare(read, &principal, &paths).unwrap(),
+                state
+                    .prepare(read, &principal, &paths.load_policy())
+                    .unwrap(),
                 state.upstream.connect().unwrap(),
             );
-            state.host_session_event(event).unwrap();
+            state.host_events.record(event);
+            state.synchronize_host_events().unwrap();
             assert!(state.authorizer.session_active());
             assert!(state.pending.is_none());
             assert!(state.ui.is_none());
@@ -1686,12 +1822,16 @@ mod tests {
             );
             assert_eq!(state.provider.generation(), generation);
             assert!(state.provider.snapshot().is_some());
-            state.handoff(prepared, &principal, &paths).unwrap();
+            state
+                .handoff(prepared, &principal, &paths.load_policy())
+                .unwrap();
             let outcome = state
                 .authorize(
                     &principal,
                     crate::owner::test_support::read_request(),
-                    &paths,
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding()),
                 )
                 .unwrap();
             let super::super::policy::AuthorizationOutcome::Allowed(permit) = outcome else {
@@ -1705,7 +1845,9 @@ mod tests {
                 state.authorize(
                     &principal,
                     crate::owner::test_support::read_request(),
-                    &paths
+                    &paths.load_policy(),
+                    crate::owner::vault::Source::capture(&paths.root)
+                        .map(|source| source.binding())
                 ),
                 Ok(AuthorizationOutcome::RequireApproval(_))
             ));
@@ -1766,6 +1908,7 @@ mod tests {
         let paths = ServicePaths {
             app: root.path().join("nonexistent.app"),
             root: root.path().to_path_buf(),
+            policy: Arc::default(),
         };
         let (mut server, mut client) = UnixStream::pair().unwrap();
         let peer = qm_macos::peer_identity::PeerIdentity::capture(&server).unwrap();
@@ -1810,10 +1953,14 @@ mod tests {
         let paths = ServicePaths {
             app: root.path().join("nonexistent.app"),
             root: root.path().to_path_buf(),
+            policy: Arc::default(),
         };
-        let (slow_server, slow_client) = UnixStream::pair().unwrap();
-        let (read_server, mut read_client) = UnixStream::pair().unwrap();
-        let peer = PeerIdentity::capture(&read_server).unwrap();
+        let socket = root.path().join("ingress.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let slow_client = UnixStream::connect(&socket).unwrap();
+        let mut read_client = UnixStream::connect(&socket).unwrap();
+        let peer = PeerIdentity::capture(&read_client).unwrap();
         let mut policy: Value = serde_json::from_slice(&super::super::test_support::policy_bytes(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1834,13 +1981,16 @@ mod tests {
             super::super::test_support::vault::snapshot("github-read"),
         );
         let shared = Arc::new((Mutex::new(state), Condvar::new()));
-        let worker = thread::spawn(move || {
-            serve_connections(
-                [Ok(slow_server), Ok(read_server)].into_iter(),
-                shared,
-                paths,
-            )
-        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = {
+            let _entered = runtime.enter();
+            tokio::net::UnixListener::from_std(listener).unwrap()
+        };
+        let worker = runtime.spawn(serve_ingress(listener, shared, paths));
         read_client
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
@@ -1849,7 +1999,8 @@ mod tests {
 
         let read = read_client.read_to_string(&mut response);
         drop(slow_client);
-        worker.join().unwrap().unwrap();
+        worker.abort();
+        runtime.shutdown_timeout(Duration::from_secs(2));
 
         read.unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -1861,6 +2012,7 @@ mod tests {
         let paths = ServicePaths {
             app: "/unused.app".into(),
             root: directory.path().canonicalize().unwrap(),
+            policy: Arc::default(),
         };
         let mut state = OwnerState::new().unwrap();
         let principal =
@@ -1882,7 +2034,8 @@ mod tests {
             .authorize(
                 &principal,
                 super::super::test_support::read_request(),
-                &paths,
+                &paths.load_policy(),
+                crate::owner::vault::Source::capture(&paths.root).map(|source| source.binding()),
             )
             .unwrap();
         let id = state.operations.register(outcome, Instant::now()).unwrap();
@@ -1894,16 +2047,16 @@ mod tests {
                 crate::owner::test_support::vault::selection(state.provider.snapshot().unwrap()),
             )
             .unwrap();
-        let request = state.prepare(id, &principal, &paths).unwrap();
+        let request = state.prepare(id, &principal, &paths.load_policy()).unwrap();
         let upstream = state.upstream.clone();
         let prepared = PreparedOperation::new(request, upstream.connect().unwrap());
 
-        handle(Client::VaultLock {}, &mut state, &paths).unwrap();
+        handle(Client::VaultLock {}, &mut state, &paths.load_policy()).unwrap();
         crate::owner::test_support::vault::install(
             &mut state.provider,
             super::super::test_support::vault::snapshot("github-read"),
         );
-        let result = state.handoff(prepared, &principal, &paths);
+        let result = state.handoff(prepared, &principal, &paths.load_policy());
         let admitted = result.is_ok();
         if let Ok(receipt) = result {
             let _ = receipt.response();
@@ -1952,7 +2105,8 @@ mod tests {
             .authorize(
                 &principal,
                 crate::owner::test_support::read_request(),
-                &paths,
+                &paths.load_policy(),
+                crate::owner::vault::Source::capture(&paths.root).map(|source| source.binding()),
             )
             .unwrap();
         let read = state.operations.register(outcome, Instant::now()).unwrap();
@@ -1967,10 +2121,12 @@ mod tests {
                 ),
             )
             .unwrap();
-        let request = state.prepare(read, &principal, &paths).unwrap();
+        let request = state
+            .prepare(read, &principal, &paths.load_policy())
+            .unwrap();
         let prepared = PreparedOperation::new(request, state.upstream.connect().unwrap());
         let response = state
-            .handoff(prepared, &principal, &paths)
+            .handoff(prepared, &principal, &paths.load_policy())
             .unwrap()
             .response();
         assert_eq!(response, OperationResponse::IssueOpen);
@@ -1984,16 +2140,21 @@ mod tests {
     fn final_write_handoff_checks_the_shared_clock_even_if_instant_has_not_expired() {
         let (_directory, paths, key, mut state, receive) = fixture();
         let message = proof(&mut state, &paths, &key);
-        handle(message, &mut state, &paths).unwrap();
+        handle(message, &mut state, &paths.load_policy()).unwrap();
         let ready = receive.try_recv().unwrap();
-        let frame = state.prepare(ready.id, &ready.principal, &paths).unwrap();
+        let frame = state
+            .prepare(ready.id, &ready.principal, &paths.load_policy())
+            .unwrap();
         let upstream = state.upstream.clone();
         let prepared = PreparedOperation::new(frame, upstream.connect().unwrap());
         let future = presence_now()
             .unwrap()
             .checked_add(Duration::from_secs(30))
             .unwrap();
-        let result = state.handoff_with_clock(prepared, &ready.principal, &paths, || Ok(future));
+        let result =
+            state.handoff_with_clock(prepared, &ready.principal, &paths.load_policy(), || {
+                Ok(future)
+            });
         let admitted = result.is_ok();
         if let Ok(receipt) = result {
             let _ = receipt.response();
@@ -2014,7 +2175,7 @@ mod tests {
                     authenticated: presence_now().unwrap()
                 },
                 &mut state,
-                &paths
+                &paths.load_policy()
             )
             .is_err()
         );

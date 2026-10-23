@@ -138,12 +138,16 @@ its enrolment session. Losing that connection cancels those operations without
 revoking unrelated read grants. Cache state and legitimately authorized standalone
 unlock work have their own lifecycle.
 
+Before publication, recheck the original operation generation and cache revision.
+Revocation before publication admission preserves the previous files. An admitted
+encrypted write may finish, but a later generation change forbids installing its
+plaintext. Failed completions must release their reservations.
+
 Provider operations freeze the enrolment, device-key pin and cache revision
 before native or network work. Completion must recheck the provider generation
 and frozen revision before installing plaintext or publishing encrypted state.
 Explicit lock, discard or account replacement invalidates older completions;
 cancelling a write or closing its UI does not invalidate an independent unlock.
-Refresh cannot change the selected binding or move its sync checkpoint backward.
 
 Cancellation, disconnect, expiry and session termination must discard affected
 pending work. Host policy determines which scoped grants survive screen lock,
@@ -158,6 +162,17 @@ lifetimes by operation or risk remains future work.
 When those choices become configurable, they must participate in the effective
 policy binding and invalidate affected authority on change, including change
 followed by reversion.
+
+Admission must detect intervening console/session and sleep/wake changes even
+when callbacks are delayed or the console is interactive again. Missing, malformed
+or regressed lifecycle evidence ends the session. Record revocation before
+waiting for authority serialization; later callbacks cannot restore it.
+
+Use typed UTC timestamps for persisted sync state and monotonic deadlines for
+authority. Cross-process clock samples are distinct from wire integers and valid
+only within the current boot and authenticated connection; they cannot recover
+authority after restart.
+
 Read-grant and network deadlines count time asleep using a continuous monotonic
 clock, so sleep combined with wall-clock rollback cannot extend authority.
 Unchanged policy reloads may shorten active deadlines to the remaining absolute
@@ -165,11 +180,6 @@ UTC expiry, but never extend them or replenish their budgets.
 No failure may fall back to broader credentials, simulated presence or an
 unenforced route. An uncertain dispatch cannot retry with a consumed grant;
 revocation cannot retract an operation already sent.
-
-Use typed UTC timestamps for persisted sync state and monotonic deadlines for
-authority. Cross-process clock samples are distinct from wire integers and valid
-only within the current boot and authenticated connection; they cannot recover
-authority after restart.
 
 ## Contain credentials and key lifecycle
 

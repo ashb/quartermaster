@@ -47,7 +47,7 @@ pub(super) fn serve(options: ServiceOptions) -> Result<(), ServiceError> {
     #[cfg(target_os = "macos")]
     {
         validate(&options)?;
-        runtime::serve(options).map_err(ServiceError::Runtime)
+        runtime::serve(options).map_err(|error| ServiceError::Runtime(std::io::Error::other(error)))
     }
     #[cfg(not(target_os = "macos"))]
     {
