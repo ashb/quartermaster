@@ -1,0 +1,5 @@
+ignore_directories([
+    "**/worktrees",
+    "**/.worktrees",
+    "target",
+])

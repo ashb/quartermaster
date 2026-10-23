@@ -1,6 +1,7 @@
 /signing.local.toml
 /docs/evidence/
 /target/
+/bazel-*
 /.venv/
 /.pytest_cache/
 **/__pycache__/

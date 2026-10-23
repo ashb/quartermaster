@@ -1,0 +1,29 @@
+load("@rules_swift//swift:swift_library.bzl", "swift_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Backend-Info.plist",
+    "Backend.entitlements",
+    "Info.plist",
+    "Quartermaster.entitlements",
+])
+
+swift_library(
+    name = "Quartermaster",
+    srcs = [
+        "BrokerApplication.swift",
+        "BrokerConnection.swift",
+        "QuartermasterApp.swift",
+    ],
+    copts = [
+        "-swift-version",
+        "6",
+    ],  # keep
+    module_name = "Quartermaster",
+    deps = [
+        "//macos/ApprovalUI:QuartermasterApprovalUI",
+        "//macos/Security/Sources/QuartermasterIPC",
+        "//macos/Security/Sources/QuartermasterSecurity",
+    ],
+)

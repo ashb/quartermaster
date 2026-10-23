@@ -1,0 +1,23 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "qm_types",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = ["Cargo.toml"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),  # keep
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),  # keep
+)
+
+rust_test(
+    name = "qm_types_test",
+    crate = ":qm_types",
+    deps = all_crate_deps(normal_dev = True),  # keep
+)

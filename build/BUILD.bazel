@@ -1,0 +1,5 @@
+exports_files([
+    "apple_support_clt.patch",
+    "gazelle_rust_extension.patch",
+    "swift_gazelle_sdk_modules.patch",
+])

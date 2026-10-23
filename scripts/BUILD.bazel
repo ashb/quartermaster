@@ -1,0 +1,25 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+sh_binary(
+    name = "provision_development",
+    srcs = ["provision_macos.sh"],
+    args = ["$(rootpath //macos:provisioning_project)"],
+    data = [
+        "sign_macos.sh",
+        "signing_identity.py",
+        "//macos:provisioning_project",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+sh_binary(
+    name = "sign_development",
+    srcs = ["sign_macos.sh"],
+    args = ["$(rootpath //macos:app_bundle)"],
+    data = [
+        "signing_identity.py",
+        "//macos:app_bundle",
+        "//macos:signing_inputs",
+    ],
+    visibility = ["//visibility:public"],
+)

@@ -2,10 +2,19 @@
 
 ## Build and check
 
-The current target is an Apple Silicon Mac running macOS 26, with Xcode
-Command Line Tools selected. Install Rust with rustfmt and Clippy, just, and uv with Python 3.12
-or later.
-The GitHub examples also need `gh`; integration tests need `jq`.
+The current target is an Apple Silicon Mac running macOS 26, with full Xcode
+selected. Install Bazelisk, just, uv with Python 3.12 or later, and prek. The
+GitHub examples also need `gh`; integration tests need `jq`.
+
+Select Xcode and restart Bazel after installing or switching Xcode:
+
+```sh
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+bazelisk shutdown
+```
+
+Command Line Tools alone are insufficient. If Swift tests cannot find Xcode's
+testing frameworks, select Xcode this way rather than setting only `DEVELOPER_DIR`.
 
 Run these from the repository root:
 
@@ -15,9 +24,15 @@ just test
 just check
 ```
 
-The build prints the app bundle path. Protected-key flows require a signed
-build; see below. Rust dependencies are authored in Cargo manifests and
-`Cargo.lock`. `just fetch` downloads them for subsequent offline builds.
+The unsigned app is `bazel-bin/macos/Quartermaster.app`. Running the protected-key
+flows requires a signed build; see below. `just fmt` applies Rust formatting,
+and `just check` checks Rust formatting, Clippy, Swift formatting and BUILD files.
+To run only Rust tests, use `just test //crates/... //bins/...`.
+
+Bazel is the build and test system. Edit Cargo manifests for Rust dependencies,
+update `Cargo.lock`, then run `bazelisk run //:gazelle` after dependency or source
+changes. Review the generated BUILD changes before committing. `just fetch`
+downloads dependencies and toolchains ahead of a build.
 
 ## Sign and run
 
@@ -31,14 +46,28 @@ team = "YOURTEAMID"
 certificate_sha256 = "<64 hexadecimal characters>"
 ```
 
-This file is ignored by Git. Obtain development provisioning profiles for the
-UI and backend through Xcode, matching their
-[UI](../macos/Quartermaster/Info.plist) and
-[backend](../macos/Quartermaster/Backend-Info.plist) bundle IDs and the groups in
-their [UI](../macos/Quartermaster/Quartermaster.entitlements) and
-[backend](../macos/Quartermaster/Backend.entitlements) entitlements. The signing helper
-searches Xcode's profile directories and the previous signed build. To select
-profiles explicitly:
+This file is ignored by Git. Add your Apple account in Xcode's Settings → Accounts,
+then prepare profiles for the configured certificate:
+
+```sh
+just provision
+just build-signed
+```
+
+`just provision` generates a disposable Xcode project from the app's bundle IDs
+and entitlement files, then builds two stub apps to let Xcode issue the profiles.
+Xcode manages signing for these disposable stubs and may create a development
+certificate or request account or signing-key authorization. Provisioning succeeds
+only if both resulting profiles authorize the certificate pinned in
+`signing.local.toml`; the real app always uses that exact certificate. The project
+and stub apps stay under `target/macos/provisioning/`; Bazel continues to build the
+real app. No Xcode project needs maintaining.
+
+Free Personal Team profiles expire after seven days. Rerun `just provision` after
+expiry, or after changing the certificate, team, bundle IDs or entitlements, then
+rebuild the signed app. Renewing profiles does not require deleting retained
+Keychain keys. The signing helper searches Xcode's profile directories, the stub
+apps and the previous signed build. To select profiles explicitly:
 
 ```sh
 QM_FRONTEND_PROFILE=/path/to/frontend.provisionprofile \
@@ -70,7 +99,7 @@ just test-integration
 ```
 
 This tests Swift/Rust IPC without a fingerprint. It requires a logged-in macOS
-GUI session and Swift command-line tools.
+GUI session and full Xcode.
 
 The hardware cases use disposable keys and the normal approval dialog. Run them
 when ready to authenticate, after preparing a signed app as above:
@@ -124,7 +153,8 @@ For intentional approval-key recovery, quit the UI and stop the backend before
 running the same command with `--approval-key-reset`. It deletes the development
 approval key and its public enrolment. Restart and enrol again afterwards.
 
-If signing reports no valid identity or profile, check that the pinned certificate
-is valid, its private key is available, and both profiles include it and allow
-the required keychain groups. A signing-key permission prompt concerns build
-signing, separately from the application's runtime fingerprint approvals.
+If signing reports no valid identity, check that the pinned certificate is valid
+and its private key is available. For missing or expired profiles, run
+`just provision` and rebuild; update or unset any explicit profile overrides.
+A signing-key permission prompt concerns build signing, separately from the
+application's runtime fingerprint approvals.

@@ -1,0 +1,64 @@
+module(name = "quartermaster")
+
+bazel_dep(name = "apple_support", version = "2.10.1")
+bazel_dep(name = "rules_cc", version = "0.2.26")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_apple", version = "5.3.1")
+bazel_dep(name = "rules_swift", version = "4.2.2")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+bazel_dep(name = "gazelle", version = "0.51.3", dev_dependency = True)
+bazel_dep(name = "gazelle_rust", version = "0.1.0", dev_dependency = True)
+bazel_dep(name = "swift_gazelle_plugin", version = "0.2.2", dev_dependency = True)
+bazel_dep(name = "aspect_bazel_lib", version = "2.22.5", dev_dependency = True)
+bazel_dep(name = "rules_go", version = "0.61.1", dev_dependency = True)
+
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
+go_sdk.download(version = "1.26.0")
+
+single_version_override(
+    module_name = "apple_support",
+    patch_strip = 1,
+    patches = ["//build:apple_support_clt.patch"],
+    version = "2.10.1",
+)
+
+# Gazelle 0.1.0 needs the current extension path and a transitive crate lock.
+# The patch lock was generated from its Cargo.lock with rules_rust 0.74.0.
+single_version_override(
+    module_name = "gazelle_rust",
+    patch_strip = 1,
+    patches = ["//build:gazelle_rust_extension.patch"],
+    version = "0.1.0",
+)
+
+single_version_override(
+    module_name = "swift_gazelle_plugin",
+    patch_strip = 1,
+    patches = ["//build:swift_gazelle_sdk_modules.patch"],
+    version = "0.2.2",
+)
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.97.1"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.annotation(
+    # Apple's libtool adapter replaces archives instead of appending cc's batches.
+    build_script_env = {"AR": "/usr/bin/ar"},
+    crate = "ring",
+    repositories = ["crates"],
+)
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+    supported_platform_triples = ["aarch64-apple-darwin"],
+)
+use_repo(crate, "crates")

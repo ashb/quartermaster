@@ -1,0 +1,46 @@
+load("@rules_swift//swift:swift_test.bzl", "swift_test")
+load("//build:macos.bzl", "swift_test_resources")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "fixtures",
+    srcs = glob(["Fixtures/**"]),
+)
+
+swift_test_resources(
+    name = "test_resources",
+    srcs = [":fixtures"],
+)
+
+filegroup(
+    name = "test_resource_accessor",
+    srcs = [":test_resources"],
+    output_group = "swift_sources",
+)
+
+swift_test(
+    name = "QuartermasterSecurityTests",
+    srcs = [
+        "ApprovalControlWorkflowTests.swift",
+        "ApprovalControllerTests.swift",
+        "ApprovalKeyStoreTests.swift",
+        "AuthorizationWorkflowTests.swift",
+        "BrokerProtocolTests.swift",
+        "ContextInterfaceTests.swift",
+        "MonotonicTimestampTests.swift",
+        "ReadGrantReviewTests.swift",
+        "SecureEnclaveApprovalKeyStorageTests.swift",
+        ":test_resource_accessor",  # keep
+    ],
+    copts = [
+        "-swift-version",
+        "6",
+    ],  # keep
+    data = [":test_resources"],
+    module_name = "QuartermasterSecurityTests",
+    deps = [
+        "//macos/Security/Sources/QuartermasterIPC",
+        "//macos/Security/Sources/QuartermasterSecurity",
+    ],
+)

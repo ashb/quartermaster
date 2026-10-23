@@ -1,0 +1,31 @@
+load("@gazelle//:def.bzl", "gazelle", "gazelle_binary")
+
+# gazelle:rust_mode generate_from_cargo
+# gazelle:rust_srcs_glob true
+# gazelle:rust_cargo_lockfile Cargo.lock
+# gazelle:rust_crates_prefix @crates//:
+# gazelle:resolve swift QuartermasterIPC //macos/Security/Sources/QuartermasterIPC:QuartermasterIPC
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+gazelle_binary(
+    name = "gazelle_bin",
+    languages = [
+        "@gazelle_rust//rust_language",
+        "@swift_gazelle_plugin//gazelle",
+    ],
+)
+
+gazelle(
+    name = "gazelle",
+    gazelle = ":gazelle_bin",
+)
+
+gazelle(
+    name = "gazelle_check",
+    args = ["-mode=diff"],
+    gazelle = ":gazelle_bin",
+)

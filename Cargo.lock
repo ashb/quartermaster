@@ -1715,7 +1715,6 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "block2",
- "cc",
  "core-foundation",
  "dispatch2",
  "form_urlencoded",

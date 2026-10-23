@@ -3,13 +3,12 @@ set positional-arguments
 default:
     @just --list
 
-# Download locked dependencies for subsequent offline builds.
+# Download dependencies and toolchains for all targets.
 fetch:
-    cargo fetch --locked
+    bazelisk fetch //...
 
-test:
-    cargo test --locked --offline --workspace --all-features
-    swift test --package-path macos/Security --scratch-path target/swift-security -Xswiftc -plugin-path -Xswiftc "$(dirname "$(xcrun --find swiftc)")/../lib/swift/host/plugins/testing"
+test *targets="//...":
+    bazelisk test "$@"
 
 # Integration tests; hardware cases require an attended fingerprint.
 test-integration *args:
@@ -39,17 +38,17 @@ test-integration *args:
     }
     if [ -z "$prepared" ]; then
         if [ "$build_only" = false ]; then
-            cargo test --locked --offline --workspace --test '*'
+            bazelisk test //crates/qm-broker:public_boundary
         fi
         scope=$(/usr/bin/uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]')
         output="$repository/target/integration/$scope"
         mkdir -p "$output"
-        cargo test --locked --offline -p qm-broker --lib --no-run --message-format=json > "$output/rust-build.json"
-        executable=$(jq -sr '[.[] | select(.executable != null and .profile.test) | .executable] | if length == 1 then .[0] else error("Expected one Rust test executable") end' "$output/rust-build.json")
-        install -m 755 "$executable" "$output/server"
-        swift build --package-path macos --scratch-path target/swift-app --product QuartermasterIntegrationTests
-        binaries=$(swift build --package-path macos --scratch-path target/swift-app --show-bin-path)
-        install -m 755 "$binaries/QuartermasterIntegrationTests" "$output/client"
+        bazelisk build //crates/qm-broker:qm_broker_test //macos/Tests:QuartermasterIntegrationTests
+        execution_root=$(bazelisk info execution_root)
+        executable=$(bazelisk cquery //crates/qm-broker:qm_broker_test --output=starlark --starlark:expr='providers(target)["DefaultInfo"].files_to_run.executable.path')
+        install -m 755 "$execution_root/$executable" "$output/server"
+        executable=$(bazelisk cquery //macos/Tests:QuartermasterIntegrationTests --output=starlark --starlark:expr='providers(target)["DefaultInfo"].files_to_run.executable.path')
+        install -m 755 "$execution_root/$executable" "$output/client"
         client="$output/client"
         server="$output/server"
         approval_group=
@@ -159,16 +158,22 @@ test-integration *args:
     printf 'Passed %s: Swift client and Rust adapter assertions\n' "$test_case"
 
 fmt:
-    cargo fmt --all
+    bazelisk run @rules_rust//:rustfmt -- //crates/... //bins/...
 
-check: test
+check:
     prek run --all-files
 
 # Build the normal app and bundled backend without launching them.
-build: (_mac "unsigned")
+build:
+    bazelisk build //macos:Quartermaster
 
 # Build with the certificate selected in signing.local.toml.
-build-signed: (_mac "signed")
+build-signed:
+    bazelisk run //macos:sign_development
+
+# Issue or renew development profiles through the account configured in Xcode.
+provision:
+    bazelisk run //scripts:provision_development
 
 # Start the bundled development backend; no login startup or fingerprint request.
 run: build-signed
@@ -176,101 +181,3 @@ run: build-signed
 
 stop:
     target/macos/signed/Quartermaster.app/Contents/Helpers/QuartermasterBackend.app/Contents/MacOS/quartermasterd stop
-
-[private]
-_mac signing:
-    #!/bin/sh
-    set -eu
-    signing=$1
-    case "$signing" in unsigned|signed) ;; *) exit 2 ;; esac
-    repository=$PWD
-    if [ "$signing" = signed ]; then
-        selection=$(uv run --offline --no-project python scripts/signing_identity.py select)
-        read -r team certificate_sha1 certificate_sha256 <<EOF
-    $selection
-    EOF
-    fi
-    cargo build --locked --offline -p quartermasterd --target aarch64-apple-darwin --target-dir "$repository/target"
-    swift build --package-path macos --scratch-path target/swift-app --product Quartermaster
-    binaries=$(swift build --package-path macos --scratch-path target/swift-app --show-bin-path)
-    destination="$repository/target/macos/$signing"
-    mkdir -p "$destination"
-    temporary=$(mktemp -d "$destination/build.XXXXXX")
-    trap 'rm -rf "$temporary"' EXIT
-    bundle="$temporary/Quartermaster.app"
-    backend="$bundle/Contents/Helpers/QuartermasterBackend.app"
-    mkdir -p "$bundle/Contents/MacOS" "$backend/Contents/MacOS"
-    install -m 755 "$binaries/Quartermaster" "$bundle/Contents/MacOS/Quartermaster"
-    install -m 755 target/aarch64-apple-darwin/debug/quartermasterd "$backend/Contents/MacOS/quartermasterd"
-    install -m 644 macos/Quartermaster/Info.plist "$bundle/Contents/Info.plist"
-    install -m 644 macos/Quartermaster/Backend-Info.plist "$backend/Contents/Info.plist"
-    if [ "$signing" = signed ]; then
-        copy_profile() {
-            profile_identifier=$1
-            profile_group=$2
-            profile_override=$3
-            profile_destination=$4
-            if [ -n "$profile_override" ]; then
-                set -- "$profile_override"
-            else
-                set -- "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.provisionprofile \
-                    "$HOME/Library/MobileDevice/Provisioning Profiles/"*.provisionprofile \
-                    "$repository/target/macos/signed/Quartermaster.app/Contents/embedded.provisionprofile" \
-                    "$repository/target/macos/signed/Quartermaster.app/Contents/Helpers/QuartermasterBackend.app/Contents/embedded.provisionprofile" \
-                    "$repository/target/xcode/Build/Products/Debug/Quartermaster.app/Contents/embedded.provisionprofile" \
-                    "$repository/target/xcode/Build/Products/Debug/Quartermaster.app/Contents/Helpers/QuartermasterBackend.app/Contents/embedded.provisionprofile"
-            fi
-            for profile in "$@"; do
-                [ -f "$profile" ] || continue
-                /usr/bin/security cms -D -i "$profile" > "$temporary/profile.plist" 2>/dev/null || continue
-                actual=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$temporary/profile.plist")
-                [ "$actual" = "$team.$profile_identifier" ] || continue
-                expiration=$(/usr/bin/plutil -extract ExpirationDate raw -o - "$temporary/profile.plist")
-                expiry=$(/bin/date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$expiration" '+%s')
-                [ "$expiry" -gt "$(date '+%s')" ] || continue
-                certificate_matches=false
-                profile_index=0
-                while /usr/bin/plutil -extract "DeveloperCertificates.$profile_index" raw -o "$temporary/certificate.b64" "$temporary/profile.plist" 2>/dev/null; do
-                    /usr/bin/base64 --decode -i "$temporary/certificate.b64" -o "$temporary/certificate.der"
-                    fingerprint=$(/usr/bin/shasum -a 256 "$temporary/certificate.der")
-                    fingerprint=$(printf '%s' "${fingerprint%% *}" | /usr/bin/tr '[:lower:]' '[:upper:]')
-                    if [ "$fingerprint" = "$certificate_sha256" ]; then certificate_matches=true; break; fi
-                    profile_index=$((profile_index + 1))
-                done
-                [ "$certificate_matches" = true ] || continue
-                profile_index=0
-                while allowed=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:keychain-access-groups:$profile_index" "$temporary/profile.plist" 2>/dev/null); do
-                    case "$profile_group" in $allowed) install -m 644 "$profile" "$profile_destination"; return ;; esac
-                    profile_index=$((profile_index + 1))
-                done
-            done
-            echo "No valid provisioning profile for $profile_identifier and the configured certificate." >&2
-            return 1
-        }
-        for role in frontend backend; do
-            if [ "$role" = frontend ]; then
-                app=$bundle
-                group="$team.dev.quartermaster.phase0"
-                profile_override=${QM_FRONTEND_PROFILE:-}
-                template=macos/Quartermaster/Quartermaster.entitlements
-            else
-                app=$backend
-                group="$team.dev.quartermaster.cache.debug"
-                profile_override=${QM_BACKEND_PROFILE:-}
-                template=macos/Quartermaster/Backend.entitlements
-            fi
-            identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
-            copy_profile "$identifier" "$group" "$profile_override" "$app/Contents/embedded.provisionprofile"
-            entitlements="$temporary/$role.entitlements"
-            cp "$template" "$entitlements"
-            /usr/libexec/PlistBuddy -c "Set :keychain-access-groups:0 $group" "$entitlements"
-            /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $team.$identifier" "$entitlements"
-            /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $team" "$entitlements"
-        done
-        /usr/bin/codesign --force --options runtime --timestamp=none --sign "$certificate_sha1" --entitlements "$temporary/backend.entitlements" "$backend"
-        /usr/bin/codesign --force --options runtime --timestamp=none --sign "$certificate_sha1" --entitlements "$temporary/frontend.entitlements" "$bundle"
-        uv run --offline --no-project python scripts/signing_identity.py verify "$certificate_sha256" "$backend" "$bundle"
-    fi
-    rm -rf "$destination/Quartermaster.app"
-    mv "$bundle" "$destination/Quartermaster.app"
-    printf '%s\n' "$destination/Quartermaster.app"

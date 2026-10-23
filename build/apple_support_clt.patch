@@ -1,0 +1,10 @@
+diff --git a/crosstool/universal_exec_tool.bzl b/crosstool/universal_exec_tool.bzl
+--- a/crosstool/universal_exec_tool.bzl
++++ b/crosstool/universal_exec_tool.bzl
+@@ -46,5 +46,6 @@
+     --sdk macosx \
+     clang \
++    -isystem "$$(xcrun --sdk macosx --show-sdk-path)/usr/include/c++/v1" \
+     -mmacosx-version-min=11.0 \
+     -std=c++17 \
+     -lc++ \

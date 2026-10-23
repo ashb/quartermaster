@@ -1,16 +1,28 @@
 minimum_prek_version = "0.5.5"
 
 [[repos]]
-repo = "https://github.com/doublify/pre-commit-rust"
-rev = "eeee35a89e69d5772bdee97db1a6a898467b686e" # v1.0
+repo = "local"
 
 [[repos.hooks]]
-id = "fmt"
-args = ["--all"]
+id = "rustfmt"
+name = "Rust formatting (Bazel toolchain)"
+language = "system"
+entry = "bazelisk run @rules_rust//:rustfmt -- //crates/... //bins/... -- --check"
 pass_filenames = false
+files = '\.rs$'
 
 [[repos.hooks]]
 id = "clippy"
-args = ["--locked", "--offline", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
-types = ["file"]
-files = '^(crates/|bins/|Cargo\.(toml|lock)$|\.cargo/|prek\.toml$)'
+name = "Clippy (Bazel targets)"
+language = "system"
+entry = "bazelisk build --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect --output_groups=clippy_checks //crates/... //bins/..."
+pass_filenames = false
+files = '^(crates/|bins/|build/|Cargo\.(toml|lock)$|.*BUILD\.bazel$|MODULE\.bazel|\.bazelrc$|prek\.toml$)'
+
+[[repos.hooks]]
+id = "gazelle"
+name = "Gazelle BUILD consistency"
+language = "system"
+entry = "bazelisk run //:gazelle_check"
+pass_filenames = false
+always_run = true

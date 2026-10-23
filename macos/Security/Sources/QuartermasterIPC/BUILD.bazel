@@ -1,0 +1,26 @@
+load("@rules_cc//cc:objc_library.bzl", "objc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+objc_library(
+    name = "ipc_headers",
+    hdrs = ["include/QuartermasterIPC.h"],
+    includes = ["include"],
+    sdk_frameworks = [
+        "Foundation",
+        "LocalAuthentication",
+    ],
+)
+
+objc_library(
+    name = "QuartermasterIPC",
+    srcs = ["context_protocol.m"],
+    hdrs = ["include/QuartermasterIPC.h"],
+    copts = ["-fblocks"],
+    includes = ["include"],
+    module_name = "QuartermasterIPC",
+    sdk_frameworks = [
+        "Foundation",
+        "LocalAuthentication",
+    ],
+)

@@ -1,0 +1,48 @@
+load("@rules_apple//apple:macos.bzl", "macos_application")
+load("//build:macos.bzl", "provisioning_project", "quartermaster_app")
+
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "sign_development",
+    actual = "//scripts:sign_development",
+)
+
+provisioning_project(
+    name = "provisioning_project",
+    backend_entitlements = "//macos/Quartermaster:Backend.entitlements",
+    backend_info = "//macos/Quartermaster:Backend-Info.plist",
+    frontend_entitlements = "//macos/Quartermaster:Quartermaster.entitlements",
+    frontend_info = "//macos/Quartermaster:Info.plist",
+)
+
+macos_application(
+    name = "frontend",
+    bundle_id = "dev.quartermaster.phase0",
+    bundle_name = "Quartermaster",
+    executable_name = "Quartermaster",
+    infoplists = ["//macos/Quartermaster:Info.plist"],
+    minimum_os_version = "26.0",
+    deps = ["//macos/Quartermaster"],
+)
+
+quartermaster_app(
+    name = "Quartermaster",
+    backend = "//bins/quartermasterd:quartermasterd",
+    backend_info = "//macos/Quartermaster:Backend-Info.plist",
+    frontend = ":frontend",
+)
+
+filegroup(
+    name = "app_bundle",
+    srcs = [":Quartermaster"],
+    output_group = "bundle",
+)
+
+filegroup(
+    name = "signing_inputs",
+    srcs = [
+        "//macos/Quartermaster:Backend.entitlements",
+        "//macos/Quartermaster:Quartermaster.entitlements",
+    ],
+)

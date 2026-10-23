@@ -1,0 +1,24 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_binary(
+    name = "quartermasterd",
+    srcs = [
+        "src/main.rs",
+        "src/runtime.rs",
+    ],
+    aliases = aliases(),
+    compile_data = ["Cargo.toml"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = ["//crates/qm-broker:qm_broker"] + all_crate_deps(normal = True),  # keep
+)
+
+rust_test(
+    name = "quartermasterd_test",
+    crate = ":quartermasterd",
+)

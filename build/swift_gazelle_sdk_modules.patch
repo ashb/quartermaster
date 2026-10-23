@@ -1,0 +1,9 @@
+diff --git a/gazelle/internal/swift/builtin_modules.go b/gazelle/internal/swift/builtin_modules.go
+--- a/gazelle/internal/swift/builtin_modules.go
++++ b/gazelle/internal/swift/builtin_modules.go
+@@ -255,3 +255,5 @@
+ 	"SwiftOnoneSupport",
++	"Synchronization",
+ 	"System",
++	"Testing",
+ 	"os",
