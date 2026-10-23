@@ -1,0 +1,2 @@
+# HTTP fixtures retain wire CRLF and the empty line ending their headers.
+*.http -text -whitespace

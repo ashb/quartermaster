@@ -48,7 +48,42 @@ use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
 
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "graphql_reference_node",
+    build_file_content = 'exports_files(["bin/node"])',
+    dev_dependency = True,
+    sha256 = "037650d0839f457747396f052073fb48333d31bf5abd3c98b74da20d89ebb1ad",
+    strip_prefix = "node-v22.23.4-darwin-arm64",
+    urls = ["https://nodejs.org/download/release/v22.23.4/node-v22.23.4-darwin-arm64.tar.xz"],
+)
+
+http_archive(
+    name = "graphql_reference",
+    build_file_content = """
+exports_files(["index.js"])
+filegroup(
+    name = "sources",
+    srcs = glob(["**/*.js", "package.json"]),
+    visibility = ["//visibility:public"],
+)
+""",
+    dev_dependency = True,
+    integrity = "sha512-mS1lbMsxgQj6hge1XZ6p7GPhbrtFwUFYi3wRzXAC/FmYnyXMTvvI3td3rjmQ2u8ewXueaSvRPWaEcgVVOT9Jnw==",
+    strip_prefix = "package",
+    urls = ["https://registry.npmjs.org/graphql/-/graphql-16.11.0.tgz"],
+)
+
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.annotation(
+    # GraphQL lookahead must ignore commas just like normal token consumption.
+    crate = "apollo-parser",
+    patch_args = ["-p1"],
+    patches = ["//build:apollo_parser_ignored_commas.patch"],
+    repositories = ["crates"],
+    version = "0.8.7",
+)
 crate.annotation(
     # Apple's libtool adapter replaces archives instead of appending cc's batches.
     build_script_env = {"AR": "/usr/bin/ar"},

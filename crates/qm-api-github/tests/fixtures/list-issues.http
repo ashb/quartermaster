@@ -1,0 +1,5 @@
+GET /repos/ashb/reviewq/issues?state=open&per_page=30 HTTP/1.1
+Host: api.github.com
+Accept: application/vnd.github+json
+X-GitHub-Api-Version: 2022-11-28
+

@@ -66,9 +66,12 @@ public service facade.
 5. Acquire the selected credential, recheck current authority, and serialize
    cancellation with final dispatch admission. Return the result to the caller.
 
-The current GitHub design requires a recognized operation and verified repository
-mapping before admission; unknown API requests deny. The development gateway
-supports a narrow issue-read subset and a local simulated mutation.
+For GitHub, recognized requests can produce specific descriptions and scoped
+matches. Unfamiliar requests use complete request inspection and fresh approval,
+subject to mandatory restrictions. They do not extend an existing grant. The
+[GitHub contract](security-boundaries.md#github-requests-matching-and-approval-proposed)
+defines request preservation, matching and approval; this general flow is planned,
+not yet integrated into the narrow development gateway.
 
 The UI may transfer its fresh authenticated `LAContext` to the backend over
 authenticated XPC, allowing one fingerprint to unlock the cache and approve the
@@ -140,6 +143,23 @@ and login UUID alongside notification-driven revocation. These private macOS
 properties need qualification on supported OS versions and can conservatively
 revoke work on other console updates. UTC sync timestamps and shared macOS
 monotonic samples have distinct types and clock lifetimes.
+
+## API classifiers
+
+Each API owns a self-contained analysis crate, starting with
+[`qm-api-github`](../crates/qm-api-github/README.md). A future GitLab classifier
+belongs alongside it with its own grammar, effects, resources, patterns and
+limits. Shared machinery can be extracted when another implementation needs it.
+
+The host-configured service selects an adapter and classifier. The adapter
+translates typed observations for policy and presentation. Unfamiliar requests
+stay with that service; they are not tried against other classifiers. A classifier
+does not select credentials, confer authority or enable a service on its own.
+
+The GitHub crate preserves captured bytes and reports coverage as well as known
+observations. Complete positive matches must cover all effects; a recognized
+sibling cannot hide unfamiliar input. It is independent of the daemon and not
+yet integrated into the general approval/forwarding path.
 
 ## Caller attribution
 

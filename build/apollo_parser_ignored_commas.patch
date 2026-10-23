@@ -1,0 +1,15 @@
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -541,6 +541,11 @@
+             .map(Result::Ok)
+             .chain(self.lexer.clone())
+             .filter_map(Result::ok)
+-            .filter(|token| !matches!(token.kind(), TokenKind::Whitespace | TokenKind::Comment))
++            .filter(|token| {
++                !matches!(
++                    token.kind(),
++                    TokenKind::Whitespace | TokenKind::Comment | TokenKind::Comma
++                )
++            })
+             .nth(n - 1)
+     }

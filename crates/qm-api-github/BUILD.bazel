@@ -1,0 +1,66 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+# gazelle:resolve rust hegel @crates//:hegeltest
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "qm_api_github",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = [
+        "Cargo.toml",
+        "README.md",
+    ] + glob(["tests/fixtures/**"]),  # keep
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),  # keep
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),  # keep
+)
+
+rust_test(
+    name = "qm_api_github_test",
+    compile_data = ["Cargo.toml"],
+    crate = ":qm_api_github",
+    edition = "2024",
+    tags = ["external"],
+    deps = all_crate_deps(normal_dev = True),  # keep
+)
+
+rust_doc_test(
+    name = "qm_api_github_doc_test",
+    crate = ":qm_api_github",
+)
+
+rust_test(
+    name = "graphql_reference",
+    srcs = [
+        "tests/graphql_reference.rs",
+        "tests/reference_cases/mod.rs",
+    ],
+    compile_data = ["Cargo.toml"],
+    crate_root = "tests/graphql_reference.rs",
+    data = [
+        "tests/reference_executor.cjs",
+        "@graphql_reference//:index.js",
+        "@graphql_reference//:sources",
+        "@graphql_reference_node//:bin/node",
+    ],
+    edition = "2024",
+    env = {
+        "QM_REFERENCE_EXECUTOR": "$(rootpath tests/reference_executor.cjs)",
+        "QM_REFERENCE_GRAPHQL": "$(rootpath @graphql_reference//:index.js)",
+        "QM_REFERENCE_NODE": "$(rootpath @graphql_reference_node//:bin/node)",
+    },
+    tags = ["external"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":qm_api_github",
+        "@crates//:hegeltest",
+        "@crates//:serde",
+        "@crates//:serde_json",
+    ],
+)

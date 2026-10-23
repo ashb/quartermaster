@@ -8,7 +8,7 @@ the reason and security consequences, before implementation weakens them.
 
 | Component | Owns | Boundary |
 |---|---|---|
-| Rust broker | Verified principals and sessions, request parsing and canonicalization, hard constraints, approval verification and dispatch | Constructs authority from verified facts; never accepts a caller's identity, classification or approval as authoritative |
+| Rust broker | Verified principals and sessions, request validation and preservation, hard constraints, approval verification and dispatch | Constructs authority from verified facts; never accepts a caller's identity, classification or approval as authoritative |
 | Swift approval UI and native security module | Faithful request presentation, OS authentication and the biometric-protected approval key | Signs the frozen request it presents; cannot grant authority beyond the broker's constraints |
 | Policy engine | Declarative rules over broker-verified principal, session, action, resource and context | May restrict authority; cannot bypass Rust checks or mint approval capabilities |
 | Credential providers | Provider authentication, retrieval and encrypted cache handling behind private interfaces | An unlocked provider or valid credential is not permission to use it |
@@ -47,18 +47,20 @@ available; a PID, executable name or client-supplied field is insufficient.
 Process ancestry and command arguments are advisory context and must be labelled
 accordingly. They cannot establish permission.
 
-The broker parses, bounds and freezes the canonical request. Its binding must
-cover the principal, session, operation, resource, destination, credential and
-effective policy version as applicable. Transports cannot replace these facts
+The broker validates, bounds and freezes the complete request. Its binding must
+cover the principal, session, request, destination, credential, effective policy
+version and any claimed resource scope. Transports cannot replace these facts
 with an assertion that a request was already checked.
 
 ## Approve what the user can understand
 
-The UI must present the security-relevant meaning of the immutable request it
-signs. It independently checks the request digest, challenge binding and supported
-presentation format. If it cannot explain the operation or a field that affects
-its authority, it must refuse approval. Operation classification and policy
-decisions remain in Rust; the UI does not maintain a second authorization policy.
+The UI must faithfully present the immutable request it signs. It independently
+checks the request digest, challenge binding and supported presentation format.
+For GitHub, the proposed contract below permits either a verified explanation or
+complete request inspection with its effects explicitly unverified. If the UI
+cannot present the complete request within its supported bounds, it must refuse
+approval. Operation classification and policy decisions remain in Rust; the UI
+does not maintain a second authorization policy.
 
 Only one approval may be armed for user presence at a time. The UI owns the
 biometric-protected approval key; the broker receives its enrolled public key and
@@ -84,6 +86,158 @@ transfer and cache work cannot restart either approval deadline. Release and
 invalidate the backend context after required signing/unwrap work, rejection,
 cancellation or connection loss; never reuse it for another write.
 
+## GitHub requests: matching and approval (proposed)
+
+This is proposed product behaviour, not an implemented or qualified capability.
+It replaces rejection based solely on an unfamiliar GitHub API shape with fresh
+approval for that request. GitHub can add APIs without requiring Quartermaster
+to understand their effects before a user can authorize their use.
+
+### When a request needs a fingerprint
+
+Quartermaster checks host restrictions and matches the request against
+host-controlled patterns. A pattern may describe a read operation, a repository,
+particular inputs or another explicitly supported condition. The fallback uses
+the host-selected GitHub HTTPS origin and the profile's explicitly selected
+credential for per-request approvals. That binding is independent of read-grant
+bindings and is frozen before authentication. Neither the client nor an upstream
+permission error can silently select a different credential or destination.
+
+| Result | Behaviour |
+|---|---|
+| An applicable denial or failed mandatory restriction | Reject; an approval cannot override it. |
+| A complete match authorizes use without approval | Proceed within the rule's principal, credential, resource, grant and lifetime limits. |
+| A match requires approval | Request a fresh fingerprint for this request. |
+| No complete match, including unfamiliar fields or API shapes | Request a fresh fingerprint for this request. |
+| Invalid policy or policy evaluation failure | Reject; a failure is not an unmatched request. |
+
+Every condition of an automatic allow rule must be verified. Matching a path prefix,
+HTTP method or part of a GraphQL operation is insufficient when other inputs
+could change its effect or scope. Rules must account for all forwarded inputs;
+an unfamiliar field cannot be silently ignored to obtain an automatic match.
+A supported denial predicate established from the request rejects the whole
+request, even when companion inputs are unfamiliar. For GraphQL, that includes
+any forbidden effect established in the selected operation: adding an unknown
+sibling field cannot turn it into an approvable request. Mandatory approval
+predicates likewise survive unfamiliar companion input. These restrictions
+take precedence over an allow rule.
+
+Host restrictions distinguish predicates over verified request facts from
+properties that require positive proof. A configured requirement to prove
+repository confinement denies when that proof is unavailable; ordinary lack of
+API knowledge alone requires approval. A missing schema is not a policy-engine
+failure and cannot create permission.
+
+For example, a grant might permit a client's issue reads in one repository.
+A request that satisfies that pattern uses the existing grant. A new endpoint,
+or an additional parameter whose effect the rule does not cover, instead gets
+the normal fingerprint dialog. Its extra input is preserved for review and
+dispatch. Approving it does not extend the read grant or teach a new allow rule.
+
+### What the user approves
+
+For an unfamiliar request, the dialog identifies the verified caller, GitHub
+destination and selected provider/account/item/field. It states that the effects
+are unverified and makes the complete method, target, query, application headers
+and body available for inspection. Request content is untrusted data, rendered
+as inert text or an explicit byte view; formatting must not hide control
+characters, duplicate fields or omitted content. A digest or truncated summary
+cannot stand in for inspection of the complete request.
+
+Repository scope is stated only when verified. An unfamiliar request cannot
+borrow a repository-limited grant merely because its URL mentions that
+repository. If scope is unverified, the dialog must say that this is one use of
+the selected credential without a verified repository restriction. It cannot
+claim confinement to the repository from an existing read grant. Explicit host
+restrictions still apply, including any requirement to prove resource scope.
+
+Approval covers only the captured request, verified caller/session, destination,
+selected credential and effective policy. It requires the existing request-bound
+signature, fresh authentication, original dispatch deadline and atomic single
+use. It creates no reusable grant. The UI receives credential identity, never
+the injected token or decrypted vault material. Authentication and cancellation
+retain the boundaries above; unlocking the cache supplies no approval.
+
+### Forward the request the client supplied
+
+Quartermaster preserves the method, target path and query, body bytes and
+application header names, values and order, including repeated fields.
+It must not rebuild a GitHub request from a classified operation, reserialize
+JSON, discard unfamiliar input, substitute a different API version or add API
+defaults. Parsed facts and friendly descriptions are views of the captured
+request; they do not become a replacement payload.
+
+For the proposed HTTP/1.1 transport, the permitted changes are limited to:
+
+- Replacing a single caller `Authorization` field, or inserting it when absent,
+  with authentication from the frozen host-selected credential. Duplicate
+  `Authorization` fields are rejected; a second field is never appended.
+- Converting an absolute-form request target to origin-form after checking its
+  scheme and authority against the selected HTTPS origin and the sole `Host`
+  field. The path and query octets are unchanged. Mismatched or duplicate
+  authorities deny.
+- Emitting `Content-Length` from the complete frozen body when framing requires
+  it, and replacing connection management with `Connection: close`. Incoming
+  `Connection` and `Keep-Alive` fields are consumed locally. Only `close` and
+  `keep-alive` connection options are accepted.
+
+Conflicting or duplicate lengths, transfer encodings, trailers, proxy
+authorization, `Expect` handshakes, CONNECT tunnels and protocol upgrades are outside this transport's supported framing
+and are rejected before approval. In particular, a `Connection` option cannot
+cause an application header to disappear. No other request fields may be added,
+removed, reordered or re-encoded. These limits concern HTTP transport, not
+recognition of GitHub APIs; see [HTTP forwarding](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1)
+and [HTTP/1.1 framing](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3).
+
+The approval binds a versioned description of these changes, the effective
+application request and the selected credential identity and digest. The secret
+authentication value stays in Rust. The final dispatch checks this binding;
+it cannot choose new transformations or substitute a later body, target,
+application header or credential.
+
+An unfamiliar request is treated as potentially mutating even if it uses GET.
+One approval permits one dispatch, without automatic retry after uncertain
+delivery. A redirect is a different request and needs its own authorization;
+the original approval does not cover it. Existing grants can cover recognized
+redirected reads only after checking the new request. Vaultwarden routing is
+governed separately by the redirect decision below.
+
+### GraphQL and changes to GitHub
+
+GraphQL uses the same decision model. Parsing identifies the selected operation,
+its variables, fragments, aliases and directives. Automatic rules must cover
+the complete effective operation and every resource relationship on which their
+scope depends. A query label or repository root alone proves neither a permitted
+operation nor repository confinement. Node IDs need verified ownership when a
+rule relies on that ownership.
+
+If the operation does not match, the user can approve the complete original
+document, variables, operation selection and other forwarded input once. Missing
+schema knowledge prevents automatic matching, not request inspection. None of
+those inputs is rewritten for dispatch.
+
+API schemas describe request structure; they do not grant authority. The
+effective policy binds pattern definitions, matching semantics and any schema
+version used to determine permission. Changing any of them invalidates affected
+authority, including change followed by reversion; a descriptive-only schema
+update cannot broaden a match. An ordinary caller cannot install patterns by
+approving a request.
+
+The guarantee is authorization of the exact request, not proof of all its
+upstream consequences. Unknown requests default to approval, but an incorrect
+automatic rule can still authorize too much. Rules and their matchers remain
+trusted security code. A genuinely read-only upstream credential offers a
+separate barrier against writes where used; a credential role label alone
+does not attest those upstream permissions.
+
+A denial covers the request facts and effects its predicate can establish.
+It cannot promise to recognize the same effect through every future API.
+An absolute ban on an effect requires independent enforcement, such as upstream
+credential permissions that exclude it. Otherwise an unfamiliar request's
+effects remain explicitly unverified, even after the user approves its bytes.
+Approval also cannot freeze GitHub's state, mutable resource names or changes
+to the credential's upstream permissions.
+
 ## Keep authority narrow and short-lived
 
 Approvals are request-bound, expiring and single-use. Mediated request approvals
@@ -95,9 +249,12 @@ must never restart or extend that lifetime. Recheck authority at dispatch.
 
 Policy returns structured `Allow`, `Deny` or `RequireApproval` decisions, with
 machine-readable reasons and any user-presence requirements. `RequireApproval`
-is not authorization. Policy errors, invalid decisions and unknown operations
-fail closed. Grants bind to the effective policy version; relevant policy or
-session changes invalidate outstanding authority, even if settings later revert.
+is not authorization. Policy errors and invalid decisions deny. Under the proposed
+GitHub contract above, a valid policy with no complete request match requires
+fresh approval; it cannot silently authorize the request. Other unsupported
+services remain denied. Grants bind to the effective policy version; relevant
+policy or session changes invalidate outstanding authority, even if settings
+later revert.
 
 The credential owner can authorize an eligible operation from a validated
 `Allow` decision without user approval. It may issue a reusable grant scoped to
@@ -294,7 +451,3 @@ Docker/Compose claims need tests through their complete enforcement paths and
 recorded versions. Carrier admission, provider-session expiry, policy failures
 and every accepted permission need executable negative coverage; a useful local
 probe does not establish release compatibility.
-
-Resource-scoped API authority requires verified mappings for numeric repository
-IDs, absolute response URLs and GraphQL node/global IDs. A method or query label
-alone does not prove an operation's effects or resource ownership.
