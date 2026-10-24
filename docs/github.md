@@ -2,6 +2,7 @@
 
 The current development build lists and reads issues from configured GitHub
 repositories. Other API requests, including real writes and GraphQL, are rejected.
+Credential delivery through environment variables is not implemented yet.
 
 ## Enrol a credential
 

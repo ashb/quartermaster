@@ -451,3 +451,22 @@ Docker/Compose claims need tests through their complete enforcement paths and
 recorded versions. Carrier admission, provider-session expiry, policy failures
 and every accepted permission need executable negative coverage; a useful local
 probe does not establish release compatibility.
+
+## Credential handoff (planned)
+
+Tools without a mediated transport may receive a selected credential in their
+environment after a separate credential-release authorization. This mode trades
+request-level enforcement for compatibility. It is a host-configured mode, never
+an automatic response to a failed or unfamiliar mediated request.
+
+Authorize the verified recipient, selected provider/account/item/field and
+effective policy before release. Policy may allow it, require a fingerprint or
+deny it. A required approval must bind that release; a mediated read grant or
+cache unlock cannot be reused as credential-release authority. The UI presents
+the recipient and credential identity, never vault keys or secret values.
+
+Once released, the tool can copy the credential or pass it to descendants.
+Quartermaster cannot enforce per-request restrictions or retract those copies.
+Expiration of a release grant or process exit does not expire the credential;
+further limits require upstream scope, expiry or revocation. Strict profiles
+that prohibit credential export continue to deny handoff.
