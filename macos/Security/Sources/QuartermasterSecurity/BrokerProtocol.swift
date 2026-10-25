@@ -19,12 +19,20 @@ public enum BrokerCommand: Encodable, Sendable {
     case vaultSync
     case vaultDiscard
     case revokeReadGrants
+    case settingsRegister(publicKey: Data)
+    case settingsStatus
+    case stageEnrollment(server: String, email: String, password: String, itemID: String?)
+    case prepareSettings(revision: UInt64, settings: BrokerSettings, provider: SettingsProviderChoice)
+    case settingsPresence(id: String, authenticated: MonotonicTimestamp)
+    case settingsProof(id: String, signature: Data)
+    case settingsCancel(id: String?)
 
     public var timeout: DispatchTimeInterval {
         switch self {
-        case .presence: .seconds(30)
-        case .vaultLogin, .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard: .seconds(120)
+        case .presence, .settingsPresence, .settingsProof, .settingsRegister, .prepareSettings: .seconds(30)
+        case .vaultLogin, .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard, .stageEnrollment: .seconds(120)
         case .hello, .enroll, .next, .proof, .cancel, .vaultStatus, .revokeReadGrants: .seconds(5)
+        case .settingsStatus, .settingsCancel: .seconds(5)
         }
     }
 
@@ -35,7 +43,8 @@ public enum BrokerCommand: Encodable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, id, publicKey, authenticated, signature, server, email, password, itemId
+        case kind, id, publicKey, authenticated, signature, server, email, password, itemId, revision, settings,
+            provider
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -70,6 +79,32 @@ public enum BrokerCommand: Encodable, Sendable {
         case .vaultSync: kind = "vaultSync"
         case .vaultDiscard: kind = "vaultDiscard"
         case .revokeReadGrants: kind = "revokeReadGrants"
+        case .settingsRegister(let key):
+            kind = "settingsRegister"
+            try fields.encode(key, forKey: .publicKey)
+        case .settingsStatus: kind = "settingsStatus"
+        case .stageEnrollment(let server, let email, let password, let itemID):
+            kind = "stageEnrollment"
+            try fields.encode(server, forKey: .server)
+            try fields.encode(email, forKey: .email)
+            try fields.encode(password, forKey: .password)
+            try fields.encodeIfPresent(itemID, forKey: .itemId)
+        case .prepareSettings(let revision, let settings, let provider):
+            kind = "prepareSettings"
+            try fields.encode(revision, forKey: .revision)
+            try fields.encode(settings, forKey: .settings)
+            try fields.encode(provider, forKey: .provider)
+        case .settingsPresence(let id, let authenticated):
+            kind = "settingsPresence"
+            try fields.encode(id, forKey: .id)
+            try fields.encode(authenticated, forKey: .authenticated)
+        case .settingsProof(let id, let signature):
+            kind = "settingsProof"
+            try fields.encode(id, forKey: .id)
+            try fields.encode(signature, forKey: .signature)
+        case .settingsCancel(let id):
+            kind = "settingsCancel"
+            try fields.encodeIfPresent(id, forKey: .id)
         }
         try fields.encode(kind, forKey: .kind)
     }
@@ -79,7 +114,7 @@ public enum BrokerControlError: String, Codable, Error, Sendable {
     case invalidMessage, denied, expired, busy, providerChanged, sessionEnded, unavailable
 }
 
-public struct VaultBinding: Decodable, Equatable, Sendable {
+public struct VaultBinding: Codable, Equatable, Sendable {
     public let server: String
     public let email: String
     public let accountID: String
@@ -134,6 +169,11 @@ public enum BrokerReply: Decodable, Sendable {
     case readGrantsRevoked
     case error(BrokerControlError)
     case vaultStatus(BrokerVaultStatus)
+    case settingsStatus(SettingsSnapshot)
+    case settingsReview(SettingsReview)
+    case settingsChallenge(SettingsChallenge)
+    case enrollmentStaged(ticket: String, provider: SettingsProvider)
+    case settingsApplied(revision: UInt64)
 
     public static func decodeSuccess(_ bytes: Data) throws -> Self {
         guard bytes.count <= maximumBrokerPayload else { throw BrokerProtocolFailure.oversizedPayload }
@@ -147,10 +187,11 @@ public enum BrokerReply: Decodable, Sendable {
     private enum Kind: String, Decodable {
         case hello, enrolled, idle, review, challenge, accepted, canceled
         case alreadyAdmitted, unknownOperation, readGrantsRevoked, error, vaultStatus
+        case settingsStatus, settingsReview, settingsChallenge, enrollmentStaged, settingsApplied
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, profile, approval, authorization, code
+        case kind, profile, approval, authorization, code, settings, review, ticket, provider, revision
     }
 
     public init(from decoder: any Decoder) throws {
@@ -168,6 +209,15 @@ public enum BrokerReply: Decodable, Sendable {
         case .readGrantsRevoked: self = .readGrantsRevoked
         case .error: self = .error(try fields.decode(BrokerControlError.self, forKey: .code))
         case .vaultStatus: self = .vaultStatus(try BrokerVaultStatus(from: decoder))
+        case .settingsStatus: self = .settingsStatus(try fields.decode(SettingsSnapshot.self, forKey: .settings))
+        case .settingsReview: self = .settingsReview(try fields.decode(SettingsReview.self, forKey: .review))
+        case .settingsChallenge:
+            self = .settingsChallenge(try fields.decode(SettingsChallenge.self, forKey: .authorization))
+        case .enrollmentStaged:
+            self = .enrollmentStaged(
+                ticket: try fields.decode(String.self, forKey: .ticket),
+                provider: try fields.decode(SettingsProvider.self, forKey: .provider))
+        case .settingsApplied: self = .settingsApplied(revision: try fields.decode(UInt64.self, forKey: .revision))
         }
     }
 }

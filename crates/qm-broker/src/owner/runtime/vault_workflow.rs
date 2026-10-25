@@ -8,64 +8,20 @@ use crate::{
 };
 use qm_providers::{RbwProvider, VaultProvider, VaultSnapshot};
 use std::sync::Arc;
-use zeroize::Zeroizing;
 
 enum VaultWork {
-    Login {
-        server: String,
-        email: String,
-        password: Zeroizing<String>,
-        item_id: Option<String>,
-    },
-    Unlock(Source),
+    Unlock(Box<Source>),
     Sync(Arc<VaultSnapshot>),
-    Discard(Source),
 }
 
 enum Output {
     Unlocked(VaultSnapshot),
     Updated(VaultSnapshot),
-    Discarded,
 }
 
 impl VaultWork {
     async fn execute(self) -> Result<Output, vault::Error> {
         match self {
-            VaultWork::Login {
-                server,
-                email,
-                password,
-                item_id,
-            } => {
-                if password.is_empty() || password.len() > 4096 {
-                    Err(qm_providers::ProviderError::InvalidCredentials.into())
-                } else {
-                    let snapshot = match item_id {
-                        Some(item_id) => {
-                            RbwProvider::enroll_selected_login(
-                                &server,
-                                &email,
-                                &item_id,
-                                password.as_bytes(),
-                                vault::LIMITS,
-                                "github-write",
-                            )
-                            .await
-                        }
-                        None => {
-                            RbwProvider::enroll_sole_login(
-                                &server,
-                                &email,
-                                password.as_bytes(),
-                                vault::LIMITS,
-                                "github-write",
-                            )
-                            .await
-                        }
-                    };
-                    snapshot.map(Output::Updated).map_err(Into::into)
-                }
-            }
             VaultWork::Sync(snapshot) => {
                 match RbwProvider::new(snapshot.binding().clone(), vault::LIMITS) {
                     Ok(provider) => provider
@@ -80,12 +36,6 @@ impl VaultWork {
                 .await
                 .map_err(|_| vault::Error::Storage)
                 .and_then(|result| result.map(Output::Unlocked)),
-            VaultWork::Discard(source) => {
-                tokio::task::spawn_blocking(move || source.delete_device())
-                    .await
-                    .map_err(|_| vault::Error::Storage)
-                    .and_then(|result| result.map(|()| Output::Discarded))
-            }
         }
     }
 }
@@ -97,8 +47,8 @@ pub(super) async fn vault_operation(
     paths: &ServicePaths,
     generation: crate::owner::provider_lifecycle::ProviderGeneration,
 ) -> Result<crate::CacheStatus> {
-    let root = paths.root.clone();
-    let source = match tokio::task::spawn_blocking(move || Source::capture(&root))
+    let source_paths = paths.clone();
+    let source = match tokio::task::spawn_blocking(move || source_paths.vault_source())
         .await
         .map_err(Error::from)?
     {
@@ -117,10 +67,11 @@ pub(super) async fn vault_operation(
             ));
         }
         if !connection.is_connected()
-            || state
+            || (state
                 .ui
                 .as_ref()
                 .is_none_or(|ui| ui.connection != Some(connection.id()))
+                && !state.administration.manages_cache(connection))
         {
             return Err(Error::State(Fault::UiNotEnrolled));
         }
@@ -128,31 +79,11 @@ pub(super) async fn vault_operation(
             state.disconnect_ui();
         }
         let reservation = match message {
-            Client::VaultLogin {
-                server,
-                email,
-                password,
-                item_id,
-            } => state
-                .provider
-                .begin_login(source.binding(), source.minimum_sync(), source.revision)
-                .map(|operation| {
-                    (
-                        operation,
-                        VaultWork::Login {
-                            server,
-                            email,
-                            password,
-                            item_id,
-                        },
-                    )
-                })
-                .map_err(vault::Error::from),
             Client::VaultUnlock {} => source.identity().and_then(|identity| {
                 state
                     .provider
                     .begin_unlock(identity)
-                    .map(|operation| (operation, VaultWork::Unlock(source)))
+                    .map(|operation| (operation, VaultWork::Unlock(Box::new(source))))
                     .map_err(Into::into)
             }),
             Client::VaultSync {} => source.identity().and_then(|identity| {
@@ -162,11 +93,6 @@ pub(super) async fn vault_operation(
                     .map(|(operation, snapshot)| (operation, VaultWork::Sync(snapshot)))
                     .map_err(Into::into)
             }),
-            Client::VaultDiscard {} => state
-                .provider
-                .begin_discard(source.revision)
-                .map(|operation| (operation, VaultWork::Discard(source)))
-                .map_err(Into::into),
             _ => return Err(Error::State(Fault::UnsupportedVaultCommand)),
         };
         match reservation {
@@ -184,10 +110,9 @@ pub(super) async fn vault_operation(
             }
         }
         Ok(Output::Unlocked(snapshot)) => CacheCompletion::Unlock(operation, Box::new(snapshot)),
-        Ok(Output::Discarded) => CacheCompletion::Discard(operation),
         Err(error) => return Ok(vault::error_reply(error)),
     };
-    let root = paths.root.clone();
+    let root = paths.vault_root()?;
     let shared = Arc::clone(shared);
     tokio::task::spawn_blocking(move || match completion.finish(&root, &shared) {
         Ok(()) => cache_status(&root, &shared),
@@ -201,7 +126,6 @@ pub(super) async fn vault_operation(
 enum CacheCompletion {
     Publish(ProviderOperation, Box<vault::PreparedCache>),
     Unlock(ProviderOperation, Box<VaultSnapshot>),
-    Discard(ProviderOperation),
 }
 
 impl CacheCompletion {
@@ -220,20 +144,6 @@ impl CacheCompletion {
                 state
                     .provider
                     .finish_unlock(operation, &identity, *snapshot)?;
-            }
-            Self::Discard(operation) => {
-                let cache = crate::owner::persistence::store(root)?.transaction()?;
-                let source = Source::capture_store(&cache)?;
-                {
-                    let mut state = shared
-                        .0
-                        .lock()
-                        .map_err(|_| Error::State(Fault::StateUnavailable))?;
-                    state.ensure_host_session()?;
-                    state.provider.check_discard(&operation, source.revision)?;
-                }
-                cache.discard()?;
-                cache.discard_enrollment()?;
             }
         }
         Ok(())
@@ -276,7 +186,7 @@ async fn prepare_cache_update(
     vault::Error,
 > {
     let shared = Arc::clone(shared);
-    let root = paths.root.clone();
+    let root = paths.vault_root()?;
     tokio::task::spawn_blocking(move || {
         let cache = crate::owner::persistence::store(&root)?.transaction()?;
         let source = Source::capture_store(&cache)?;

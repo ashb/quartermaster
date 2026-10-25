@@ -85,6 +85,8 @@ impl WrappedCacheKey {
 #[cfg(target_os = "macos")]
 mod native;
 #[cfg(target_os = "macos")]
+pub(crate) use native::own_access_group;
+#[cfg(target_os = "macos")]
 pub use native::{DeviceCacheKey, NativeAuthenticationContext, SnapshotKey};
 
 #[cfg(test)]

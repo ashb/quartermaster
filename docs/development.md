@@ -83,9 +83,9 @@ open target/macos/signed/Quartermaster.app
 ```
 
 `just run` builds, signs and starts the backend. Opening the app shows the
-`QM [DEBUG]` menu. Starting it creates no read grant and requests no fingerprint;
+Quartermaster key menu. Starting it creates no read grant and requests no fingerprint;
 enrolment and credential use can require authentication. This is a development
-build, identified by the `[DEBUG BUILD. Insecure]` banner.
+build, whose protected settings flow still needs attended signing and hardware qualification.
 
 Quit the UI through its menu, then use `just stop` to stop the backend. It is
 started for the logged-in user; login startup is not configured.
@@ -132,16 +132,26 @@ Development state lives under
 |---|---|
 | `backend.log` | Backend output; check this first for startup or request failures. |
 | `gh/` | Isolated GitHub CLI configuration. |
-| `github.json` | Simulation/real-GitHub selection and repository configuration. |
-| `vault/` | Encrypted vault cache and enrolment metadata. |
+| `vault/` | Retained legacy encrypted cache and enrolment metadata. |
+| `enrollments/` | Encrypted cache slots; the protected settings record selects the active slot. |
 
 If the UI reports a disconnected or unavailable backend, quit it, run `just run`,
 then reopen the signed app. Restart both after rebuilding so they come from the
 same signed build.
 
-Use **Vault status** to inspect enrolment. For an incompatible or damaged cache,
-use **Discard offline cache…**, then **Enrol dedicated vault…** to rebuild it
-from the vault. Discarding the local cache does not modify the source vault.
+Open **Settings → Vault** to inspect the selected enrolment. A replacement is
+verified into an inactive cache slot, then selected only after settings approval.
+**Disconnect…** stages removal of the selection. Approving it locks the provider;
+it retains encrypted files and does not modify the source vault.
+After disconnecting, select the intended cache under **Retained enrolments** to
+review and reauthorize it without signing in again. Listed metadata grants no
+access; Save authenticates the cache before selecting it.
+
+Approved settings and the UI public-key pin are stored together in the backend's
+Data Protection Keychain access group, under service
+`dev.quartermaster.settings.development.v1`. There is no authoritative JSON copy.
+Opening the UI reads settings without requesting a fingerprint. Missing or
+unreadable protected state grants no access; **Reconnect** retries registration.
 
 To inspect the approval key without creating one:
 
@@ -149,9 +159,9 @@ To inspect the approval key without creating one:
 target/macos/signed/Quartermaster.app/Contents/MacOS/Quartermaster --approval-key-status
 ```
 
-For intentional approval-key recovery, quit the UI and stop the backend before
-running the same command with `--approval-key-reset`. It deletes the development
-approval key and its public enrolment. Restart and enrol again afterwards.
+The CLI cannot reset the approval key. A mismatched key or damaged protected
+settings record fails closed; an authenticated recovery flow is not implemented.
+Do not delete retained keys as a troubleshooting shortcut.
 
 If signing reports no valid identity, check that the pinned certificate is valid
 and its private key is available. For missing or expired profiles, run

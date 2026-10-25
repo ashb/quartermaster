@@ -12,9 +12,20 @@ pub(super) struct PolicySource {
     current: Arc<AtomicU64>,
 }
 
-#[derive(Default)]
 struct SourceState {
     fingerprint: Option<Result<[u8; 32], AuthorizationError>>,
+    approved: Decoded,
+    provider: Option<crate::owner::settings::ProviderPin>,
+}
+
+impl Default for SourceState {
+    fn default() -> Self {
+        Self {
+            fingerprint: None,
+            approved: Err(AuthorizationError::InvalidPolicy),
+            provider: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -44,6 +55,72 @@ impl Observation {
 }
 
 impl PolicySource {
+    pub(super) fn snapshot(&self) -> Result<Observation, AuthorizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AuthorizationError::InvalidPolicy)?;
+        let decoded = state.approved.clone();
+        self.observe(&mut state, decoded)
+    }
+
+    pub(super) fn install<C>(
+        &self,
+        manager: &crate::owner::settings::Manager<C>,
+    ) -> Result<(), AuthorizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AuthorizationError::InvalidPolicy)?;
+        state.approved = manager.policy();
+        state.provider = manager.record().provider().cloned();
+        let decoded = state.approved.clone();
+        self.observe(&mut state, decoded)?;
+        Ok(())
+    }
+
+    pub(super) fn suspend(&self) -> Result<(), AuthorizationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AuthorizationError::InvalidPolicy)?;
+        state.approved = Err(AuthorizationError::InvalidPolicy);
+        let decoded = state.approved.clone();
+        self.observe(&mut state, decoded)?;
+        Ok(())
+    }
+
+    pub(super) fn provider(
+        &self,
+    ) -> Result<Option<crate::owner::settings::ProviderPin>, AuthorizationError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| AuthorizationError::InvalidPolicy)?
+            .provider
+            .clone())
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture(policy: Policy) -> Self {
+        Self {
+            state: Mutex::new(SourceState {
+                approved: Ok(policy),
+                ..SourceState::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_fixture(&self, policy: Policy) {
+        let mut state = self.state.lock().unwrap();
+        state.approved = Ok(policy);
+        let decoded = state.approved.clone();
+        self.observe(&mut state, decoded).unwrap();
+    }
+
+    #[cfg(test)]
     pub(super) fn read(
         &self,
         load: impl FnOnce() -> Decoded,
@@ -53,6 +130,14 @@ impl PolicySource {
             AuthorizationError::InvalidPolicy
         })?;
         let decoded = load();
+        self.observe(&mut state, decoded)
+    }
+
+    fn observe(
+        &self,
+        state: &mut SourceState,
+        decoded: Decoded,
+    ) -> Result<Observation, AuthorizationError> {
         let fingerprint = decoded.as_ref().map(Policy::digest).map_err(Clone::clone);
         let mut epoch = self.current.load(Ordering::Acquire);
         if state.fingerprint.as_ref() != Some(&fingerprint) {

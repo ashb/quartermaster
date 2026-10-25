@@ -52,8 +52,8 @@ just check
 
 `just build` produces an unsigned app at `bazel-bin/macos/Quartermaster.app`.
 To run it with Touch ID, follow the [development signing and startup instructions](docs/development.md#sign-and-run).
-Then use the [GitHub setup guide](docs/github.md) to enrol a credential and try
-real requests or the local approval demo.
+Then use the native **Settings…** window and the [GitHub setup guide](docs/github.md)
+to enrol a credential and configure mediated requests.
 
 ## Documentation
 

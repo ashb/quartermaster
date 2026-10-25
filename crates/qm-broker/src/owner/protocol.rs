@@ -40,6 +40,49 @@ pub(super) enum Client {
     VaultSync {},
     VaultDiscard {},
     RevokeReadGrants {},
+    SettingsRegister {
+        #[serde(rename = "publicKey")]
+        public_key: String,
+    },
+    SettingsStatus {},
+    StageEnrollment {
+        server: String,
+        email: String,
+        password: Zeroizing<String>,
+        #[serde(rename = "itemId")]
+        item_id: Option<String>,
+    },
+    PrepareSettings {
+        revision: super::settings::Revision,
+        settings: super::settings::Settings,
+        provider: super::settings::ProviderChoice,
+    },
+    SettingsPresence {
+        id: String,
+        authenticated: MonotonicTimestamp,
+    },
+    SettingsProof {
+        id: String,
+        signature: String,
+    },
+    SettingsCancel {
+        id: Option<String>,
+    },
+}
+
+impl Client {
+    pub(super) fn is_settings(&self) -> bool {
+        matches!(
+            self,
+            Self::SettingsRegister { .. }
+                | Self::SettingsStatus {}
+                | Self::StageEnrollment { .. }
+                | Self::PrepareSettings { .. }
+                | Self::SettingsPresence { .. }
+                | Self::SettingsProof { .. }
+                | Self::SettingsCancel { .. }
+        )
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -97,6 +140,22 @@ pub(super) enum Reply {
     AlreadyAdmitted,
     UnknownOperation,
     ReadGrantsRevoked,
+    SettingsStatus {
+        settings: super::settings::Snapshot,
+    },
+    SettingsReview {
+        review: super::settings::Review,
+    },
+    SettingsChallenge {
+        authorization: super::settings::Challenge,
+    },
+    EnrollmentStaged {
+        ticket: String,
+        provider: super::settings::ProviderPin,
+    },
+    SettingsApplied {
+        revision: super::settings::Revision,
+    },
     Error {
         code: ControlError,
     },

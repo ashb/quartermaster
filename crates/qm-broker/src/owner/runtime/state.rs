@@ -28,6 +28,7 @@ type ConsoleCapture =
     Box<dyn FnMut() -> Result<ConsoleObservation, qm_macos::console_session::Error> + Send>;
 
 pub(super) struct OwnerState {
+    pub(super) administration: super::settings::Administration,
     pub(super) ui: Option<UiSession>,
     pub(super) approval_public_key: Option<Vec<u8>>,
     pub(super) pending: Option<ApprovalDelivery>,
@@ -69,6 +70,7 @@ impl OwnerState {
 
     fn with_console(console_capture: Option<ConsoleCapture>, interactive: bool) -> Result<Self> {
         Ok(Self {
+            administration: super::settings::Administration::default(),
             ui: None,
             approval_public_key: None,
             pending: None,
@@ -176,6 +178,7 @@ impl OwnerState {
     }
 
     pub(super) fn disconnect_ui(&mut self) {
+        self.administration.cancel_changes();
         if let Some(ui) = self.ui.take() {
             self.operations.cancel_interactive_session(ui.session.id());
         }

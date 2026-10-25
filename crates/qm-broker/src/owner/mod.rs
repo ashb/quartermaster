@@ -6,6 +6,8 @@ mod request;
 mod review;
 #[cfg(target_os = "macos")]
 mod runtime;
+#[cfg(any(target_os = "macos", test))]
+mod settings;
 #[cfg(target_os = "macos")]
 mod vault;
 
@@ -60,7 +62,13 @@ pub(super) fn persisted_status(options: ServiceOptions) -> Result<CacheStatus, S
     #[cfg(target_os = "macos")]
     {
         validate(&options)?;
-        let mut status = vault::status(&options.storage_root, None);
+        let store = settings::Store::native().map_err(|_| {
+            ServiceError::Runtime(std::io::Error::other("protected settings unavailable"))
+        })?;
+        let mut status =
+            settings::persisted_status(&options.storage_root, &store).map_err(|_| {
+                ServiceError::Runtime(std::io::Error::other("protected settings unavailable"))
+            })?;
         status.observation = Some(crate::StatusObservation::PersistedCache);
         Ok(status)
     }

@@ -171,3 +171,39 @@ final class BrokerPending: ApprovalBackend {
         Task { _ = try? await client.call(.cancel(id: id)) }
     }
 }
+
+@MainActor
+final class SettingsPending: ApprovalBackend {
+    private let client: BrokerConnection
+    private let id: String
+    private var workflow: SettingsWorkflow
+    var document: SettingsDocument { workflow.document }
+
+    init(client: BrokerConnection, review: SettingsReview) throws {
+        guard let key = try ApprovalKeyStore().existingPublicKey() else { throw ApprovalKeyError.missingEnrolledKey }
+        workflow = try SettingsWorkflow(review: review, expectedKey: key, now: .now)
+        self.client = client
+        id = review.id
+    }
+
+    func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {
+        try workflow.recordAuthentication(at: authenticated, now: .now)
+        guard
+            case .settingsChallenge(let challenge) = try await client.call(
+                .settingsPresence(id: id, authenticated: authenticated), context: context)
+        else { throw BrokerFailure.invalidMessage }
+        return try workflow.validate(challenge, now: .now)
+    }
+
+    func submit(_ signature: Data) async throws {
+        try workflow.checkSubmission(now: .now)
+        guard case .settingsApplied = try await client.call(.settingsProof(id: id, signature: signature)) else {
+            throw BrokerFailure.invalidMessage
+        }
+    }
+
+    func cancel() {
+        workflow.cancel()
+        Task { _ = try? await client.call(.settingsCancel(id: id)) }
+    }
+}

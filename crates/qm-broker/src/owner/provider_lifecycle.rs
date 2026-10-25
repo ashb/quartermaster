@@ -47,11 +47,6 @@ pub(super) enum Error {
 enum Work {
     Unlock(CacheIdentity),
     Refresh(CacheIdentity),
-    Login {
-        binding: Option<ProviderBinding>,
-        minimum_sync: OffsetDateTime,
-    },
-    Discard,
 }
 
 pub(super) struct ProviderOperation {
@@ -155,30 +150,6 @@ impl ProviderState {
         self.reserve(Work::Unlock(identity.clone()), identity.revision)
     }
 
-    pub(super) fn begin_login(
-        &mut self,
-        binding: Option<ProviderBinding>,
-        minimum_sync: OffsetDateTime,
-        revision: PersistedRevision,
-    ) -> Result<ProviderOperation, Error> {
-        self.lock()?;
-        self.reserve(
-            Work::Login {
-                binding,
-                minimum_sync,
-            },
-            revision,
-        )
-    }
-
-    pub(super) fn begin_discard(
-        &mut self,
-        revision: PersistedRevision,
-    ) -> Result<ProviderOperation, Error> {
-        self.lock()?;
-        self.reserve(Work::Discard, revision)
-    }
-
     pub(super) fn revise_source(
         &self,
         operation: &mut ProviderOperation,
@@ -186,18 +157,6 @@ impl ProviderState {
     ) -> Result<(), Error> {
         self.check(operation, operation.revision)?;
         operation.revision = revision;
-        Ok(())
-    }
-
-    pub(super) fn check_discard(
-        &self,
-        operation: &ProviderOperation,
-        revision: PersistedRevision,
-    ) -> Result<(), Error> {
-        self.check(operation, revision)?;
-        if !matches!(operation.work, Work::Discard) {
-            return Err(Error::Changed);
-        }
         Ok(())
     }
 
@@ -276,14 +235,10 @@ impl ProviderState {
     ) -> Result<Update, Error> {
         let validation = self.check(&operation, current).and_then(|()| {
             let (binding, minimum_sync) = match &operation.work {
-                Work::Refresh(expected) => (Some(&expected.binding), expected.synchronized_at),
-                Work::Login {
-                    binding,
-                    minimum_sync,
-                } => (binding.as_ref(), *minimum_sync),
+                Work::Refresh(expected) => (&expected.binding, expected.synchronized_at),
                 _ => return Err(Error::Changed),
             };
-            if binding.is_some_and(|binding| binding != snapshot.binding()) {
+            if binding != snapshot.binding() {
                 return Err(Error::Changed);
             }
             if snapshot.synchronized_at() < minimum_sync {
@@ -550,63 +505,5 @@ mod tests {
         assert_eq!(state.generation(), generation);
         assert_eq!(state.snapshot().unwrap().checkpoint(), [3; 16]);
         assert!(state.begin_refresh(&identity).is_ok());
-    }
-
-    #[test]
-    fn provider_lifecycle_discard_invalidates_a_pending_unlock_even_when_the_worker_is_busy() {
-        let snapshot = snapshot("github-write");
-        let identity = identity(&snapshot);
-        let mut state = ProviderState::default();
-        let pending = state.begin_unlock(identity.clone()).unwrap();
-
-        assert!(matches!(
-            state.begin_discard(identity.revision),
-            Err(Error::Busy)
-        ));
-        assert!(matches!(
-            state.finish_unlock(pending, &identity, snapshot),
-            Err(Error::Superseded)
-        ));
-        assert!(state.snapshot().is_none());
-        assert!(state.begin_discard(identity.revision).is_ok());
-    }
-
-    #[test]
-    fn provider_lifecycle_account_replacement_invalidates_a_pending_unlock() {
-        let snapshot = snapshot("github-write");
-        let identity = identity(&snapshot);
-        let mut state = ProviderState::default();
-        let pending = state.begin_unlock(identity.clone()).unwrap();
-
-        assert!(matches!(
-            state.begin_login(None, time::OffsetDateTime::UNIX_EPOCH, identity.revision),
-            Err(Error::Busy)
-        ));
-        assert!(state.finish_unlock(pending, &identity, snapshot).is_err());
-        assert!(state.snapshot().is_none());
-    }
-
-    #[test]
-    fn provider_lifecycle_login_publishes_only_the_frozen_existing_binding() {
-        let (mut state, source) = unlocked();
-        let ticket = state
-            .begin_login(
-                Some(source.binding.clone()),
-                source.synchronized_at,
-                source.revision,
-            )
-            .unwrap();
-        let changed = snapshot_at(
-            "github-write",
-            "33333333-3333-4333-8333-333333333333",
-            [9; 16],
-            source.synchronized_at + std::time::Duration::from_secs(1),
-        );
-
-        assert!(matches!(
-            state.prepare_update(ticket, source.revision, changed),
-            Err(Error::Changed)
-        ));
-        assert!(state.snapshot().is_none());
     }
 }

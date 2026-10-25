@@ -23,6 +23,21 @@ credentials and network routes remain outside that boundary.
 It runs in the logged-in user's GUI session without a root service or public
 listener. Policy stays on the host, with no required Quartermaster cloud service.
 
+## Native settings
+
+The macOS app uses SwiftUI's Settings scene for Vaultwarden enrolment, the
+GitHub repository catalogue, unfamiliar-request approval and recognized-mutation
+rules. Edits remain a draft until a separate complete change review and an explicit
+Save Changes action with Touch ID. Enrolment edits invalidate verification and
+block review until reverified. Password entry is transient; vault snapshots, cache keys and selected
+API credentials remain in Rust.
+
+The backend persists approved settings, enrolment selection and approval-key
+continuity in one backend-only Keychain record. Cache slots contain encrypted
+provider snapshots. Runtime grants are separate, memory-only authority and are
+never restored from settings. See [settings authority](security-boundaries.md#settings-authority)
+for the commit and cancellation boundary.
+
 ## Components
 
 ```mermaid

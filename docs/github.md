@@ -17,12 +17,22 @@ dedicated development vault account.
    and [repository identity check](https://docs.github.com/en/rest/repos/repos#get-a-repository).
 2. Put the token in a vault Login item's **password** field. The development UI
    selects this field; custom-field selection is not available in it yet.
-3. Choose **Enrol dedicated vault…** from the `QM [DEBUG]` menu. Enter the server
-   URL, account email, Login item UUID and master password. The item UUID can be
-   omitted only when the vault contains exactly one entry, which must be a
-   supported personal Login.
-4. Complete enrolment and check **Vault status**. On later runs, use the existing
-   enrolment; **Sync vault** refreshes it after changes in the source vault.
+3. Open **Settings → GitHub** and enter the Login item UUID under **Token source**.
+   The UUID can be omitted only when the vault contains exactly one entry, which
+   must be a supported personal Login.
+4. Open **Vault**, enter the server URL, account email and master password, then
+   choose **Verify Vault…** and **Review Changes…**. Check the account,
+   item and proposed rules, then choose **Save Changes** and approve with Touch ID. Verification alone
+   does not replace the active enrolment.
+
+Editing the server, email or Login item after verification invalidates it. Verify
+the edited selection before reviewing changes; Discard Changes restores the
+approved selection.
+
+When no vault is selected, **Vault → Retained enrolments** lists caches on this
+Mac. Select the intended account and Login item, review, then save with Touch ID
+instead of signing in again. The approval unlocks and verifies that cache before
+selecting it. **Sync Vault** refreshes the selected cache from Vaultwarden.
 
 The development enrolment uses the role label `github-write`. It can hold the
 read-only token above; the label does not give that token write permissions.
@@ -43,29 +53,13 @@ Replace `owner/repository`. For a public repository, you can instead read `id`
 from `https://api.github.com/repos/OWNER/REPO` in a browser and assign that value
 to `QM_REPOSITORY_ID`.
 
-Starting the backend creates the data directory and isolated `gh` configuration.
-Save the repository configuration with private permissions:
+Open **Settings → GitHub**, enable GitHub mediation, and add the repository's
+`owner/repository` name and numeric ID. Choose **Review Changes…**, inspect the
+proposal, then **Save Changes** with Touch ID. Adding a repository does not create a read grant.
 
-```sh
-QM_GITHUB_CONFIG=$(mktemp "$QM_DATA/github.json.XXXXXX")
-cat > "$QM_GITHUB_CONFIG" <<EOF
-{
-  "version": 1,
-  "mode": "github",
-  "repositories": [{
-    "id": $QM_REPOSITORY_ID,
-    "owner": "${QM_REPOSITORY%%/*}",
-    "name": "${QM_REPOSITORY#*/}",
-    "writes": false
-  }]
-}
-EOF
-mv "$QM_GITHUB_CONFIG" "$QM_DATA/github.json"
-```
-
-The file must belong to your user and have mode `0600`, which `mktemp` supplies.
-Quartermaster verifies the repository's ID and name before reading issues.
-Changing configuration does not create a grant.
+Approved settings live in the backend's Data Protection Keychain group. The
+backend ignores the old `github.json`; editing or replaying it cannot change
+access. Runtime read grants remain in memory.
 
 ### Repository identity
 
@@ -117,14 +111,12 @@ in the development UI yet.
 
 Supported list parameters are `state` (`open`, `closed`, `all`), `per_page` (1–100),
 `page` (1–10000), and one bounded `before` or `after` cursor. At most three redirects
-within the configured repository are permitted. The legacy per-repository
-`writes` field has no effect. Automatic matching currently requires a supported
+within the configured repository are permitted. Automatic matching currently requires a supported
 JSON Accept header; `gh`'s wildcard default is unfamiliar input.
 
 ## Approve another API request once
 
-Set `"approveUnverifiedRequests": true` at the top level of `github.json` to
-enable the general approval path. Without it, requests lacking a complete
+In **Settings → GitHub**, enable **Allow unfamiliar requests**, then review and approve the change. Without it, requests lacking a complete
 configured issue-read match are rejected. Enabling it does not create a read
 grant or authorize a request by itself.
 
@@ -143,25 +135,3 @@ GH_CONFIG_DIR="$QM_GH_CONFIG" GH_TOKEN=quartermaster-local-only GH_PROMPT_DISABL
 ```
 
 This request uses fresh one-use approval even if an issue-read grant exists.
-
-## Try the approval UI without a GitHub action
-
-Without `github.json`, the backend uses simulation mode. To explicitly select it,
-save this configuration using the same private-file procedure above:
-
-```json
-{"version": 1, "mode": "simulation", "repositories": []}
-```
-
-With a dedicated vault enrolled, run:
-
-```sh
-GH_CONFIG_DIR="$HOME/Library/Application Support/Quartermaster/Development/gh" \
-GH_ENTERPRISE_TOKEN=quartermaster-dummy-local-only GH_PROMPT_DISABLED=1 \
-  gh api --hostname github.example.invalid --method PATCH \
-  repos/quartermaster/demo/issues/42 --raw-field state=closed
-```
-
-This opens the approval dialog and returns a synthetic response marked
-`quartermaster_local_simulation`. No request reaches GitHub. A failed real request
-does not switch to simulation.

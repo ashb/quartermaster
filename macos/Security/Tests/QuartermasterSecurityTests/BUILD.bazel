@@ -32,6 +32,8 @@ swift_test(
         "MonotonicTimestampTests.swift",
         "ReadGrantReviewTests.swift",
         "SecureEnclaveApprovalKeyStorageTests.swift",
+        "SettingsEditorTests.swift",
+        "SettingsWorkflowTests.swift",
         ":test_resource_accessor",  # keep
     ],
     copts = [

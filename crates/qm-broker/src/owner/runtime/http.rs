@@ -150,7 +150,7 @@ pub(super) fn handle_verified_http(
             .then_some(state.provider.generation())
     };
     let binding = if cold.is_some() {
-        crate::owner::vault::Source::capture(&paths.root).map(|source| source.binding())
+        paths.vault_source().map(|source| source.binding())
     } else {
         Ok(None)
     };

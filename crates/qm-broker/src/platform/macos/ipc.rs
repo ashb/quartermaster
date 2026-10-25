@@ -50,6 +50,12 @@ impl PeerHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ConnectionId(u64);
 
+impl ConnectionId {
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
+}
+
 pub(crate) struct Connection<'a> {
     peer: &'a Arc<PeerState>,
     generation: Option<Generation>,

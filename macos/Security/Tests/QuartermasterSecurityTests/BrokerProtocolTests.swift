@@ -80,6 +80,9 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
         case .alreadyAdmitted: kind = "alreadyAdmitted"
         case .unknownOperation: kind = "unknownOperation"
         case .readGrantsRevoked: kind = "readGrantsRevoked"
+        case .settingsStatus, .settingsReview, .settingsChallenge, .enrollmentStaged, .settingsApplied:
+            Issue.record("Unexpected settings reply in the operation fixture")
+            kind = "unexpectedSettings"
         case .error(let code):
             kind = "error"
             #expect(code.rawValue == (fixture["code"] as? String))

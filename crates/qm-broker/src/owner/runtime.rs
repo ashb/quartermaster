@@ -5,6 +5,7 @@ mod error;
 
 mod http;
 mod policy_source;
+mod settings;
 mod state;
 mod vault_workflow;
 
@@ -39,6 +40,7 @@ struct ServicePaths {
     app: PathBuf,
     root: PathBuf,
     policy: Arc<policy_source::PolicySource>,
+    settings: Option<Arc<crate::owner::settings::Store>>,
 }
 
 type PolicyInput =
@@ -46,8 +48,60 @@ type PolicyInput =
 
 impl ServicePaths {
     fn load_policy(&self) -> PolicyInput {
-        self.policy
-            .read(|| crate::owner::persistence::policy(&self.root))
+        self.policy.snapshot()
+    }
+
+    fn vault_root(&self) -> Result<PathBuf, crate::owner::vault::Error> {
+        Ok(self
+            .policy
+            .provider()
+            .map_err(|_| crate::owner::vault::Error::Storage)?
+            .map_or_else(|| self.root.clone(), |pin| pin.root(&self.root)))
+    }
+
+    fn vault_source(&self) -> Result<crate::owner::vault::Source, crate::owner::vault::Error> {
+        let pin = self
+            .policy
+            .provider()
+            .map_err(|_| crate::owner::vault::Error::Storage)?;
+        let root = pin
+            .as_ref()
+            .map_or_else(|| self.root.clone(), |pin| pin.root(&self.root));
+        let source = crate::owner::vault::Source::capture(&root)?;
+        if let Some(pin) = pin {
+            let identity = source.identity()?;
+            if identity.binding != pin.binding
+                || identity.scope != pin.scope
+                || identity.device_key != pin.device_key
+            {
+                return Err(qm_providers::ProviderError::AccountMismatch.into());
+            }
+        }
+        Ok(source)
+    }
+}
+
+#[cfg(test)]
+mod settings_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn a_user_writable_configuration_cannot_activate_or_restore_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ServicePaths {
+            app: "/unused.app".into(),
+            root: root.path().to_owned(),
+            policy: Arc::default(),
+            settings: None,
+        };
+        let file = root.path().join("github.json");
+        for unverified in [false, true, false] {
+            fs::write(&file, format!(r#"{{"version":1,"mode":"github","repositories":[{{"id":123,"owner":"example","name":"one"}}],"approveUnverifiedRequests":{unverified}}}"#)).unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(paths.load_policy().unwrap().current().unwrap().1.is_err());
+        }
+        fs::remove_file(file).unwrap();
+        assert!(paths.load_policy().unwrap().current().unwrap().1.is_err());
     }
 }
 
@@ -61,6 +115,7 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
         app: options.bundle_root,
         root: options.storage_root,
         policy: Arc::default(),
+        settings: crate::owner::settings::Store::native().ok().map(Arc::new),
     };
     let lock = OpenOptions::new()
         .create(true)
@@ -82,7 +137,17 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    let shared = Arc::new((Mutex::new(OwnerState::for_service()?), Condvar::new()));
+    let mut state = OwnerState::for_service()?;
+    match paths.settings.as_ref().map(|store| store.load()) {
+        Some(Ok(Some(manager))) => {
+            state.approval_public_key = Some(manager.record().public_key().to_vec());
+            paths.policy.install(&manager)?;
+            state.administration.manager = Some(manager);
+        }
+        Some(Ok(None)) => {}
+        Some(Err(_)) | None => state.administration.unavailable = true,
+    }
+    let shared = Arc::new((Mutex::new(state), Condvar::new()));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(8)
@@ -97,6 +162,19 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
         tokio::net::UnixListener::from_std(listener)?
     };
     let ingress_shared = Arc::clone(&shared);
+    let expiration_shared = Arc::clone(&shared);
+    let expiration = runtime.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if let (Ok(now), Ok(mut state)) = (
+                qm_macos::presence_clock::monotonic_raw(),
+                expiration_shared.0.lock(),
+            ) {
+                state.administration.expire(now);
+            }
+        }
+    });
     let stop = event_loop.stop_handle();
     let (finished, completion) = mpsc::sync_channel(1);
     let ingress = runtime.spawn(async move {
@@ -119,6 +197,7 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
     shared.1.notify_all();
     drop(native);
     ingress.abort();
+    expiration.abort();
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     fs::remove_file(socket)?;
     result.and_then(|()| {
@@ -539,7 +618,10 @@ mod github_tests {
         let paths = ServicePaths {
             app: root.path().join("nonexistent.app"),
             root: root.path().to_owned(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let (server, client) = UnixStream::pair().unwrap();
         let peer = PeerIdentity::capture(&server).unwrap();
@@ -557,9 +639,9 @@ mod github_tests {
         list["id"] = "22222222222222222222222222222222".into();
         list["action"] = "listIssues".into();
         policy["grants"].as_array_mut().unwrap().push(list);
-        let path = paths.root.join("github.json");
-        fs::write(&path, br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one","writes":true}]}"#).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        paths.policy.set_fixture(crate::owner::policy::Policy::default().with_github(
+            crate::owner::github::configuration::GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one","writes":true}]}"#).unwrap()
+        ));
         let mut state = OwnerState::new().unwrap();
         state.refresh_policy(&paths.load_policy()).unwrap();
         state
@@ -1061,7 +1143,10 @@ mod tests {
         let paths = ServicePaths {
             app: "/unused.app".into(),
             root: directory.path().canonicalize().unwrap(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let random = SystemRandom::new();
         let document =
@@ -1388,7 +1473,10 @@ mod tests {
         let paths = ServicePaths {
             app: "/unused.app".into(),
             root: directory.path().canonicalize().unwrap(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let shared = Arc::new((Mutex::new(OwnerState::new().unwrap()), Condvar::new()));
 
@@ -1603,7 +1691,10 @@ mod tests {
         let paths = ServicePaths {
             app: "/must-not-be-launched.app".into(),
             root: root.path().to_path_buf(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let mut state = OwnerState::new().unwrap();
         let expires = (OffsetDateTime::now_utc() + Duration::from_secs(60)).unix_timestamp() as u64;
@@ -1681,7 +1772,10 @@ mod tests {
         let paths = ServicePaths {
             root: root.path().to_owned(),
             app: "/unused.app".into(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let mut state = OwnerState::new().unwrap();
         let principal =
@@ -1872,7 +1966,10 @@ mod tests {
         let paths = ServicePaths {
             app: root.path().join("nonexistent.app"),
             root: root.path().to_path_buf(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let (mut server, mut client) = UnixStream::pair().unwrap();
         let peer = qm_macos::peer_identity::PeerIdentity::capture(&server).unwrap();
@@ -1916,7 +2013,10 @@ mod tests {
         let paths = ServicePaths {
             app: root.path().join("nonexistent.app"),
             root: root.path().to_path_buf(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let socket = root.path().join("ingress.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1974,7 +2074,10 @@ mod tests {
         let paths = ServicePaths {
             app: "/unused.app".into(),
             root: directory.path().canonicalize().unwrap(),
-            policy: Arc::default(),
+            settings: None,
+            policy: Arc::new(policy_source::PolicySource::fixture(
+                crate::owner::policy::Policy::default(),
+            )),
         };
         let mut state = OwnerState::new().unwrap();
         let principal =

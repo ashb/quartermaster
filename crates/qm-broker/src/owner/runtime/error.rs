@@ -1,6 +1,6 @@
 use crate::owner::{
     dispatch, operation::OperationError, policy::AuthorizationError, protocol::ControlError,
-    provider_lifecycle, vault,
+    provider_lifecycle, settings::Error as SettingsError, vault,
 };
 use std::{fmt, io};
 
@@ -33,7 +33,6 @@ pub(in crate::owner) enum Fault {
     IngressUnavailable,
     UiDisconnected,
     UiNotEnrolled,
-    UiAlreadyEnrolled,
     ApprovalKeyChanged,
     PendingMissing,
     ReviewNotPresented,
@@ -124,6 +123,16 @@ impl From<base64::DecodeError> for Error {
         Self::Protocol(ControlError::InvalidMessage)
     }
 }
+impl From<crate::owner::settings::Error> for Error {
+    fn from(error: crate::owner::settings::Error) -> Self {
+        Self::Protocol(match error {
+            SettingsError::Busy => ControlError::Busy,
+            SettingsError::Expired => ControlError::Expired,
+            SettingsError::Storage => ControlError::Unavailable,
+            SettingsError::Invalid | SettingsError::Stale => ControlError::Denied,
+        })
+    }
+}
 impl From<serde_json::Error> for Error {
     fn from(_: serde_json::Error) -> Self {
         Self::Protocol(ControlError::InvalidMessage)
@@ -155,7 +164,6 @@ impl From<Error> for ControlError {
             Error::State(
                 Fault::UiDisconnected
                 | Fault::UiNotEnrolled
-                | Fault::UiAlreadyEnrolled
                 | Fault::PendingMissing
                 | Fault::ReviewNotPresented
                 | Fault::NativeContextRequired

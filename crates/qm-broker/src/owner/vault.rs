@@ -161,13 +161,6 @@ impl Source {
         };
         Ok(key.with_bytes(|key| sealed.open(key, self.minimum_sync()))?)
     }
-
-    pub(super) fn delete_device(&self) -> Result<(), Error> {
-        if let Some(manifest) = &self.manifest {
-            DeviceCacheKey::discard_for_reenrollment(CacheKeyScope::new(manifest.scope())?)?;
-        }
-        Ok(())
-    }
 }
 
 pub fn status(root: &Path, snapshot: Option<&VaultSnapshot>) -> CacheStatus {
@@ -248,21 +241,6 @@ pub fn error_reply(error: Error) -> CacheStatus {
 
 pub(super) struct SealIntent {
     manifest: VaultEnrollment,
-}
-
-#[cfg(test)]
-pub(super) fn begin_persistence(
-    root: &Path,
-    provider: &ProviderState,
-    operation: &mut ProviderOperation,
-    snapshot: &VaultSnapshot,
-) -> Result<SealIntent, Error> {
-    let cache = store(root)?.transaction()?;
-    let source = Source::capture_store(&cache)?;
-    provider.check(operation, source.revision)?;
-    let intent = persistence_intent(&cache, source, snapshot)?;
-    provider.revise_source(operation, Source::capture_store(&cache)?.revision)?;
-    Ok(intent)
 }
 
 pub(super) fn persistence_intent<B: BackupExclusion>(
@@ -404,6 +382,46 @@ pub(super) fn publication(
     Publication::new(store(root)?, prepared)
 }
 
+pub(super) struct StagedCache {
+    pub(super) slot: String,
+    pub(super) identity: CacheIdentity,
+    pub(super) snapshot: VaultSnapshot,
+}
+
+pub(super) fn stage_inactive(base: &Path, snapshot: VaultSnapshot) -> Result<StagedCache, Error> {
+    let mut random = [0; 16];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| Error::Storage)?;
+    let slot: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let root = base.join("enrollments").join(&slot);
+    let cache = store(&root)?.transaction()?;
+    let source = Source::capture_store(&cache)?;
+    if source.manifest.is_some() || source.cache.is_some() {
+        return Err(Error::Storage);
+    }
+    let intent = persistence_intent(&cache, source, &snapshot)?;
+    drop(cache);
+    let mut prepared = intent.seal(snapshot)?;
+    let scope = prepared.manifest.scope().to_owned();
+    let device_key = prepared.manifest.identity().ok_or(Error::Incomplete)?;
+    let snapshot = prepared.snapshot.take().ok_or(Error::Storage)?;
+    let identity = Publication::new(store(&root)?, prepared)?.publish()?;
+    if identity.binding != *snapshot.binding()
+        || identity.scope != scope
+        || identity.device_key != device_key
+        || identity.checkpoint != snapshot.checkpoint()
+        || identity.synchronized_at != snapshot.synchronized_at()
+    {
+        return Err(ProviderError::AccountMismatch.into());
+    }
+    Ok(StagedCache {
+        slot,
+        identity,
+        snapshot,
+    })
+}
+
 #[cfg(test)]
 pub(super) fn publish_update(
     root: &Path,
@@ -432,23 +450,6 @@ pub(super) fn finish_unlock(
         }
     };
     Ok(provider.finish_unlock(operation, &identity, snapshot)?)
-}
-
-#[cfg(test)]
-pub(super) fn finish_discard(
-    root: &Path,
-    provider: &mut ProviderState,
-    operation: ProviderOperation,
-) -> Result<(), Error> {
-    let result = (|| {
-        provider.check_discard(&operation, Source::capture(root)?.revision)?;
-        let cache = store(root)?;
-        cache.discard()?;
-        cache.discard_enrollment()?;
-        Ok(())
-    })();
-    provider.release(&operation);
-    result
 }
 
 #[cfg(test)]
@@ -511,41 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn unentitled_reset_cannot_delete_an_enrollment_or_its_cache() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let store = store(&root).unwrap();
-        let manifest =
-            VaultEnrollment::begin(binding(), "0123456789abcdef0123456789abcdef".into()).unwrap();
-        store.save_enrollment(&manifest.encode().unwrap()).unwrap();
-        store.save(b"preserve dummy encrypted cache").unwrap();
-
-        assert!(matches!(
-            discard(&root),
-            Err(Error::Key(CacheKeyError::InvalidEntitlements))
-        ));
-
-        assert!(store.load_enrollment().unwrap().is_some());
-        assert_eq!(
-            store.load().unwrap().unwrap(),
-            b"preserve dummy encrypted cache"
-        );
-    }
-
-    #[test]
-    fn explicit_discard_removes_unenrolled_cache_data_without_key_queries() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let store = store(&root).unwrap();
-        store.save(b"discard dummy encrypted cache").unwrap();
-
-        discard(&root).unwrap();
-
-        assert_eq!(store.load().unwrap(), None);
-        assert_eq!(status(&root, None).state, VaultState::Unenrolled);
-    }
-
-    #[test]
     fn persist_rejects_a_backward_sync_before_key_access_or_cache_replacement() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -568,23 +534,11 @@ mod tests {
         let before_cache = cache.load().unwrap();
 
         let source = Source::capture(&root).unwrap();
-        let mut provider = ProviderState::default();
-        let mut operation = provider
-            .begin_login(source.binding(), source.minimum_sync(), source.revision)
-            .unwrap();
-        let result = begin_persistence(&root, &provider, &mut operation, &snapshot);
+        let result = persistence_intent(&cache, source, &snapshot);
 
         assert!(matches!(result, Err(Error::Cache(CacheError::Stale))));
         assert_eq!(cache.load_enrollment().unwrap(), before_enrollment);
         assert_eq!(cache.load().unwrap(), before_cache);
-    }
-
-    fn discard(root: &Path) -> Result<(), Error> {
-        let source = Source::capture(root)?;
-        let mut provider = ProviderState::default();
-        let operation = provider.begin_discard(source.revision)?;
-        source.delete_device()?;
-        finish_discard(root, &mut provider, operation)
     }
 
     #[test]
@@ -611,8 +565,8 @@ mod tests {
     }
 
     #[test]
-    fn late_refresh_after_lock_discard_or_replacement_cannot_publish_any_files() {
-        for event in 0..3 {
+    fn late_refresh_after_lock_cannot_publish_any_files() {
+        {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
             let snapshot = crate::owner::test_support::vault::snapshot("github-write");
@@ -631,18 +585,7 @@ mod tests {
             let prepared = fixture::prepared(&root, refreshed);
             let cache = store(&root).unwrap();
             let before = (cache.load().unwrap(), cache.load_enrollment().unwrap());
-            match event {
-                0 => provider.lock().unwrap(),
-                1 => assert!(matches!(
-                    provider.begin_discard(source.revision),
-                    Err(provider_lifecycle::Error::Busy)
-                )),
-                2 => assert!(matches!(
-                    provider.begin_login(source.binding(), source.minimum_sync(), source.revision),
-                    Err(provider_lifecycle::Error::Busy)
-                )),
-                _ => unreachable!(),
-            }
+            provider.lock().unwrap();
 
             assert!(matches!(
                 publish_update(&root, &mut provider, refresh, prepared),

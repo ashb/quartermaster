@@ -53,12 +53,23 @@ pub(super) fn handle(
         | Client::VaultUnlock {}
         | Client::VaultSync {}
         | Client::VaultDiscard {} => Err(Error::State(Fault::UnsupportedVaultCommand)),
+        Client::SettingsRegister { .. }
+        | Client::SettingsStatus {}
+        | Client::StageEnrollment { .. }
+        | Client::PrepareSettings { .. }
+        | Client::SettingsPresence { .. }
+        | Client::SettingsProof { .. }
+        | Client::SettingsCancel { .. } => Err(Error::Protocol(ControlError::Denied)),
         Client::Hello {} => Ok(Reply::Hello { profile: PROFILE }),
         Client::Enroll { public_key } => {
-            if state.ui.is_some() {
-                return Err(Error::State(Fault::UiAlreadyEnrolled));
-            }
             let key = BASE64.decode(public_key).map_err(Error::from)?;
+            if state.ui.is_some() {
+                return if state.approval_public_key.as_deref() == Some(key.as_slice()) {
+                    Ok(Reply::Enrolled)
+                } else {
+                    Err(Fault::ApprovalKeyChanged.into())
+                };
+            }
             let id = random()?;
             let session = ApprovalSession::new(id, state.authorizer.policy_digest()?, &key)?;
             if state
@@ -176,7 +187,7 @@ pub(super) fn listen(
     .map_err(Error::from)
 }
 
-fn handle_event(
+pub(super) fn handle_event(
     event: Event<'_>,
     shared: &Shared,
     paths: &ServicePaths,
@@ -206,6 +217,7 @@ fn handle_event(
             .0
             .lock()
             .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.administration.disconnect(id);
         if state
             .ui
             .as_ref()
@@ -217,15 +229,25 @@ fn handle_event(
         return Ok(Vec::new().into());
     };
     let request = decode_client(payload).map_err(Error::from);
-    if context.is_none()
-        && matches!(
-            &request,
-            Ok(Client::VaultLogin { .. }
-                | Client::VaultUnlock {}
-                | Client::VaultSync {}
-                | Client::VaultDiscard {})
-        )
-    {
+    if request.as_ref().is_ok_and(Client::is_settings) {
+        return super::settings::message(
+            request?,
+            context.as_ref(),
+            &connection,
+            shared,
+            paths,
+            runtime,
+            work_limit,
+        );
+    }
+    if matches!(
+        &request,
+        Ok(Client::VaultLogin { .. } | Client::VaultDiscard {})
+    ) {
+        connection.release_context();
+        return encode_result(Err(Error::Protocol(ControlError::Denied))).map(Into::into);
+    }
+    if context.is_none() && matches!(&request, Ok(Client::VaultUnlock {} | Client::VaultSync {})) {
         let request = request?;
         let generation = {
             let mut state = shared
@@ -233,10 +255,11 @@ fn handle_event(
                 .lock()
                 .map_err(|_| Error::State(Fault::StateUnavailable))?;
             state.ensure_host_session()?;
-            if state
+            if (state
                 .ui
                 .as_ref()
                 .is_none_or(|ui| ui.connection != Some(connection.id()))
+                && !state.administration.manages_cache(&connection.handle()))
                 || !connection.is_connected()
             {
                 return encode_result(Err(Error::State(Fault::UiNotEnrolled))).map(Into::into);
@@ -293,8 +316,14 @@ fn handle_event(
         runtime.spawn_blocking(move || {
             let _permit = permit;
             let _ = send.send(
-                encode_result(cache_status(&paths.root, &shared).map(Reply::VaultStatus))
-                    .unwrap_or_else(|_| br#"{"kind":"error","code":"unavailable"}"#.to_vec()),
+                encode_result(
+                    paths
+                        .vault_root()
+                        .map_err(Error::from)
+                        .and_then(|root| cache_status(&root, &shared))
+                        .map(Reply::VaultStatus),
+                )
+                .unwrap_or_else(|_| br#"{"kind":"error","code":"unavailable"}"#.to_vec()),
             );
         });
         return Ok(ipc::Response::Deferred(receive));
@@ -358,7 +387,7 @@ fn handle_event(
     encode_result(result).map(Into::into)
 }
 
-fn encode_result(result: Result<Reply>) -> Result<Vec<u8>> {
+pub(super) fn encode_result(result: Result<Reply>) -> Result<Vec<u8>> {
     let reply = result.unwrap_or_else(|error| Reply::Error {
         code: ControlError::from(error),
     });
@@ -444,6 +473,61 @@ mod tests {
         sync::{Condvar, Mutex, mpsc},
         thread,
     };
+
+    #[test]
+    fn legacy_vault_login_cannot_bypass_settings_approval_over_native_ipc() {
+        let (_directory, paths, _key, state, _receive) = fixture();
+        let shared = Arc::new((Mutex::new(state), Condvar::new()));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let work_limit = Arc::new(tokio::sync::Semaphore::new(8));
+        let native = Fixture::new(move |event| {
+            if let Event::Message { connection, .. } = &event
+                && let Some(ui) = shared.0.lock().unwrap().ui.as_mut()
+            {
+                ui.connection = Some(connection.id());
+            }
+            handle_event(event, &shared, &paths, &handle, &work_limit)
+                .or_else(|error| encode_result(Err(error)).map(Into::into))
+                .map_err(io::Error::other)
+        });
+        let client = native.client();
+        let reply = send(&client, br#"{"kind":"vaultLogin","server":"https://vault.example.invalid","email":"dummy@example.invalid","password":""}"#, None);
+        let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(reply["kind"], "error");
+        assert_eq!(reply["code"], "denied");
+        client.invalidate();
+    }
+
+    #[test]
+    fn settings_inspection_survives_invalid_operation_policy_without_activating_it() {
+        let (_directory, paths, _key, mut state, _receive) = fixture();
+        paths.policy.suspend().unwrap();
+        state.authorizer.invalidate_policy().unwrap();
+        let shared = Arc::new((Mutex::new(state), Condvar::new()));
+        let owner = Arc::clone(&shared);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let work_limit = Arc::new(tokio::sync::Semaphore::new(8));
+        let native = Fixture::new(move |event| {
+            handle_event(event, &owner, &paths, &handle, &work_limit)
+                .or_else(|error| encode_result(Err(error)).map(Into::into))
+                .map_err(io::Error::other)
+        });
+        let client = native.client();
+        let reply: serde_json::Value =
+            serde_json::from_slice(&send(&client, br#"{"kind":"settingsStatus"}"#, None)).unwrap();
+        assert_eq!(reply["kind"], "settingsStatus");
+        assert_eq!(reply["settings"]["revision"], 0);
+        assert!(shared.0.lock().unwrap().authorizer.policy_digest().is_err());
+        client.invalidate();
+    }
 
     #[test]
     fn a_stalled_policy_read_cannot_block_cancel_or_lock_on_the_same_native_connection() {

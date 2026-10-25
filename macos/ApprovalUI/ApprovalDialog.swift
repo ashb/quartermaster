@@ -321,7 +321,14 @@ struct ApprovalDialogView: View {
 }
 
 @MainActor
-public final class ApprovalDialog: NSObject, NSWindowDelegate {
+public protocol ApprovalWindow: AnyObject {
+    var window: NSWindow { get }
+    var onClose: (() -> Void)? { get set }
+    func cancel()
+}
+
+@MainActor
+public final class ApprovalDialog: NSObject, NSWindowDelegate, ApprovalWindow {
     public let controller: ApprovalController
     public let window: NSWindow
     public var onClose: (() -> Void)?

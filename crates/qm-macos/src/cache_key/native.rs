@@ -286,7 +286,7 @@ fn public_identity(key: &SecKey) -> Result<(SecKey, [u8; 32]), CacheKeyError> {
     Ok((public, identity))
 }
 
-fn own_access_group() -> Result<String, CacheKeyError> {
+pub(crate) fn own_access_group() -> Result<String, CacheKeyError> {
     let code = SecCode::for_self(Flags::NONE).map_err(|_| CacheKeyError::InvalidEntitlements)?;
     let mut information = std::ptr::null();
     let status = unsafe { SecCodeCopySigningInformation(code.as_CFTypeRef(), 2, &mut information) };

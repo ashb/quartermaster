@@ -70,6 +70,11 @@ impl Default for Policy {
 }
 
 impl Policy {
+    pub(super) fn with_mutation_rule(mut self, decision: PolicyDecision) -> Self {
+        self.writes = decision;
+        self
+    }
+
     pub(super) fn with_github(mut self, config: GitHubConfig) -> Self {
         self.github = Some(config);
         self

@@ -116,7 +116,7 @@ pub(super) fn request_approval(
         .map_err(|_| Error::State(Fault::StateUnavailable))?
         .provider
         .generation();
-    let source = crate::owner::vault::Source::capture(&paths.root)?;
+    let source = paths.vault_source()?;
     let identity = source.identity()?;
     let (operation, authorization, frozen) = {
         let state = shared
@@ -165,7 +165,7 @@ pub(super) fn request_approval(
         .wait_timeout_while(state, Duration::from_secs(15), |s| s.ui.is_none())
         .map_err(|_| Error::State(Fault::StateUnavailable))?;
     drop(state);
-    let current = crate::owner::vault::Source::capture(&paths.root)?;
+    let current = paths.vault_source()?;
     let policy = paths.load_policy();
     let mut state = shared
         .0
@@ -324,8 +324,7 @@ pub(super) fn native_presence(
         .checked_add(Duration::from_secs(30))
         .ok_or_else(|| Error::State(Fault::InvalidClock))?;
     let lease = connection.context_lease(deadline)?;
-    let current =
-        crate::owner::vault::Source::capture(&paths.root).and_then(|source| source.identity());
+    let current = paths.vault_source().and_then(|source| source.identity());
     let policy = paths.load_policy();
     let work = {
         let mut state = shared
@@ -354,8 +353,7 @@ pub(super) fn native_presence(
             }
             source.unlock_authenticated(context).map_err(Error::from)
         });
-        let identity =
-            crate::owner::vault::Source::capture(&paths.root).and_then(|source| source.identity());
+        let identity = paths.vault_source().and_then(|source| source.identity());
         let mut state = shared
             .0
             .lock()
@@ -371,8 +369,7 @@ pub(super) fn native_presence(
             }
         }
     }
-    let current =
-        crate::owner::vault::Source::capture(&paths.root).and_then(|source| source.identity());
+    let current = paths.vault_source().and_then(|source| source.identity());
     let policy = paths.load_policy();
     let mut state = shared
         .0
