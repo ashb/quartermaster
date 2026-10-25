@@ -69,6 +69,7 @@ pub(crate) fn inspect(
         analysis.unknown(Location::Body, UncoveredReason::ApplicationData);
     }
     let mut seen = BTreeSet::new();
+    let mut cursor = false;
     if !query.is_empty() {
         for (index, parameter) in query.split('&').enumerate() {
             let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
@@ -80,6 +81,9 @@ pub(crate) fn inspect(
                     "state" => matches!(value, "open" | "closed" | "all"),
                     "page" => positive_integer(value).is_some(),
                     "per_page" => positive_integer(value).is_some_and(|n| n <= 100),
+                    "before" | "after" => {
+                        !std::mem::replace(&mut cursor, true) && valid_cursor(parameter)
+                    }
                     _ => false,
                 };
             if !known {
@@ -140,4 +144,50 @@ fn positive_integer(value: &str) -> Option<u64> {
         return None;
     }
     value.parse().ok().filter(|value| *value > 0)
+}
+
+fn valid_cursor(parameter: &str) -> bool {
+    let Some((_, value)) = form_urlencoded::parse(parameter.as_bytes()).next() else {
+        return false;
+    };
+    let unpadded = value.trim_end_matches('=');
+    !unpadded.is_empty()
+        && value.len() <= 512
+        && value.len() - unpadded.len() <= 2
+        && unpadded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"+/-_".contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{PatternSet, analyze, test_support::request};
+
+    #[test]
+    fn issue_pagination_recognizes_one_bounded_cursor_without_changing_its_bytes() {
+        for cursor in ["after=abc%2Bdef%2Fghi%3D%3D", "before=opaque_cursor-123"] {
+            let target = format!("/repos/a/b/issues?{cursor}&per_page=10");
+            let request = request("GET", &target, "", "");
+            assert!(
+                analyze(&request, &PatternSet::default())
+                    .unwrap()
+                    .complete()
+            );
+            assert_eq!(request.path_and_query(), target);
+        }
+        for cursor in [
+            "after=",
+            "after=abc&before=def",
+            "after=abc&after=def",
+            "after=abc+def",
+            "after=%26page%3D2",
+        ] {
+            let request = request("GET", &format!("/repos/a/b/issues?{cursor}"), "", "");
+            assert!(
+                !analyze(&request, &PatternSet::default())
+                    .unwrap()
+                    .complete()
+            );
+        }
+    }
 }

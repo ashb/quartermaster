@@ -56,6 +56,8 @@ with an assertion that a request was already checked.
 
 The UI must faithfully present the immutable request it signs. It independently
 checks the request digest, challenge binding and supported presentation format.
+Keep the process tree, exact permitted command and labelled repository visible
+without expanding Details. Distinguish verified scope from advisory context.
 For GitHub, the proposed contract below permits either a verified explanation or
 complete request inspection with its effects explicitly unverified. If the UI
 cannot present the complete request within its supported bounds, it must refuse
@@ -88,10 +90,16 @@ cancellation or connection loss; never reuse it for another write.
 
 ## GitHub requests: matching and approval (proposed)
 
-This is proposed product behaviour, not an implemented or qualified capability.
-It replaces rejection based solely on an unfamiliar GitHub API shape with fresh
-approval for that request. GitHub can add APIs without requiring Quartermaster
-to understand their effects before a user can authorize their use.
+The development broker implements the request-preserving, one-use approval path
+below when the host enables unverified requests. Live-provider and hardware
+acceptance remain. Repository grants follow the requested name; Quartermaster
+never rewrites a named URL into a numeric-ID URL. The
+[repository contract](github.md#repository-identity) describes metadata checks
+and name reuse between verification and dispatch. This contract replaces
+rejection based solely on an unfamiliar
+GitHub API shape with fresh approval for that request. GitHub can add APIs
+without requiring Quartermaster to understand their effects before a user can
+authorize their use.
 
 ### When a request needs a fingerprint
 
@@ -259,24 +267,24 @@ later revert.
 The credential owner can authorize an eligible operation from a validated
 `Allow` decision without user approval. It may issue a reusable grant scoped to
 the verified principal, session, actions, resources, credential role, policy
-generation, absolute expiry and budget. Each operation must satisfy those limits;
+generation and absolute expiry. Each operation must satisfy those limits;
 reconnect and activity never extend them. Mandatory approval requirements still
 apply. Policy authorization and verified user approval are distinct sources of
 authority, and both require current authorization at final dispatch admission.
 
 Reusable read grants live only in the Rust owner's memory. Establishing a grant
 requires a fresh, signed approval of its verified caller, repository, credential
-binding, scope, absolute expiry and budget. A one-use issuance challenge belongs
-to the current backend and approval session; consuming it cannot replenish an
+binding, scope and absolute expiry. A one-use issuance challenge belongs
+to the current backend and approval session; consuming it cannot extend an
 existing grant. Proof acceptance retains pending evidence. Final admission of the
-initiating read installs the grant and debits its first use atomically; cancellation
+initiating read installs the grant atomically; cancellation
 or UI loss before admission prevents issuance. After admission, eligible reads
 survive UI exit. The grant covers all instances of the verified executable running
-as that OS user, sharing its budget; the dialog must state this scope.
+as that OS user.
 Backend restart requires fresh authorization on next use, without prompting merely
 because the application launched. Configuration changes may revoke grants but
-cannot create them. Expiry and exhaustion require fresh approval, without silently
-renewing authority. This avoids persistent revocation and budget rollback state.
+cannot create them. Expiry requires fresh approval, without silently renewing
+authority. This avoids persistent revocation and grant rollback state.
 
 A mediated-read rule selects its credential role on the host. It may select a
 credential with broader upstream permissions because the broker still enforces
@@ -284,11 +292,11 @@ the exact read operation. The role does not attest upstream read-only permission
 and never grants direct credential delivery or waives mutation approval.
 
 Keep each operation record through final admission. Accepting a proof does not
-end cancellation. Cancellation and admission serialize on that record, together
-with any shared grant-budget debit. A cancellation that wins prevents handoff;
+end cancellation. Cancellation and admission serialize on that record.
+A cancellation that wins prevents handoff;
 after admission the result is `AlreadyAdmitted`. Unknown IDs and the wrong
 principal cannot receive a successful cancellation acknowledgement. An uncertain
-handoff consumes its budget and authority without an automatic retry.
+handoff consumes its single-use authority without an automatic retry.
 
 An authenticated UI connection can cancel only interactive operations bound to
 its enrolment session. Losing that connection cancels those operations without
@@ -333,7 +341,7 @@ authority after restart.
 Read-grant and network deadlines count time asleep using a continuous monotonic
 clock, so sleep combined with wall-clock rollback cannot extend authority.
 Unchanged policy reloads may shorten active deadlines to the remaining absolute
-UTC expiry, but never extend them or replenish their budgets.
+UTC expiry, but never extend them.
 No failure may fall back to broader credentials, simulated presence or an
 unenforced route. An uncertain dispatch cannot retry with a consumed grant;
 revocation cannot retract an operation already sent.

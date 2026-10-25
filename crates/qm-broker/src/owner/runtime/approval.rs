@@ -65,6 +65,12 @@ pub(super) struct ReviewContext {
     pub(super) process_chain: Vec<String>,
 }
 
+impl crate::owner::review::CredentialContext for ReviewContext {
+    fn credential_role(&self) -> &str {
+        &self.provider.role
+    }
+}
+
 impl ApprovalDelivery {
     pub(super) fn created(&self) -> MonotonicTimestamp {
         self.request.context().created

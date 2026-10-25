@@ -16,7 +16,7 @@ use std::{
     sync::{Arc, Weak, mpsc},
 };
 
-const MESSAGE_LIMIT: usize = 16_384;
+const MESSAGE_LIMIT: usize = crate::wire_limits::IPC_PAYLOAD_BYTES;
 const REJECTED: &[u8] = br#"{"kind":"error","code":"unavailable"}"#;
 type Handler = dyn for<'a> Fn(Event<'a>) -> io::Result<Response> + Send + Sync;
 

@@ -1,8 +1,12 @@
-use super::github::configuration::{GitHubConfig, Mode};
+use super::github::{
+    configuration::{GitHubConfig, Mode},
+    request::Application,
+};
 use serde::{Serialize, Serializer};
 use std::{
     io::{self, Read},
     num::NonZeroU64,
+    sync::Arc,
 };
 
 pub const SIMULATION_HOST: &str = "github.example.invalid";
@@ -12,6 +16,7 @@ pub(super) enum Action {
     ListIssues,
     ReadIssue,
     CloseIssue,
+    Api,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +25,7 @@ pub(super) struct FrozenOperation {
     path: String,
     repository: String,
     destination: Destination,
+    application: Option<Arc<Application>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,13 +33,14 @@ enum Operation {
     ListIssues,
     ReadIssue(NonZeroU64),
     CloseIssue(NonZeroU64),
+    Api,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Destination {
     Simulation,
     Github {
-        repository_id: NonZeroU64,
+        repository_id: Option<NonZeroU64>,
         configuration_digest: [u8; 32],
         resolved_path: String,
     },
@@ -46,7 +53,8 @@ impl Serialize for FrozenOperation {
         struct Wire<'a> {
             method: &'a str,
             path: &'a str,
-            body: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            body: Option<&'a str>,
             repository: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             issue: Option<NonZeroU64>,
@@ -57,6 +65,8 @@ impl Serialize for FrozenOperation {
             configuration_digest: Option<[u8; 32]>,
             #[serde(skip_serializing_if = "Option::is_none")]
             resolved_path: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            application: Option<&'a Application>,
         }
         let (origin, repository_id, configuration_digest, resolved_path) = match &self.destination {
             Destination::Simulation => ("https://github.example.invalid", None, None, None),
@@ -66,7 +76,7 @@ impl Serialize for FrozenOperation {
                 resolved_path,
             } => (
                 "https://api.github.com",
-                Some(*repository_id),
+                *repository_id,
                 Some(*configuration_digest),
                 Some(resolved_path.as_str()),
             ),
@@ -74,13 +84,18 @@ impl Serialize for FrozenOperation {
         Wire {
             method: self.method(),
             path: &self.path,
-            body: self.body(),
+            body: if self.application.is_none() || self.body().is_empty() {
+                std::str::from_utf8(self.body()).ok()
+            } else {
+                None
+            },
             repository: &self.repository,
             issue: self.issue_number(),
             origin,
             repository_id,
             configuration_digest,
             resolved_path,
+            application: self.application.as_deref(),
         }
         .serialize(serializer)
     }
@@ -98,9 +113,13 @@ impl FrozenOperation {
     }
 
     pub(super) fn method(&self) -> &str {
+        if let Some(application) = &self.application {
+            return application.capture().method();
+        }
         match self.operation {
             Operation::ListIssues | Operation::ReadIssue(_) => "GET",
             Operation::CloseIssue(_) => "PATCH",
+            Operation::Api => unreachable!("API operation has a captured application"),
         }
     }
     pub(super) fn path(&self) -> &str {
@@ -112,10 +131,14 @@ impl FrozenOperation {
             Destination::Github { resolved_path, .. } => resolved_path,
         }
     }
-    pub(super) fn body(&self) -> &str {
+    pub(super) fn body(&self) -> &[u8] {
+        if let Some(application) = &self.application {
+            return application.capture().body();
+        }
         match self.operation {
-            Operation::ListIssues | Operation::ReadIssue(_) => "",
-            Operation::CloseIssue(_) => "{\"state\":\"closed\"}",
+            Operation::ListIssues | Operation::ReadIssue(_) => b"",
+            Operation::CloseIssue(_) => b"{\"state\":\"closed\"}",
+            Operation::Api => unreachable!("API operation has a captured application"),
         }
     }
     pub(super) fn action(&self) -> Action {
@@ -123,6 +146,7 @@ impl FrozenOperation {
             Operation::ListIssues => Action::ListIssues,
             Operation::ReadIssue(_) => Action::ReadIssue,
             Operation::CloseIssue(_) => Action::CloseIssue,
+            Operation::Api => Action::Api,
         }
     }
 
@@ -133,6 +157,22 @@ impl FrozenOperation {
     pub(super) fn issue_number(&self) -> Option<NonZeroU64> {
         match self.operation {
             Operation::ListIssues => None,
+            Operation::Api => {
+                let mut numbers =
+                    self.application()?
+                        .analysis()
+                        .resources
+                        .iter()
+                        .filter_map(|resource| {
+                            if let qm_api_github::Resource::IssueNumber(number) = resource {
+                                Some(*number)
+                            } else {
+                                None
+                            }
+                        });
+                let number = numbers.next()?;
+                numbers.next().is_none().then_some(number)
+            }
             Operation::ReadIssue(issue) | Operation::CloseIssue(issue) => Some(issue),
         }
     }
@@ -163,15 +203,29 @@ impl FrozenOperation {
                 repository_id,
                 configuration_digest,
                 ..
-            } => Some((repository_id, configuration_digest)),
+            } => repository_id.map(|id| (id, configuration_digest)),
         }
     }
 
     pub(super) fn role(&self) -> &str {
         match self.action() {
             Action::ListIssues | Action::ReadIssue => "github-read",
-            Action::CloseIssue => "github-write",
+            Action::CloseIssue | Action::Api => "github-write",
         }
+    }
+
+    pub(super) fn application(&self) -> Option<&Application> {
+        self.application.as_deref()
+    }
+
+    pub(super) fn matches_service(&self, config: &GitHubConfig) -> bool {
+        matches!(self.destination, Destination::Github { configuration_digest, .. }
+            if config.mode() == Mode::Github && configuration_digest == config.digest())
+    }
+
+    pub(super) fn has_mutation(&self) -> bool {
+        self.action() == Action::CloseIssue
+            || self.application().is_some_and(Application::has_mutation)
     }
 }
 
@@ -278,38 +332,8 @@ pub(super) fn read(stream: &mut impl Read) -> io::Result<FrozenOperation> {
         path: "/api/v3/repos/quartermaster/demo/issues/42".into(),
         repository: "quartermaster/demo".into(),
         destination: Destination::Simulation,
+        application: None,
     })
-}
-
-fn decimal(value: &str, maximum: u64) -> io::Result<u64> {
-    if value.is_empty()
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || value.starts_with('0')
-    {
-        return Err(io::Error::other("invalid positive integer"));
-    }
-    value
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number <= maximum)
-        .ok_or_else(|| io::Error::other("integer outside supported range"))
-}
-
-fn pagination_cursor(pair: &str) -> io::Result<String> {
-    let (_, value) = form_urlencoded::parse(pair.as_bytes())
-        .next()
-        .ok_or_else(|| io::Error::other("missing pagination cursor"))?;
-    let unpadded = value.trim_end_matches('=');
-    if unpadded.is_empty()
-        || value.len() > 512
-        || value.len() - unpadded.len() > 2
-        || !unpadded
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"+/-_".contains(&byte))
-    {
-        return Err(io::Error::other("invalid pagination cursor"));
-    }
-    Ok(form_urlencoded::byte_serialize(value.as_bytes()).collect())
 }
 
 pub(super) fn read_configured(
@@ -319,94 +343,50 @@ pub(super) fn read_configured(
     let Some(config) = config.filter(|config| config.mode() == Mode::Github) else {
         return read(stream);
     };
-    let request = head(stream)?;
-    if request.method != "GET"
-        || request.length.is_some_and(|length| length != 0)
-        || !(request.host.eq_ignore_ascii_case(b"api.github.com")
-            || request.host.eq_ignore_ascii_case(b"api.github.com:443"))
+    let application = Arc::new(Application::read(stream, &config.read_patterns())?);
+    let capture = application.capture();
+    let analysis = application.analysis();
+    let resource = config.matched_read_repository(analysis);
+    let operation = if analysis.complete()
+        && capture.method() == "GET"
+        && !capture.path_and_query().starts_with("/graphql")
+        && resource.is_some()
+        && analysis.effects.len() == 1
     {
-        return Err(io::Error::other(
-            "unsupported GitHub origin, method or body",
-        ));
-    }
-    if request.target.contains(['#', '\\']) {
-        return Err(io::Error::other("noncanonical target"));
-    }
-    let (path, query) = request
-        .target
-        .split_once('?')
-        .map_or((request.target.as_str(), None), |(path, query)| {
-            (path, Some(query))
-        });
-    if path.contains('%') {
-        return Err(io::Error::other("encoded resource path"));
-    }
-    let parts = path.split('/').collect::<Vec<_>>();
-    if !(parts.len() == 5 || parts.len() == 6)
-        || !parts[0].is_empty()
-        || parts[1] != "repos"
-        || parts[4] != "issues"
-    {
-        return Err(io::Error::other("unsupported GitHub resource"));
-    }
-    let repository = config
-        .repository(parts[2], parts[3])
-        .ok_or_else(|| io::Error::other("repository is not configured"))?;
-    let full_name = repository.full_name();
-    let (issue, target) = if parts.len() == 6 {
-        if query.is_some() {
-            return Err(io::Error::other("issue lookup does not accept a query"));
+        match analysis.effects[0].kind {
+            qm_api_github::EffectKind::ListIssues => Operation::ListIssues,
+            qm_api_github::EffectKind::ReadIssue => analysis
+                .resources
+                .iter()
+                .find_map(|resource| {
+                    if let qm_api_github::Resource::IssueNumber(number) = resource {
+                        Some(Operation::ReadIssue(*number))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(Operation::Api),
+            _ => Operation::Api,
         }
-        let issue = NonZeroU64::new(decimal(parts[5], u64::MAX)?).unwrap();
-        (Some(issue), format!("/repos/{full_name}/issues/{issue}"))
     } else {
-        let (mut state, mut per_page, mut page) = (None, None, None);
-        let mut cursor = None;
-        if let Some(query) = query {
-            for pair in query.split('&') {
-                let (key, value) = pair
-                    .split_once('=')
-                    .ok_or_else(|| io::Error::other("invalid query"))?;
-                match key {
-                    "state" if state.is_none() && matches!(value, "open" | "closed" | "all") => {
-                        state = Some(value)
-                    }
-                    "per_page" if per_page.is_none() => per_page = Some(decimal(value, 100)?),
-                    "page" if page.is_none() => page = Some(decimal(value, 10000)?),
-                    "before" | "after" if cursor.is_none() => {
-                        cursor = Some((key, pagination_cursor(pair)?))
-                    }
-                    _ => return Err(io::Error::other("unknown or repeated query parameter")),
-                }
-            }
-        }
-        let cursor = cursor.map_or_else(String::new, |(key, value)| format!("&{key}={value}"));
-        (
-            None,
-            format!(
-                "/repos/{full_name}/issues?state={}&per_page={}&page={}{cursor}",
-                state.unwrap_or("open"),
-                per_page.unwrap_or(30),
-                page.unwrap_or(1)
-            ),
-        )
+        Operation::Api
     };
-    let resolved_path = format!(
-        "/repositories/{}{}",
-        repository.id(),
-        target
-            .strip_prefix(&format!("/repos/{full_name}"))
-            .expect("canonical path uses the configured repository")
-    );
+    let scoped = !matches!(operation, Operation::Api);
+    let path = capture.path_and_query().to_owned();
     Ok(FrozenOperation {
-        operation: issue.map_or(Operation::ListIssues, Operation::ReadIssue),
-        path: target,
-        repository: full_name,
+        operation,
+        path: path.clone(),
+        repository: resource
+            .filter(|_| scoped)
+            .map_or_else(String::new, |repository| repository.full_name()),
         destination: Destination::Github {
-            repository_id: repository.id(),
+            repository_id: resource
+                .filter(|_| scoped)
+                .map(|repository| repository.id()),
             configuration_digest: config.digest(),
-            resolved_path,
+            resolved_path: path,
         },
+        application: Some(application),
     })
 }
 
@@ -491,6 +471,39 @@ mod github_tests {
     use crate::owner::github::configuration::GitHubConfig;
     use std::io::Cursor;
 
+    #[test]
+    fn github_reads_keep_the_clients_repository_path_and_query_octets() {
+        let config = config();
+        let path = "/repos/quartermaster/one/issues?per_page=10&state=all";
+        let request = read_configured(
+            &mut Cursor::new(format!(
+                "GET {path} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
+            )),
+            Some(&config),
+        )
+        .unwrap();
+        assert_eq!(request.path(), path);
+        assert_eq!(request.wire_path(), path);
+    }
+
+    #[test]
+    fn github_capture_accepts_unfamiliar_rest_and_graphql_for_policy_review() {
+        let config = config();
+        for (path, body) in [
+            ("/graphql", r#"{"query":"query { viewer { login } }"}"#),
+            ("/an-unfamiliar-endpoint?option=1", r#"{"newOption":true}"#),
+        ] {
+            let request = read_configured(
+                &mut Cursor::new(format!(
+                    "POST {path} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )),
+                Some(&config),
+            );
+            assert!(request.is_ok(), "{path}: {request:?}");
+        }
+    }
+
     fn config() -> GitHubConfig {
         GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"quartermaster","name":"one"},{"id":456,"owner":"quartermaster","name":"two"}]}"#).unwrap()
     }
@@ -498,7 +511,7 @@ mod github_tests {
     fn parse(target: &str) -> io::Result<FrozenOperation> {
         read_configured(
             &mut Cursor::new(format!(
-                "GET {target} HTTP/1.1\r\nHost: api.github.com\r\n\r\n"
+                "GET {target} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
             )),
             Some(&config()),
         )
@@ -528,52 +541,47 @@ mod github_tests {
     }
 
     #[test]
-    fn github_request_normalizes_only_the_supported_issue_list_query() {
-        for (query, expected) in [
-            ("", "state=open&per_page=30&page=1"),
-            (
-                "?page=2&state=closed&per_page=100",
-                "state=closed&per_page=100&page=2",
-            ),
-            (
-                "?state=all&per_page=1&page=10000",
-                "state=all&per_page=1&page=10000",
-            ),
+    fn github_request_preserves_supported_query_order_and_distinct_approval_bindings() {
+        for query in [
+            "",
+            "?page=2&state=closed&per_page=100",
+            "?state=all&per_page=1&page=10000",
         ] {
             let operation = parse(&format!("/repos/quartermaster/one/issues{query}")).unwrap();
             assert_eq!(operation.action(), Action::ListIssues);
             assert_eq!(
                 operation.path(),
-                format!("/repos/quartermaster/one/issues?{expected}")
+                format!("/repos/quartermaster/one/issues{query}")
             );
-            assert_eq!(operation.body(), "");
+            assert_eq!(operation.body(), b"");
         }
         let implicit = parse("/repos/quartermaster/one/issues").unwrap();
         let explicit =
             parse("/repos/quartermaster/one/issues?page=1&per_page=30&state=open").unwrap();
-        assert_eq!(implicit.digest(), explicit.digest());
+        assert_ne!(implicit.digest(), explicit.digest());
     }
 
     #[test]
     fn github_request_preserves_bounded_pagination_cursors_in_both_frozen_destinations() {
-        for (query, canonical) in [
-            (
-                "after=Y3Vyc29yOnYyOpLPAAABoNM-bZjPAAAAAUveKc4%3D",
-                "after=Y3Vyc29yOnYyOpLPAAABoNM-bZjPAAAAAUveKc4%3D",
-            ),
-            ("before=abc%2bdef%2fghi==", "before=abc%2Bdef%2Fghi%3D%3D"),
-            ("after=opaque_cursor-123", "after=opaque_cursor-123"),
+        for query in [
+            "after=Y3Vyc29yOnYyOpLPAAABoNM-bZjPAAAAAUveKc4%3D",
+            "before=abc%2bdef%2fghi==",
+            "after=opaque_cursor-123",
         ] {
             let operation = parse(&format!(
                 "/repos/quartermaster/one/issues?{query}&page=2&state=all&per_page=1"
             ))
             .unwrap();
-            let suffix = format!("issues?state=all&per_page=1&page=2&{canonical}");
+            let suffix = format!("issues?{query}&page=2&state=all&per_page=1");
+            assert_eq!(operation.action(), Action::ListIssues);
             assert_eq!(
                 operation.path(),
                 format!("/repos/quartermaster/one/{suffix}")
             );
-            assert_eq!(operation.wire_path(), format!("/repositories/123/{suffix}"));
+            assert_eq!(
+                operation.wire_path(),
+                format!("/repos/quartermaster/one/{suffix}")
+            );
             assert_ne!(
                 operation.digest(),
                 parse("/repos/quartermaster/one/issues?state=all&per_page=1&page=2")
@@ -583,11 +591,11 @@ mod github_tests {
         }
         let lower = parse("/repos/quartermaster/one/issues?after=abc%3d").unwrap();
         let upper = parse("/repos/quartermaster/one/issues?after=abc%3D").unwrap();
-        assert_eq!(lower.digest(), upper.digest());
+        assert_ne!(lower.digest(), upper.digest());
     }
 
     #[test]
-    fn github_request_rejects_ambiguous_oversized_or_escaping_pagination_cursors() {
+    fn ambiguous_oversized_or_escaping_cursors_cannot_use_a_read_grant() {
         let oversized = format!("after={}", "x".repeat(513));
         for query in [
             "after=",
@@ -608,16 +616,25 @@ mod github_tests {
             "after=abc%5Cdef",
             oversized.as_str(),
         ] {
-            assert!(
-                parse(&format!("/repos/quartermaster/one/issues?{query}")).is_err(),
-                "accepted {query}"
-            );
+            let result = parse(&format!("/repos/quartermaster/one/issues?{query}"));
+            if matches!(query, "after=%" | "after=%ZZ") {
+                assert!(result.is_err());
+            } else {
+                let request = result.unwrap();
+                assert_eq!(request.action(), Action::Api, "{query}");
+                assert!(!request.matches_configuration(&config()), "{query}");
+            }
         }
-        assert!(parse("/repos/quartermaster/one/issues/%31?after=abc").is_err());
+        assert_eq!(
+            parse("/repos/quartermaster/one/issues/%31?after=abc")
+                .unwrap()
+                .action(),
+            Action::Api
+        );
     }
 
     #[test]
-    fn github_request_rejects_ambiguous_queries_noncanonical_paths_and_unknown_resources() {
+    fn unfamiliar_queries_paths_and_resources_cannot_borrow_repository_read_authority() {
         for target in [
             "/repos/quartermaster/one/issues?state=open&state=closed",
             "/repos/quartermaster/one/issues?per_page=1&per_page=1",
@@ -626,36 +643,41 @@ mod github_tests {
             "/repos/quartermaster/one/issues?per_page=0",
             "/repos/quartermaster/one/issues?per_page=101",
             "/repos/quartermaster/one/issues?page=0",
-            "/repos/quartermaster/one/issues?page=10001",
             "/repos/quartermaster/one/issues?page=-1",
             "/repos/quartermaster/one/issues?page=1&",
-            "/repos/quartermaster/one/issues?",
             "/repos/quartermaster/one/issues/1?state=open",
             "/repos/quartermaster/one/issues/0",
-            "/repos/quartermaster/one/issues/01",
             "/repos/quartermaster/one/issues/18446744073709551616",
             "/repos/quartermaster/one/issues/1/extra",
-            "/repos/quartermaster/one/issues/1#fragment",
             "/repos/quartermaster/one/issues/%31",
             "/repos/quartermaster/one%2ftwo/issues/1",
             "/repos/quartermaster/../issues/1",
             "/repos/quartermaster/unknown/issues/1",
             "/repos/another/one/issues/1",
             "/api/v3/repos/quartermaster/one/issues/1",
-            "https://api.github.com/repos/quartermaster/one/issues/1",
         ] {
-            assert!(parse(target).is_err(), "accepted {target}");
+            let request = parse(target).unwrap();
+            assert_eq!(request.action(), Action::Api, "{target}");
+            assert!(!request.matches_configuration(&config()), "{target}");
         }
+        assert!(parse("/repos/quartermaster/one/issues/1#fragment").is_err());
+        let absolute = parse("https://api.github.com/repos/quartermaster/one/issues/1").unwrap();
+        assert_eq!(absolute.action(), Action::ReadIssue);
+        assert_eq!(absolute.path(), "/repos/quartermaster/one/issues/1");
     }
 
     #[test]
-    fn github_request_rejects_other_origins_ambiguous_framing_bodies_and_writes() {
+    fn github_capture_rejects_other_origins_and_ambiguous_framing() {
         for (method, host, headers, body) in [
             ("GET", "github.com", "", ""),
             ("GET", "api.github.com:80", "", ""),
             ("GET", "api.github.com.evil.invalid", "", ""),
-            ("GET", "api.github.com", "Host: api.github.com\r\n", ""),
-            ("GET", "api.github.com", "Content-Length: 1\r\n", "x"),
+            (
+                "GET",
+                "api.github.com",
+                "Host: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n",
+                "",
+            ),
             (
                 "GET",
                 "api.github.com",
@@ -668,18 +690,24 @@ mod github_tests {
                 "Content-Length: 0\r\nContent-Length: 0\r\n",
                 "",
             ),
-            (
-                "PATCH",
-                "api.github.com",
-                "Content-Length: 18\r\n",
-                "{\"state\":\"closed\"}",
-            ),
-            ("POST", "api.github.com", "", ""),
         ] {
             let bytes = format!(
                 "{method} /repos/quartermaster/one/issues/1 HTTP/1.1\r\nHost: {host}\r\n{headers}\r\n{body}"
             );
             assert!(read_configured(&mut Cursor::new(bytes), Some(&config())).is_err());
+        }
+        for (method, body) in [
+            ("GET", "x"),
+            ("PATCH", "{\"state\":\"closed\"}"),
+            ("POST", ""),
+        ] {
+            let input = format!(
+                "{method} /repos/quartermaster/one/issues/1 HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let request = read_configured(&mut Cursor::new(input), Some(&config())).unwrap();
+            assert_eq!(request.action(), Action::Api);
+            assert!(!request.matches_configuration(&config()));
         }
     }
 
@@ -688,8 +716,7 @@ mod github_tests {
         let simulation =
             GitHubConfig::decode(br#"{"version":1,"mode":"simulation","repositories":[]}"#)
                 .unwrap();
-        let input =
-            "GET /repos/quartermaster/one/issues/1 HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
+        let input = "GET /repos/quartermaster/one/issues/1 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n";
         assert!(read_configured(&mut Cursor::new(input), Some(&simulation)).is_err());
         assert!(read_configured(&mut Cursor::new(input), None).is_err());
     }

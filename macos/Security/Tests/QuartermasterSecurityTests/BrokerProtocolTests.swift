@@ -114,10 +114,10 @@ func brokerBackendRejectionsRetainTheirTypedError(_ code: BrokerControlError) th
 @Test func brokerCodecBoundsBothDirectionsWithoutReturningAPartialMessage() throws {
     let command = BrokerCommand.vaultLogin(
         server: "https://vault.example.invalid", email: "dummy@example.invalid",
-        password: String(repeating: "x", count: 16384), itemID: nil)
+        password: String(repeating: "x", count: 1024 * 1024), itemID: nil)
     #expect(throws: BrokerProtocolFailure.oversizedPayload) { try command.encoded() }
     #expect(throws: BrokerProtocolFailure.oversizedPayload) {
-        try BrokerReply.decodeSuccess(Data(repeating: 32, count: 16385))
+        try BrokerReply.decodeSuccess(Data(repeating: 32, count: 1024 * 1024 + 1))
     }
 }
 

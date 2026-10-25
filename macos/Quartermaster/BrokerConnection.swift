@@ -127,6 +127,7 @@ final class BrokerPending: ApprovalBackend {
     let request: DialogRequest
     let provider: ApprovalProviderIdentity
     let readGrant: ReadGrantReview?
+    let apiRequest: APIRequestReview?
     private var workflow: AuthorizationWorkflow
 
     init(client: BrokerConnection, review: ApprovalReview) throws {
@@ -136,20 +137,17 @@ final class BrokerPending: ApprovalBackend {
         let request = try JSONDecoder().decode(DialogRequest.self, from: bytes)
         let readGrant = try ReadGrantReview.parse(
             request: bytes, role: review.provider.role, uid: geteuid(), now: Date())
+        let apiRequest = try APIRequestReview.parse(request: bytes)
         guard request.peer != nil, !request.processChain.isEmpty, request.processChain.count <= 6 else {
             throw BrokerFailure.invalidMessage
         }
-        if readGrant == nil {
-            guard request.repository == "quartermaster/demo", request.issue == 42, request.method == "PATCH",
-                request.path == "/api/v3/repos/quartermaster/demo/issues/42", request.body == "{\"state\":\"closed\"}",
-                request.origin == "https://github.example.invalid"
-            else { throw BrokerFailure.invalidMessage }
-        }
+        guard readGrant != nil || apiRequest != nil else { throw BrokerFailure.invalidMessage }
         self.client = client
         self.id = id
         self.request = request
         self.provider = review.provider
         self.readGrant = readGrant
+        self.apiRequest = apiRequest
     }
 
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {

@@ -5,10 +5,12 @@ package(default_visibility = ["//visibility:public"])
 swift_library(
     name = "QuartermasterSecurity",
     srcs = [
+        "APIRequestReview.swift",
         "ApprovalControlWorkflow.swift",
         "ApprovalController.swift",
         "ApprovalKeyStore.swift",
         "AuthorizationWorkflow.swift",
+        "BrokerLimits.swift",
         "BrokerProtocol.swift",
         "MonotonicTimestamp.swift",
         "ReadGrantReview.swift",

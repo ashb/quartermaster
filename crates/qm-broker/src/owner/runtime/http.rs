@@ -33,9 +33,10 @@ pub(super) fn response_until(
     let (status, body) = response.public_parts();
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    )
+    )?;
+    stream.write_all(body)
 }
 
 pub(super) struct ResponseWriter<'a> {
@@ -52,6 +53,21 @@ impl Write for ResponseWriter<'_> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
+    }
+}
+
+struct RequestReader<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Deadline,
+}
+
+impl std::io::Read for RequestReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream
+            .set_read_timeout(Some(self.deadline.remaining()?))?;
+        let count = std::io::Read::read(self.stream, bytes)?;
+        self.deadline.remaining()?;
+        Ok(count)
     }
 }
 
@@ -114,7 +130,13 @@ pub(super) fn handle_verified_http(
         state.refresh_policy(&policy)?;
         state.authorizer.github_configuration().cloned()
     };
-    let request = http_request::read_configured(stream, config.as_ref())?;
+    let request = http_request::read_configured(
+        &mut RequestReader {
+            stream,
+            deadline: Deadline::after(Duration::from_secs(5))?,
+        },
+        config.as_ref(),
+    )?;
     let created = presence_now()?;
     let cold = {
         let state = shared
@@ -260,10 +282,46 @@ pub(super) fn execute_github(
         let deadline =
             state
                 .operations
-                .read_deadline(id, principal, &state.authorizer, Instant::now())?;
+                .dispatch_deadline(id, principal, &state.authorizer, Instant::now())?;
         (deadline, state.github.clone())
     };
     let mut visited = Vec::new();
+    let unscoped = {
+        let state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.operations.request(id, principal)?.action() == http_request::Action::Api
+    };
+    if unscoped {
+        let request = {
+            let policy = paths.load_policy();
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
+            state.prepare_unscoped_github(id, principal, &policy)?
+        };
+        let prepared = PreparedOperation::github(request, connector.connect(deadline)?)?;
+        let receipt = {
+            let policy = paths.load_policy();
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
+            if !connected(stream) {
+                return Err(Error::State(Fault::Canceled));
+            }
+            state.handoff(prepared, principal, &policy)?
+        };
+        let outcome = receipt.response();
+        shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?
+            .finish(id, &outcome)?;
+        return response_until(stream, outcome, deadline).map_err(Error::from);
+    }
     for redirects in 0..=3 {
         let metadata = {
             let policy = paths.load_policy();
@@ -341,4 +399,34 @@ pub(super) fn execute_github(
         }
     }
     Err(Error::State(Fault::RedirectLimit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_capture_uses_one_deadline_even_when_complete_bytes_are_available() {
+        for expired in [false, true] {
+            let (mut server, mut client) = UnixStream::pair().unwrap();
+            client.write_all(b"GET /api/v3/repos/quartermaster/demo/issues/42 HTTP/1.1\r\nHost: github.example.invalid\r\n\r\n").unwrap();
+            let deadline = if expired {
+                Deadline::from_instant(Instant::now() - Duration::from_secs(1)).unwrap()
+            } else {
+                Deadline::after(Duration::from_secs(1)).unwrap()
+            };
+            let result = http_request::read_configured(
+                &mut RequestReader {
+                    stream: &mut server,
+                    deadline,
+                },
+                None,
+            );
+            if expired {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
 }

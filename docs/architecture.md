@@ -76,8 +76,9 @@ For GitHub, recognized requests can produce specific descriptions and scoped
 matches. Unfamiliar requests use complete request inspection and fresh approval,
 subject to mandatory restrictions. They do not extend an existing grant. The
 [GitHub contract](security-boundaries.md#github-requests-matching-and-approval-proposed)
-defines request preservation, matching and approval; this general flow is planned,
-not yet integrated into the narrow development gateway.
+defines request preservation, matching and approval. The development gateway
+uses this flow; live-provider and hardware acceptance remain. Repository scope
+follows the [requested repository name](github.md#repository-identity).
 
 The UI may transfer its fresh authenticated `LAContext` to the backend over
 authenticated XPC, allowing one fingerprint to unlock the cache and approve the
@@ -164,8 +165,9 @@ does not select credentials, confer authority or enable a service on its own.
 
 The GitHub crate preserves captured bytes and reports coverage as well as known
 observations. Complete positive matches must cover all effects; a recognized
-sibling cannot hide unfamiliar input. It is independent of the daemon and not
-yet integrated into the general approval/forwarding path.
+sibling cannot hide unfamiliar input. The broker supplies its own pattern
+catalogue and uses these observations for policy and approval. The classifier
+remains independent of the daemon and credential authority.
 
 ## Caller attribution
 
@@ -210,7 +212,7 @@ label is not identity. Session status should show the VM, policy, credentials,
 resources and expiry, with a direct revocation action.
 
 Keep API/SSH and Docker carriers independent, with separate worker processes,
-queues, budgets and revocation. A stalled consumer or failed stream must not block
+queues, capacity limits and revocation. A stalled consumer or failed stream must not block
 unrelated work. Shared-folder sockets do not replace authenticated relay
 admission.
 

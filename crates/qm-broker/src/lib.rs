@@ -33,6 +33,7 @@ use std::{fmt, io, path::PathBuf};
 
 mod owner;
 mod platform;
+mod wire_limits;
 
 pub struct ServiceOptions {
     pub storage_root: PathBuf,

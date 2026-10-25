@@ -32,6 +32,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),  # keep
     visibility = ["//visibility:public"],
     deps = [
+        "//crates/qm-api-github:qm_api_github",
         "//crates/qm-macos:qm_macos",
         "//crates/qm-providers:qm_providers",
         "//crates/qm-types:qm_types",

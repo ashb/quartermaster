@@ -88,6 +88,7 @@ pub(super) struct PreparedRequest {
 enum Destination {
     Simulation,
     Github(Box<RepositoryBinding>),
+    UnscopedGithub,
 }
 
 pub(super) struct Acquisition<'a> {
@@ -116,11 +117,12 @@ impl PreparedGitHubRequest {
     ) -> Result<Self, Error> {
         PreparedRequest::acquire(input, Destination::Github(Box::new(repository))).map(Self)
     }
-    pub(super) fn repository(&self) -> &RepositoryBinding {
-        self.0
-            .repository
-            .as_deref()
-            .expect("GitHub preparation has a verified repository")
+    pub(super) fn acquire_unscoped(input: Acquisition<'_>) -> Result<Self, Error> {
+        PreparedRequest::acquire(input, Destination::UnscopedGithub).map(Self)
+    }
+
+    pub(super) fn repository(&self) -> Option<&RepositoryBinding> {
+        self.0.repository.as_deref()
     }
 }
 
@@ -159,6 +161,12 @@ impl PreparedRequest {
             {
                 Some(binding)
             }
+            Destination::UnscopedGithub
+                if operation.request().mode() == Mode::Github
+                    && operation.request().action() == super::request::Action::Api =>
+            {
+                None
+            }
             _ => return Err(Error::Unavailable),
         };
         if !selection.matches_snapshot(snapshot) {
@@ -172,26 +180,22 @@ impl PreparedRequest {
             .map_err(Error::Provider)?;
         validate_token(&credential)?;
         let request = operation.request();
-        let mut bytes = Zeroizing::new(Vec::with_capacity(8192));
-        let host = if repository.is_some() {
-            "api.github.com"
+        let bytes = if let Some(application) = request.application() {
+            application.wire(&credential)
         } else {
-            SIMULATION_HOST
+            let mut bytes = Zeroizing::new(
+                format!(
+                    "{} {} HTTP/1.1\r\nHost: {SIMULATION_HOST}\r\nAuthorization: Bearer ",
+                    request.method(),
+                    request.wire_path()
+                )
+                .into_bytes(),
+            );
+            bytes.extend_from_slice(&credential);
+            bytes.extend_from_slice(format!("\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", request.body().len()).as_bytes());
+            bytes.extend_from_slice(request.body());
+            bytes
         };
-        bytes.extend_from_slice(
-            format!(
-                "{} {} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer ",
-                request.method(),
-                request.wire_path()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&credential);
-        if repository.is_some() {
-            bytes.extend_from_slice(b"\r\nUser-Agent: Quartermaster\r\nAccept: application/vnd.github+json\r\nAccept-Encoding: identity\r\nX-GitHub-Api-Version: 2026-03-10");
-        }
-        bytes.extend_from_slice(format!("\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", request.body().len()).as_bytes());
-        bytes.extend_from_slice(request.body().as_bytes());
         let wire_digest = digest(&SHA256, &bytes).as_ref().try_into().unwrap();
         Ok(Self {
             id,
@@ -384,7 +388,7 @@ mod tests {
     ) {
         let now = Instant::now();
         let mut authorizer = Authorizer::new([1; 16]);
-        let mut policy: serde_json::Value = serde_json::from_slice(&policy_bytes(1010, 2)).unwrap();
+        let mut policy: serde_json::Value = serde_json::from_slice(&policy_bytes(1010)).unwrap();
         policy["grants"][0]["role"] = role.into();
         authorizer
             .install(
@@ -587,7 +591,8 @@ mod tests {
             !response
                 .public_parts()
                 .1
-                .contains("quartermaster-dummy-canary")
+                .windows(b"quartermaster-dummy-canary".len())
+                .any(|part| part == b"quartermaster-dummy-canary")
         );
     }
 
@@ -693,7 +698,8 @@ mod tests {
                 !response
                     .public_parts()
                     .1
-                    .contains("quartermaster-dummy-canary")
+                    .windows(b"quartermaster-dummy-canary".len())
+                    .any(|part| part == b"quartermaster-dummy-canary")
             );
             assert!(
                 crate::owner::execution::prepare_simulation(
@@ -729,7 +735,7 @@ mod tests {
         let (mut authorizer, principal, mut registry, _, snapshot, now) = fixture("github-read");
         authorizer
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 1)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1009) + Duration::from_millis(900),
                 now,
             )
@@ -1095,20 +1101,21 @@ mod tests {
                 !response
                     .public_parts()
                     .1
-                    .contains("quartermaster-dummy-canary")
+                    .windows(b"quartermaster-dummy-canary".len())
+                    .any(|part| part == b"quartermaster-dummy-canary")
             );
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn simultaneous_handoffs_can_send_only_one_request_with_the_last_budget_unit() {
+    fn simultaneous_read_handoffs_can_share_the_same_live_grant() {
         use std::sync::{Arc, Barrier, Mutex};
         let (_, principal, mut registry, _, snapshot, now) = fixture("github-read");
         let mut authorizer = Authorizer::new([1; 16]);
         authorizer
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 1)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1000),
                 now,
             )
@@ -1168,8 +1175,8 @@ mod tests {
             .filter_map(|worker| worker.join().unwrap())
             .count();
 
-        assert_eq!(successes, 1);
-        assert_eq!(transport::fixture::observe(&upstream).0, 1);
+        assert_eq!(successes, 2);
+        assert_eq!(transport::fixture::observe(&upstream).0, 2);
     }
 
     #[cfg(unix)]

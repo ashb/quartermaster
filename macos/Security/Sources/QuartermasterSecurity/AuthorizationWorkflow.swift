@@ -62,7 +62,7 @@ public struct AuthorizationWorkflow: Sendable {
         guard review.id.count == 32, review.id.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
             !review.created.isZero, let age = try? now.duration(since: review.created), age < .seconds(120),
             review.session.count == 16, review.policy.count == 32, review.nonce.count == 32,
-            review.nonce.contains(where: { $0 != 0 }), review.request.count <= 12000,
+            review.nonce.contains(where: { $0 != 0 }), review.request.count <= BrokerLimits.reviewBytes,
             Data(SHA256.hash(data: review.request)) == review.requestDigest,
             review.provider.field == "LoginPassword", !review.provider.server.isEmpty,
             !review.provider.account.isEmpty, !review.provider.email.isEmpty,

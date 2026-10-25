@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 use zeroize::Zeroizing;
 
-pub(super) const MAX_PAYLOAD: usize = 16384;
+pub(super) const MAX_PAYLOAD: usize = crate::wire_limits::IPC_PAYLOAD_BYTES;
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]

@@ -70,3 +70,16 @@ pub(super) fn prepare_metadata(
         registry, id, principal, authorizer, snapshot, now,
     )?)
 }
+
+pub(super) fn prepare_unscoped_github(
+    registry: &OperationRegistry,
+    id: OperationId,
+    principal: &VerifiedPrincipal,
+    authorizer: &Authorizer,
+    snapshot: &VaultSnapshot,
+    now: Instant,
+) -> Result<PreparedGitHubRequest, dispatch::Error> {
+    PreparedGitHubRequest::acquire_unscoped(acquisition(
+        registry, id, principal, authorizer, snapshot, now,
+    )?)
+}

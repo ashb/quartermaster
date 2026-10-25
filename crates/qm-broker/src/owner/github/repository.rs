@@ -226,19 +226,24 @@ impl RepositoryBinding {
             .map(|path| format!("/{path}"))
             .or_else(|| target.starts_with('/').then(|| target.to_owned()))
             .ok_or(Error)?;
-        let numeric = format!("/repositories/{}/", self.repository_id);
-        let path = path.strip_prefix(&numeric).map_or_else(
-            || path.clone(),
-            |suffix| format!("/repos/{}/{suffix}", self.repository),
-        );
+        if !path.starts_with(&format!("/repos/{}/", self.repository))
+            && !path.starts_with(&format!("/repositories/{}/", self.repository_id))
+        {
+            return Err(Error);
+        }
+        let original = from.application().ok_or(Error)?.capture().original();
+        let line_end = original
+            .windows(2)
+            .position(|part| part == b"\r\n")
+            .ok_or(Error)?;
+        let mut redirected = format!("GET {path} HTTP/1.1\r\n").into_bytes();
+        redirected.extend_from_slice(&original[line_end + 2..]);
         let operation = crate::owner::request::read_configured(
-            &mut Cursor::new(format!(
-                "GET {path} HTTP/1.1\r\nHost: api.github.com\r\n\r\n"
-            )),
+            &mut Cursor::new(redirected),
             Some(&self.configuration),
         )
         .map_err(|_| Error)?;
-        if operation.repository() != self.repository {
+        if operation.action() != Action::Api && operation.repository() != self.repository {
             return Err(Error);
         }
         Ok(operation)
@@ -271,7 +276,7 @@ mod tests {
     fn operation(config: &GitHubConfig) -> request::FrozenOperation {
         request::read_configured(
             &mut Cursor::new(
-                "GET /repos/example/one/issues/123 HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+                "GET /repos/example/one/issues/123 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n",
             ),
             Some(config),
         )

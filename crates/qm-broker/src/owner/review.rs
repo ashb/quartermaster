@@ -1,6 +1,10 @@
 use super::{grant::ReadGrantClaims, request::FrozenOperation};
 use serde::Serialize;
 
+pub(super) trait CredentialContext {
+    fn credential_role(&self) -> &str;
+}
+
 pub(super) struct ReviewDocument<C> {
     operation: FrozenOperation,
     authorization: Option<ReadGrantClaims>,
@@ -15,7 +19,7 @@ impl<C> ReviewDocument<C> {
         context: C,
     ) -> Result<Self, serde_json::Error>
     where
-        C: Serialize,
+        C: Serialize + CredentialContext,
     {
         #[derive(Serialize)]
         struct Envelope<'a, C> {
@@ -52,5 +56,11 @@ impl<C> ReviewDocument<C> {
     }
     pub(super) fn context(&self) -> &C {
         &self.context
+    }
+}
+
+impl<C: CredentialContext> ReviewDocument<C> {
+    pub(super) fn credential_role(&self) -> &str {
+        self.context.credential_role()
     }
 }

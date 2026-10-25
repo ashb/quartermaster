@@ -309,7 +309,7 @@ impl OperationRegistry {
         }
     }
 
-    pub(super) fn bind_review<C>(
+    pub(super) fn bind_review<C: super::review::CredentialContext>(
         &mut self,
         id: OperationId,
         principal: &VerifiedPrincipal,
@@ -505,14 +505,10 @@ impl OperationRegistry {
         let proof = approval
             .approve(signature)
             .map_err(|_| OperationError::Authorization(AuthorizationError::InvalidApproval))?;
-        let deadline = if requirement.grant_claims().is_some() {
-            let expires = authenticated
-                .checked_add(Duration::from_secs(30))
-                .ok_or(OperationError::Unavailable)?;
-            Some(Deadline::from_instant(expires).map_err(|_| OperationError::Unavailable)?)
-        } else {
-            None
-        };
+        let expires = authenticated
+            .checked_add(Duration::from_secs(30))
+            .ok_or(OperationError::Unavailable)?;
+        let deadline = Deadline::from_instant(expires).map_err(|_| OperationError::Unavailable)?;
         let operation = authorizer
             .approve(
                 requirement,
@@ -523,10 +519,8 @@ impl OperationRegistry {
                 now,
             )
             .map_err(OperationError::Authorization)?;
-        if let Some(deadline) = deadline {
-            record.created = authenticated;
-            record.continuous_deadline = deadline;
-        }
+        record.created = authenticated;
+        record.continuous_deadline = deadline;
         record.phase = Phase::Preparing(Box::new(Preparation {
             operation,
             selection,
@@ -674,19 +668,23 @@ impl OperationRegistry {
         Ok(preparation)
     }
 
-    pub(super) fn read_deadline(
+    pub(super) fn dispatch_deadline(
         &self,
         id: OperationId,
         principal: &VerifiedPrincipal,
         authorizer: &Authorizer,
         now: Instant,
     ) -> Result<Deadline, dispatch::Error> {
-        let preparation = self.metadata_operation(id, principal)?;
+        let preparation = self
+            .preparation(id, principal)
+            .map_err(dispatch::Error::Operation)?;
         let record = self
             .get(id, principal)
             .map_err(dispatch::Error::Operation)?;
-        let operation_deadline = record
-            .created
+        let operation_deadline = preparation
+            .operation
+            .authenticated_at()
+            .unwrap_or(record.created)
             .checked_add(Duration::from_secs(30))
             .ok_or(dispatch::Error::Unavailable)?;
         if now >= operation_deadline {
@@ -877,12 +875,12 @@ mod tests {
         time::Duration,
     };
 
-    fn fixture(budget: u32) -> (Authorizer, VerifiedPrincipal, OperationRegistry, Instant) {
+    fn fixture() -> (Authorizer, VerifiedPrincipal, OperationRegistry, Instant) {
         let now = Instant::now();
         let mut authorizer = Authorizer::new([1; 16]);
         authorizer
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, budget)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1000),
                 now,
             )
@@ -898,7 +896,7 @@ mod tests {
     #[test]
     fn a_failed_signing_transition_revokes_the_record_instead_of_leaving_partial_state() {
         for invalid_offset in [false, true] {
-            let (authorizer, principal, mut registry, created) = fixture(2);
+            let (authorizer, principal, mut registry, created) = fixture();
             let id = registry
                 .register(
                     authorizer
@@ -960,7 +958,7 @@ mod tests {
 
     #[test]
     fn interactive_intent_can_be_canceled_before_any_credential_is_selected() {
-        let (authorizer, principal, mut registry, now) = fixture(2);
+        let (authorizer, principal, mut registry, now) = fixture();
         let request = request::read(&mut Cursor::new(b"PATCH /api/v3/repos/quartermaster/demo/issues/42 HTTP/1.1\r\nHost: github.example.invalid\r\nContent-Length: 18\r\n\r\n{\"state\":\"closed\"}")).unwrap();
         let id = registry
             .register(authorizer.authorize(&principal, request, now).unwrap(), now)
@@ -1066,7 +1064,7 @@ mod tests {
 
     #[test]
     fn timely_authentication_preserves_its_dispatch_window_after_the_pending_deadline() {
-        let (mut authorizer, principal, mut registry, now) = fixture(1);
+        let (mut authorizer, principal, mut registry, now) = fixture();
         let (id, _session) = approved_write_at(
             &mut registry,
             &mut authorizer,
@@ -1089,6 +1087,114 @@ mod tests {
     }
 
     #[test]
+    fn one_use_api_dispatch_deadline_starts_at_authentication_after_a_long_user_wait() {
+        let now = Instant::now();
+        let created = now - Duration::from_secs(60);
+        let config = crate::owner::github::configuration::GitHubConfig::decode(
+            br#"{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true}"#,
+        )
+        .unwrap();
+        let mut authorizer = Authorizer::new([1; 16]);
+        authorizer
+            .install(
+                Ok(FixturePolicy::default().with_github(config.clone())),
+                crate::owner::test_support::wall(1000),
+                now,
+            )
+            .unwrap();
+        let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
+        let request = request::read_configured(
+            &mut Cursor::new(
+                "POST /future HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 0\r\n\r\n",
+            ),
+            Some(&config),
+        )
+        .unwrap();
+        let document = crate::owner::test_support::approval::review(request.clone(), None);
+        let mut registry = OperationRegistry::default();
+        let id = registry
+            .register(
+                authorizer.authorize(&principal, request, created).unwrap(),
+                created,
+            )
+            .unwrap();
+        registry.owned(id, &principal).unwrap().continuous_deadline =
+            Deadline::from_instant(created + Duration::from_secs(30)).unwrap();
+        registry.bind_review(id, &principal, &document).unwrap();
+        let (session, key) = crate::owner::test_support::approval::session(&authorizer);
+        registry.begin_approval(id, &principal, &session).unwrap();
+        registry
+            .authentication(id, &principal, now, now, Duration::from_secs(60))
+            .unwrap();
+        let snapshot = crate::owner::test_support::vault::snapshot("github-write");
+        let challenge = registry
+            .challenge(
+                id,
+                &principal,
+                crate::owner::test_support::vault::selection(&snapshot),
+            )
+            .unwrap();
+        let signature = key
+            .sign(&ring::rand::SystemRandom::new(), &challenge.bytes)
+            .unwrap();
+        registry
+            .proof(id, &principal, &authorizer, signature.as_ref(), now)
+            .unwrap();
+        assert!(
+            registry
+                .dispatch_deadline(id, &principal, &authorizer, Instant::now())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn one_use_api_challenge_rejects_a_role_different_from_the_presented_selection() {
+        let now = Instant::now();
+        let config = crate::owner::github::configuration::GitHubConfig::decode(
+            br#"{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true}"#,
+        )
+        .unwrap();
+        let mut authorizer = Authorizer::new([1; 16]);
+        authorizer
+            .install(
+                Ok(FixturePolicy::default().with_github(config.clone())),
+                crate::owner::test_support::wall(1000),
+                now,
+            )
+            .unwrap();
+        let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
+        let request = request::read_configured(
+            &mut Cursor::new("GET /future HTTP/1.1\r\nHost: api.github.com\r\n\r\n"),
+            Some(&config),
+        )
+        .unwrap();
+        let document = crate::owner::test_support::approval::selected_review(
+            request.clone(),
+            None,
+            "github-read",
+        );
+        let mut registry = OperationRegistry::default();
+        let id = registry
+            .register(authorizer.authorize(&principal, request, now).unwrap(), now)
+            .unwrap();
+        registry.bind_review(id, &principal, &document).unwrap();
+        let (session, _key) = crate::owner::test_support::approval::session(&authorizer);
+        registry.begin_approval(id, &principal, &session).unwrap();
+        registry
+            .authentication(id, &principal, now, now, Duration::ZERO)
+            .unwrap();
+        let replacement = crate::owner::test_support::vault::snapshot("github-write");
+        assert!(matches!(
+            registry.challenge(
+                id,
+                &principal,
+                crate::owner::test_support::vault::selection(&replacement)
+            ),
+            Err(OperationError::CredentialMismatch)
+        ));
+    }
+
+    #[test]
     fn authentication_must_be_fresh_within_the_original_wait_and_cannot_be_replaced() {
         for (offset, delay, allowed) in [
             (Duration::ZERO, Duration::ZERO, true),
@@ -1096,7 +1202,7 @@ mod tests {
             (Duration::from_secs(120), Duration::ZERO, false),
             (Duration::from_secs(121), Duration::ZERO, false),
         ] {
-            let (authorizer, principal, mut registry, now) = fixture(1);
+            let (authorizer, principal, mut registry, now) = fixture();
             let request = request::read(&mut Cursor::new(b"PATCH /api/v3/repos/quartermaster/demo/issues/42 HTTP/1.1\r\nHost: github.example.invalid\r\nContent-Length: 18\r\n\r\n{\"state\":\"closed\"}")).unwrap();
             let id = registry
                 .register(authorizer.authorize(&principal, request, now).unwrap(), now)
@@ -1127,7 +1233,7 @@ mod tests {
 
     #[test]
     fn an_unrelated_ui_session_cannot_cancel_or_retarget_an_operation() {
-        let (mut authorizer, principal, mut registry, _) = fixture(1);
+        let (mut authorizer, principal, mut registry, _) = fixture();
         let (id, _session) = approved_write(&mut registry, &mut authorizer, &principal);
 
         assert_eq!(
@@ -1147,7 +1253,7 @@ mod tests {
 
     #[test]
     fn a_ready_write_cannot_outlive_its_original_authentication_event() {
-        let (mut authorizer, principal, mut registry, _) = fixture(1);
+        let (mut authorizer, principal, mut registry, _) = fixture();
         let (id, _session) = approved_write(&mut registry, &mut authorizer, &principal);
         ready(&mut registry, &authorizer, id, &principal).unwrap();
 
@@ -1166,7 +1272,7 @@ mod tests {
 
     #[test]
     fn ui_disconnection_cancels_its_write_and_preserves_independent_reads() {
-        let (mut authorizer, principal, mut registry, now) = fixture(2);
+        let (mut authorizer, principal, mut registry, now) = fixture();
         let (write, _session) = approved_write(&mut registry, &mut authorizer, &principal);
         let first = read(&mut registry, &authorizer, &principal, now);
 
@@ -1191,7 +1297,7 @@ mod tests {
 
     #[test]
     fn cancellation_and_admission_have_one_consistent_winner() {
-        let (authorizer, principal, mut registry, now) = fixture(1);
+        let (authorizer, principal, mut registry, now) = fixture();
         let id = read(&mut registry, &authorizer, &principal, now);
         ready(&mut registry, &authorizer, id, &principal).unwrap();
         let owner = Arc::new(Mutex::new((authorizer, registry)));
@@ -1219,7 +1325,7 @@ mod tests {
 
     #[test]
     fn cancellation_after_verified_proof_prevents_admission_and_remains_observable() {
-        let (mut authorizer, principal, mut registry, _) = fixture(2);
+        let (mut authorizer, principal, mut registry, _) = fixture();
         let (id, _session) = approved_write(&mut registry, &mut authorizer, &principal);
         ready(&mut registry, &authorizer, id, &principal).unwrap();
 
@@ -1240,8 +1346,8 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_during_preparation_does_not_spend_the_grant_budget() {
-        let (mut authorizer, principal, mut registry, now) = fixture(1);
+    fn cancellation_during_preparation_preserves_the_grant() {
+        let (mut authorizer, principal, mut registry, now) = fixture();
         let canceled = read(&mut registry, &authorizer, &principal, now);
         assert_eq!(
             registry.cancel(canceled, &principal),
@@ -1255,13 +1361,13 @@ mod tests {
         assert!(
             authorizer
                 .authorize(&principal, read_request(), now)
-                .is_err()
+                .is_ok()
         );
     }
 
     #[test]
     fn admitted_operations_report_already_admitted_and_cannot_execute_twice() {
-        let (mut authorizer, principal, mut registry, now) = fixture(1);
+        let (mut authorizer, principal, mut registry, now) = fixture();
         let id = read(&mut registry, &authorizer, &principal, now);
         ready(&mut registry, &authorizer, id, &principal).unwrap();
         let admission = registry
@@ -1286,13 +1392,13 @@ mod tests {
         assert!(
             authorizer
                 .authorize(&principal, read_request(), now)
-                .is_err()
+                .is_ok()
         );
     }
 
     #[test]
     fn wrong_owner_and_unknown_ids_do_not_report_cancellation() {
-        let (authorizer, principal, mut registry, now) = fixture(1);
+        let (authorizer, principal, mut registry, now) = fixture();
         let id = read(&mut registry, &authorizer, &principal, now);
         let other = VerifiedPrincipal::fixture(502, "11".repeat(20), [1; 16]);
 
@@ -1313,7 +1419,7 @@ mod tests {
     #[test]
     fn final_admission_rechecks_revocation_and_expiry() {
         for changed in [false, true] {
-            let (mut authorizer, principal, mut registry, now) = fixture(1);
+            let (mut authorizer, principal, mut registry, now) = fixture();
             let id = read(&mut registry, &authorizer, &principal, now);
             ready(&mut registry, &authorizer, id, &principal).unwrap();
             if changed {
@@ -1342,8 +1448,8 @@ mod tests {
     }
 
     #[test]
-    fn two_concurrently_prepared_operations_cannot_spend_the_same_last_budget_unit() {
-        let (authorizer, principal, mut registry, now) = fixture(1);
+    fn separately_prepared_operations_can_share_the_same_live_grant() {
+        let (authorizer, principal, mut registry, now) = fixture();
         let first = read(&mut registry, &authorizer, &principal, now);
         let second = read(&mut registry, &authorizer, &principal, now);
         ready(&mut registry, &authorizer, first, &principal).unwrap();
@@ -1372,13 +1478,13 @@ mod tests {
                 .map(|thread| thread.join().unwrap())
                 .filter(|allowed| *allowed)
                 .count(),
-            1
+            2
         );
     }
 
     #[test]
-    fn canceled_write_leaves_independent_read_grants_and_budgets_valid() {
-        let (mut authorizer, principal, mut registry, now) = fixture(2);
+    fn canceled_write_leaves_independent_read_grants_valid() {
+        let (mut authorizer, principal, mut registry, now) = fixture();
         let (write, _session) = approved_write(&mut registry, &mut authorizer, &principal);
         assert_eq!(
             registry.cancel(write, &principal),
@@ -1395,7 +1501,7 @@ mod tests {
 
     #[test]
     fn terminal_records_remain_bounded_until_the_originating_connection_ends() {
-        let (authorizer, principal, mut registry, now) = fixture(1);
+        let (authorizer, principal, mut registry, now) = fixture();
         for _ in 0..128 {
             let id = read(&mut registry, &authorizer, &principal, now);
             assert_eq!(

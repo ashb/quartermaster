@@ -528,7 +528,6 @@ mod github_tests {
 
     fn setup(
         address: SocketAddr,
-        budget: u32,
     ) -> (
         tempfile::TempDir,
         ServicePaths,
@@ -549,7 +548,6 @@ mod github_tests {
                 .unix_timestamp()
                 .try_into()
                 .unwrap(),
-            budget,
         ))
         .unwrap();
         policy["grants"][0]["uid"] = json!(unsafe { libc::geteuid() });
@@ -588,7 +586,7 @@ mod github_tests {
         paths: &ServicePaths,
         target: &str,
     ) -> Result<String> {
-        client.write_all(format!("GET {target} HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer untrusted-caller-token\r\n\r\n").as_bytes()).unwrap();
+        client.write_all(format!("GET {target} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nAuthorization: Bearer untrusted-caller-token\r\n\r\n").as_bytes()).unwrap();
         handle_http(server, shared, paths)?;
         server.shutdown(std::net::Shutdown::Write).unwrap();
         let mut response = String::new();
@@ -608,7 +606,7 @@ mod github_tests {
                 github::issue(987654321)
             };
             let (address, worker) = github::serve(vec![github::repository(123), reply]);
-            let (_root, paths, shared, mut server, mut client) = setup(address, 2);
+            let (_root, paths, shared, mut server, mut client) = setup(address);
             let response = request(&mut server, &mut client, &shared, &paths, target).unwrap();
             assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
             assert!(response.contains("Actual fixture issue"));
@@ -618,8 +616,7 @@ mod github_tests {
             let requests = worker.join().unwrap();
             assert_eq!(requests.len(), 2);
             assert!(requests[0].starts_with("GET /repos/example/one HTTP/1.1"));
-            let destination = target.replace("/repos/example/one/", "/repositories/123/");
-            assert!(requests[1].starts_with(&format!("GET {destination} HTTP/1.1")));
+            assert!(requests[1].starts_with(&format!("GET {target} HTTP/1.1")));
             assert!(
                 requests
                     .iter()
@@ -638,7 +635,7 @@ mod github_tests {
                 github::repository(456)
             };
             let (address, worker) = github::serve(vec![reply]);
-            let (_root, paths, shared, mut server, mut client) = setup(address, 2);
+            let (_root, paths, shared, mut server, mut client) = setup(address);
             let result = request(
                 &mut server,
                 &mut client,
@@ -661,41 +658,25 @@ mod github_tests {
     }
 
     #[test]
-    fn github_runtime_read_redirect_reauthorizes_and_debits_the_next_target_without_a_new_prompt() {
-        for budget in [1, 2] {
-            let replies = if budget == 1 {
-                vec![
-                    github::repository(123),
-                    github::redirect("https://api.github.com/repositories/123/issues/43"),
-                ]
-            } else {
-                vec![
-                    github::repository(123),
-                    github::redirect("https://api.github.com/repositories/123/issues/43"),
-                    github::repository(123),
-                    github::issue(43),
-                ]
-            };
-            let (address, worker) = github::serve(replies);
-            let (_root, paths, shared, mut server, mut client) = setup(address, budget);
-            let result = request(
-                &mut server,
-                &mut client,
-                &shared,
-                &paths,
-                "/repos/example/one/issues/42",
-            );
-            if budget == 1 {
-                assert!(result.is_err());
-            } else {
-                assert!(result.unwrap().contains("Actual fixture issue 43"));
-            }
-            assert!(shared.0.lock().unwrap().ui.is_none());
-            assert_eq!(
-                worker.join().unwrap().len(),
-                if budget == 1 { 2 } else { 4 }
-            );
-        }
+    fn github_runtime_read_redirect_reauthorizes_the_next_target_without_a_new_prompt() {
+        let replies = vec![
+            github::repository(123),
+            github::redirect("https://api.github.com/repos/example/one/issues/43"),
+            github::repository(123),
+            github::issue(43),
+        ];
+        let (address, worker) = github::serve(replies);
+        let (_root, paths, shared, mut server, mut client) = setup(address);
+        let result = request(
+            &mut server,
+            &mut client,
+            &shared,
+            &paths,
+            "/repos/example/one/issues/42",
+        );
+        assert!(result.unwrap().contains("Actual fixture issue 43"));
+        assert!(shared.0.lock().unwrap().ui.is_none());
+        assert_eq!(worker.join().unwrap().len(), 4);
     }
 
     #[test]
@@ -708,7 +689,7 @@ mod github_tests {
         ] {
             let (address, worker) =
                 github::serve(vec![github::repository(123), github::redirect(target)]);
-            let (_root, paths, shared, mut server, mut client) = setup(address, 4);
+            let (_root, paths, shared, mut server, mut client) = setup(address);
             let result = request(
                 &mut server,
                 &mut client,
@@ -733,7 +714,7 @@ mod github_tests {
             for step in 0..redirects {
                 replies.push(github::repository(123));
                 replies.push(github::redirect(&format!(
-                    "https://api.github.com/repositories/123/issues/{}",
+                    "https://api.github.com/repos/example/one/issues/{}",
                     43 + step
                 )));
             }
@@ -742,7 +723,7 @@ mod github_tests {
                 replies.push(github::issue(45));
             }
             let (address, worker) = github::serve(replies);
-            let (_root, paths, shared, mut server, mut client) = setup(address, 10);
+            let (_root, paths, shared, mut server, mut client) = setup(address);
             let result = request(
                 &mut server,
                 &mut client,
@@ -760,15 +741,15 @@ mod github_tests {
     }
 
     #[test]
-    fn github_runtime_preserves_cursor_pagination_and_debits_each_page_without_a_frontend() {
-        let next = "https://api.github.com/repositories/123/issues?state=all&per_page=1&page=2&after=Y3Vyc29yOnYyOpLPAAABoNM-bZjPAAAAAUveKc4%3D";
+    fn github_runtime_preserves_cursor_pagination_without_a_frontend() {
+        let next = "https://api.github.com/repos/example/one/issues?state=all&per_page=1&page=2&after=Y3Vyc29yOnYyOpLPAAABoNM-bZjPAAAAAUveKc4%3D";
         let (address, worker) = github::serve(vec![
             github::repository(123),
             github::list_page(42, Some(next)),
             github::repository(123),
             github::list_page(43, None),
         ]);
-        let (_root, paths, shared, mut server, mut client) = setup(address, 2);
+        let (_root, paths, shared, mut server, mut client) = setup(address);
         let first = request(
             &mut server,
             &mut client,
@@ -794,17 +775,16 @@ mod github_tests {
         assert!(request(&mut server, &mut client, &shared, &paths, target).is_err());
         let requests = worker.join().unwrap();
         assert_eq!(requests.len(), 4);
-        assert!(requests[3].starts_with("GET /repositories/123/issues?state=all&per_page=1&page=2&after=Y3Vyc29yOnYyOpLPAAABoNM-bZjPAAAAAUveKc4%3D HTTP/1.1"));
+        assert!(requests[3].starts_with("GET /repos/example/one/issues?state=all&per_page=1&page=2&after=Y3Vyc29yOnYyOpLPAAABoNM-bZjPAAAAAUveKc4%3D HTTP/1.1"));
     }
 
     #[test]
-    fn github_runtime_repo_replacement_after_metadata_cannot_redirect_the_credential_or_issue_read()
-    {
+    fn github_runtime_named_repository_reads_preserve_the_path_after_metadata_changes() {
         let (address, worker) = github::serve(vec![
             github::repository(123),
             github::replaced_repository_issue(42),
         ]);
-        let (_root, paths, shared, mut server, mut client) = setup(address, 2);
+        let (_root, paths, shared, mut server, mut client) = setup(address);
         let response = request(
             &mut server,
             &mut client,
@@ -813,17 +793,19 @@ mod github_tests {
             "/repos/example/one/issues/42",
         )
         .unwrap();
-        assert!(response.contains("Original repository issue"));
-        assert!(!response.contains("Recreated repository issue"));
+        assert!(response.contains("Recreated repository issue"));
+        assert!(!response.contains("Original repository issue"));
         let requests = worker.join().unwrap();
-        assert!(requests[1].starts_with("GET /repositories/123/issues/42 HTTP/1.1"));
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /repos/example/one HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("GET /repos/example/one/issues/42 HTTP/1.1\r\n"));
     }
 
     #[test]
     fn github_runtime_a_nonreading_client_cannot_keep_a_response_worker_past_its_deadline() {
         let (address, upstream) =
             github::serve(vec![github::repository(123), github::large_issue(42)]);
-        let (_root, paths, shared, mut server, client) = setup(address, 2);
+        let (_root, paths, shared, mut server, client) = setup(address);
         let (id, principal, connector) = {
             let mut state = shared.0.lock().unwrap();
             state.refresh_policy(&paths.load_policy()).unwrap();
@@ -832,7 +814,7 @@ mod github_tests {
             let config = state.authorizer.github_configuration().unwrap();
             let request = http_request::read_configured(
                 &mut std::io::Cursor::new(
-                    "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+                    "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n",
                 ),
                 Some(config),
             )
@@ -945,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_or_exhausted_reads_require_fresh_approval_and_can_recover() {
+    fn expired_or_revoked_reads_require_fresh_approval_and_can_recover() {
         for expire in [false, true] {
             let (_root, paths, _key, mut state, _receive) = fixture();
             state.cancel_pending();
@@ -967,23 +949,7 @@ mod tests {
                     )
                     .unwrap();
             } else {
-                for _ in 0..99 {
-                    let AuthorizationOutcome::Allowed(permit) = state
-                        .authorizer
-                        .authorize(
-                            &principal,
-                            crate::owner::test_support::read_request(),
-                            Instant::now(),
-                        )
-                        .unwrap()
-                    else {
-                        panic!()
-                    };
-                    state
-                        .authorizer
-                        .admit(permit, &principal, Instant::now())
-                        .unwrap();
-                }
+                state.authorizer.revoke_read_grants().unwrap();
             }
             assert!(matches!(
                 state.authorize(
@@ -1044,7 +1010,6 @@ mod tests {
         assert_eq!(claims["purpose"], "quartermaster.issue-read-grant.v1");
         assert_eq!(claims["grant"]["codeHash"], "11".repeat(20));
         assert_eq!(claims["grant"]["role"], "github-write");
-        assert_eq!(claims["grant"]["budget"], 100);
         assert!(
             state
                 .authorizer
@@ -1644,7 +1609,7 @@ mod tests {
         let expires = (OffsetDateTime::now_utc() + Duration::from_secs(60)).unix_timestamp() as u64;
         state
             .authorizer
-            .seed_fixture_grants(&crate::owner::test_support::policy_bytes(expires, 2));
+            .seed_fixture_grants(&crate::owner::test_support::policy_bytes(expires));
         let principal = super::super::identity::VerifiedPrincipal::fixture(
             501,
             "11".repeat(20),
@@ -1679,7 +1644,7 @@ mod tests {
                     crate::owner::vault::Source::capture(&paths.root)
                         .map(|source| source.binding())
                 )
-                .is_err()
+                .is_ok()
         );
         assert!(state.ui.is_none());
         assert!(state.pending.is_none());
@@ -1727,7 +1692,7 @@ mod tests {
             .unwrap();
         state
             .authorizer
-            .seed_fixture_grants(&crate::owner::test_support::policy_bytes(expires, 2));
+            .seed_fixture_grants(&crate::owner::test_support::policy_bytes(expires));
         crate::owner::test_support::vault::install(
             &mut state.provider,
             crate::owner::test_support::vault::snapshot("github-read"),
@@ -1764,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn host_lock_and_wake_preserve_scoped_reads_cache_and_remaining_budget() {
+    fn host_lock_and_wake_preserve_scoped_reads_and_cache() {
         for event in [
             crate::platform::HostSessionEvent::Sleep,
             crate::platform::HostSessionEvent::Wake,
@@ -1781,8 +1746,7 @@ mod tests {
                 .try_into()
                 .unwrap();
             let mut policy: Value =
-                serde_json::from_slice(&crate::owner::test_support::policy_bytes(expires, 2))
-                    .unwrap();
+                serde_json::from_slice(&crate::owner::test_support::policy_bytes(expires)).unwrap();
             policy["grants"][0]["role"] = "github-write".into();
             state
                 .authorizer
@@ -1849,7 +1813,7 @@ mod tests {
                     crate::owner::vault::Source::capture(&paths.root)
                         .map(|source| source.binding())
                 ),
-                Ok(AuthorizationOutcome::RequireApproval(_))
+                Ok(AuthorizationOutcome::Allowed(_))
             ));
             assert!(
                 state
@@ -1859,7 +1823,7 @@ mod tests {
                         crate::owner::test_support::read_request(),
                         Instant::now()
                     )
-                    .is_err()
+                    .is_ok()
             );
         }
     }
@@ -1918,7 +1882,6 @@ mod tests {
                 .unwrap()
                 .as_secs()
                 + 60,
-            2,
         ))
         .unwrap();
         policy["grants"][0]["uid"] = json!(unsafe { libc::geteuid() });
@@ -1967,7 +1930,6 @@ mod tests {
                 .unwrap()
                 .as_secs()
                 + 60,
-            2,
         ))
         .unwrap();
         policy["grants"][0]["uid"] = json!(unsafe { libc::geteuid() });
@@ -2023,7 +1985,6 @@ mod tests {
                 .unwrap()
                 .as_secs()
                 + 60,
-            2,
         );
         state.authorizer.seed_fixture_grants(&policy);
         crate::owner::test_support::vault::install(
@@ -2094,7 +2055,6 @@ mod tests {
                 .unwrap()
                 .as_secs()
                 + 60,
-            2,
         ))
         .unwrap();
         policy["grants"][0]["role"] = "github-write".into();

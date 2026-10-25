@@ -61,7 +61,7 @@ public struct DialogRequest: Codable, Equatable {
     public let issue: UInt64?
     public let method: String
     public let path: String
-    public let body: String
+    public let body: String?
     public let processChain: [String]
     public var origin: String? = nil
     public var peer: DialogPeer? = nil
@@ -72,20 +72,30 @@ public struct ApprovalPresentation {
     let request: DialogRequest
     let provider: ApprovalProviderIdentity
     let readGrant: ReadGrantReview?
+    let apiRequest: APIRequestReview?
 
-    public init(request: DialogRequest, provider: ApprovalProviderIdentity, readGrant: ReadGrantReview?) {
+    public init(
+        request: DialogRequest, provider: ApprovalProviderIdentity, readGrant: ReadGrantReview?,
+        apiRequest: APIRequestReview? = nil
+    ) {
         self.request = request
         self.provider = provider
         self.readGrant = readGrant
+        self.apiRequest = apiRequest
     }
 
     var operationTitle: String {
-        readGrant == nil ? "Close issue #\(request.issue.map(String.init) ?? "?")" : "Allow issue reads"
+        if let api = apiRequest, readGrant == nil, api.complete, api.effects == ["Close issue"],
+            let issue = request.issue
+        {
+            return "Close issue #\(issue)"
+        }
+        return readGrant == nil ? "Approve one GitHub request" : "Allow issue reads"
     }
 
     var authenticationReason: String {
-        readGrant == nil
-            ? "approve closing issue \(request.issue.map(String.init) ?? "?") in \(request.repository)"
+        return readGrant == nil
+            ? "approve this GitHub request once"
             : "allow issue reads in \(request.repository)"
     }
 }
@@ -136,78 +146,100 @@ struct ApprovalDialogView: View {
     let presentation: ApprovalPresentation
     @ObservedObject var controller: ApprovalController
     let close: () -> Void
+    @State private var showsDetails = false
+    @State private var showsVault = false
+    @State private var showsHTTP = false
+    @State private var showsPeer = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 14) {
                 Image(systemName: "key.horizontal.fill")
-                    .font(.system(size: 27)).foregroundStyle(.white)
-                    .frame(width: 58, height: 58).background(.indigo, in: RoundedRectangle(cornerRadius: 14))
+                    .font(.system(size: 23)).foregroundStyle(.white)
+                    .frame(width: 48, height: 48).background(.indigo, in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Quartermaster").font(.headline).foregroundStyle(.secondary)
-                    Text("Approve this request").font(.title2.bold())
+                    Text(presentation.operationTitle).font(.title2.bold())
+                }
+                Spacer()
+                Text("[DEBUG BUILD. Insecure]")
+                    .font(.caption2.bold()).foregroundStyle(.yellow)
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(.red.opacity(0.3), in: RoundedRectangle(cornerRadius: 6))
+            }
+
+            if let peer = presentation.request.peer {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Command").font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: peer.commandLine ?? "Command arguments unavailable")
+                        .font(.system(.body, design: .monospaced)).textSelection(.enabled)
                 }
             }
 
-            VStack(alignment: .leading, spacing: 12) {
-                Text(presentation.operationTitle).font(.headline)
-                Text(presentation.request.repository).foregroundStyle(.secondary)
-                if let grant = presentation.readGrant {
-                    Text("List and read issues · up to \(grant.budget) requests")
-                    Text(grant.principalScope).font(.caption)
-                    if grant.isSimulation { Text("Simulation · no GitHub request").font(.caption) }
-                    Text("Until \(grant.expires.formatted(date: .omitted, time: .standard)) or backend restart")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                let provider = presentation.provider
-                Group {
-                    Text("\(provider.email) · \(provider.server)").font(.caption)
-                    DisclosureGroup("Vault selection") {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Account: \(provider.account)")
-                            Text("Item: \(provider.item)")
-                            Text("Login password · \(provider.role)")
-                            Text("Enrolment: \(provider.enrollment) · generation \(provider.generation)")
-                        }.font(.caption.monospaced()).textSelection(.enabled)
-                    }.font(.caption)
-                }
-                if let peer = presentation.request.peer {
-                    Text(peer.commandLine ?? "Command arguments unavailable")
-                        .font(.system(.caption, design: .monospaced)).lineLimit(3)
-                        .help(peer.commandLine ?? "Command arguments unavailable")
-                    DisclosureGroup("HTTP request") {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(
-                                "\(presentation.request.method) \(presentation.request.origin ?? "")\(presentation.request.path)"
-                            )
-                            Text(presentation.request.body)
-                        }.font(.caption.monospaced()).textSelection(.enabled)
-                    }.font(.caption)
-                    DisclosureGroup("Socket peer: PID \(peer.pid) · signature checked") {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(peer.executable)
-                            Text(
-                                "\(peer.signingIdentifier) · \(peer.adHoc ? "ad-hoc signature" : peer.teamIdentifier ?? "no Team ID")"
-                            )
-                            Text("CDHash: \(peer.cdHash)")
-                        }.font(.caption.monospaced()).textSelection(.enabled)
-                    }.font(.caption)
-                }
-                Divider()
-                Text("OBSERVED PROCESS CHAIN · CONTEXT ONLY")
-                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(Array(presentation.request.processChain.enumerated()), id: \.offset) { index, process in
-                    HStack(spacing: 8) {
-                        Image(systemName: index == 0 ? "terminal" : "arrow.turn.down.right").foregroundStyle(.secondary)
-                        Text(process).font(.system(.body, design: .monospaced)).lineLimit(1).help(process)
-                    }.padding(.leading, CGFloat(index) * 18)
-                }
-                Text(statusDetail)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(presentation.request.repository.isEmpty ? "Destination" : "Repository")
                     .font(.caption).foregroundStyle(.secondary)
-                    .lineLimit(1).help(statusDetail)
+                Text(
+                    presentation.request.repository.isEmpty
+                        ? presentation.request.origin ?? "" : presentation.request.repository
+                ).font(.headline)
+                if let grant = presentation.readGrant {
+                    Text("Until \(grant.expires.formatted(date: .omitted, time: .shortened)) or backend restart")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
             }
-            .padding(18).frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Process tree").font(.subheadline.weight(.semibold))
+                ForEach(Array(presentation.request.processChain.reversed().enumerated()), id: \.offset) {
+                    index, process in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: index == 0 ? "terminal" : "arrow.turn.down.right").foregroundStyle(.secondary)
+                        Text(verbatim: process).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                    }.padding(.leading, CGFloat(index) * 14)
+                }
+                Text("Observed process ancestry").font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let api = presentation.apiRequest, presentation.readGrant == nil {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("One request · no reusable access")
+                    Text(
+                        "Repository scope is unverified. This request may use the selected credential’s full upstream permissions."
+                    )
+                    .font(.caption)
+                    if !api.effects.isEmpty {
+                        Text("Recognized effects: \(api.effects.joined(separator: ", "))").font(.caption)
+                    }
+                    if !api.complete {
+                        Text("Some inputs are unfamiliar; the complete effects are unverified.").font(.caption)
+                    }
+                    ScrollView([.horizontal, .vertical]) {
+                        Text(verbatim: api.text).font(.caption.monospaced()).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(height: 180)
+                    Text(
+                        "Authentication is replaced with the selected credential. HTTP framing uses a fixed body length and closes the connection. Byte escapes are shown literally."
+                    )
+                    .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            DisclosureGroup("Details", isExpanded: $showsDetails) {
+                ViewThatFits(in: .vertical) {
+                    detailsContent
+                    ScrollView(.vertical) {
+                        detailsContent
+                    }.frame(height: 300)
+                }
+                .frame(maxHeight: 300)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !controller.detail.isEmpty {
+                Text(controller.detail).font(.caption).foregroundStyle(.secondary)
+            }
 
             HStack(spacing: 12) {
                 Button(controller.phase == .stopped ? "Close" : "Cancel") {
@@ -223,24 +255,59 @@ struct ApprovalDialogView: View {
         .onChange(of: controller.phase) { _, phase in
             if phase == .approved { close() }
         }
-        .padding(28).frame(width: 540)
+        .padding(24).frame(width: 540)
         .fixedSize(horizontal: false, vertical: true)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .overlay(alignment: .topTrailing) {
-            Text("[DEBUG BUILD. Insecure]")
-                .font(.caption.bold()).foregroundStyle(.yellow)
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(.red.opacity(0.3), in: RoundedRectangle(cornerRadius: 6))
-                .padding(28)
+        // AppKit resizes immediately, so disclosure layout must not animate independently.
+        .transaction { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
         }
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private var statusDetail: String {
-        if !controller.detail.isEmpty { return controller.detail }
-        if presentation.readGrant != nil {
-            return "Further permitted reads need no prompt while this grant remains valid."
+    private var detailsContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            let provider = presentation.provider
+            Group {
+                Text("\(provider.email) · \(provider.server)").font(.caption)
+                DisclosureGroup("Vault selection", isExpanded: $showsVault) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Account: \(provider.account)")
+                        Text("Item: \(provider.item)")
+                        Text("Login password · \(provider.role)")
+                        Text("Enrolment: \(provider.enrollment) · generation \(provider.generation)")
+                    }.font(.caption.monospaced()).textSelection(.enabled)
+                }.font(.caption)
+            }
+            if let peer = presentation.request.peer {
+                DisclosureGroup("HTTP request", isExpanded: $showsHTTP) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(
+                            "\(presentation.request.method) \(presentation.request.origin ?? "")\(presentation.request.path)"
+                        )
+                        if let api = presentation.apiRequest {
+                            ScrollView([.horizontal, .vertical]) {
+                                Text(verbatim: api.text)
+                            }.frame(height: 180)
+                        } else {
+                            Text(presentation.request.body ?? "")
+                        }
+                    }.font(.caption.monospaced()).textSelection(.enabled)
+                }.font(.caption)
+                DisclosureGroup(isExpanded: $showsPeer) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(peer.executable)
+                        Text(
+                            "\(peer.signingIdentifier) · \(peer.adHoc ? "ad-hoc signature" : peer.teamIdentifier ?? "no Team ID")"
+                        )
+                        Text("CDHash: \(peer.cdHash)")
+                    }.font(.caption.monospaced()).textSelection(.enabled)
+                } label: {
+                    Text(verbatim: "Socket peer: PID \(String(peer.pid)) · signature checked")
+                }.font(.caption)
+            }
         }
-        return "Local simulation — no GitHub action will run."
+        .padding(.top, 10).frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var authenticationTitle: String {

@@ -147,7 +147,6 @@ impl OwnerState {
             Err(
                 AuthorizationError::Denied
                 | AuthorizationError::Expired
-                | AuthorizationError::BudgetExhausted
                 | AuthorizationError::CredentialMismatch,
             ) if matches!(
                 request.action(),
@@ -380,7 +379,7 @@ mod tests {
                 .try_into()
                 .unwrap();
             let mut grants: serde_json::Value =
-                serde_json::from_slice(&test_support::policy_bytes(expires, 1)).unwrap();
+                serde_json::from_slice(&test_support::policy_bytes(expires)).unwrap();
             grants["grants"][0]["role"] = "github-write".into();
             state
                 .authorizer
@@ -427,7 +426,7 @@ mod tests {
                 state
                     .authorizer
                     .authorize(&principal, test_support::read_request(), Instant::now())
-                    .is_err()
+                    .is_ok()
             );
         }
     }

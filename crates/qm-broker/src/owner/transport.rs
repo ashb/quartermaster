@@ -33,26 +33,29 @@ pub(super) struct ReadRedirect {
 }
 
 impl OperationResponse {
-    pub(super) fn public_parts(&self) -> (&str, &str) {
+    pub(super) fn public_parts(&self) -> (String, &[u8]) {
         match self {
             Self::IssueOpen => (
-                "200 OK",
-                "{\"number\":42,\"state\":\"open\",\"quartermaster_local_simulation\":true}",
+                "200 OK".into(),
+                b"{\"number\":42,\"state\":\"open\",\"quartermaster_local_simulation\":true}",
             ),
             Self::IssueClosed => (
-                "200 OK",
-                "{\"number\":42,\"state\":\"closed\",\"quartermaster_local_simulation\":true}",
+                "200 OK".into(),
+                b"{\"number\":42,\"state\":\"closed\",\"quartermaster_local_simulation\":true}",
             ),
             Self::Denied => (
-                "403 Forbidden",
-                "{\"message\":\"Quartermaster denied this operation\"}",
+                "403 Forbidden".into(),
+                b"{\"message\":\"Quartermaster denied this operation\"}",
             ),
             Self::Uncertain => (
-                "502 Bad Gateway",
-                "{\"message\":\"The operation's result could not be confirmed\"}",
+                "502 Bad Gateway".into(),
+                b"{\"message\":\"The operation's result could not be confirmed\"}",
             ),
             Self::Github(response) => response.public_parts(),
-            Self::Redirect(_) => ("502 Bad Gateway", "{\"message\":\"Unresolved redirect\"}"),
+            Self::Redirect(_) => (
+                "502 Bad Gateway".into(),
+                b"{\"message\":\"Unresolved redirect\"}",
+            ),
         }
     }
 
@@ -133,7 +136,7 @@ impl ReadyHttp {
 }
 
 pub(super) fn reserve_socket(socket: &impl AsRawFd, maximum: usize) -> io::Result<()> {
-    let capacity: libc::c_int = 65536;
+    let capacity: libc::c_int = maximum.max(65536).try_into().map_err(|_| failure())?;
     let mut actual: libc::c_int = 0;
     let mut length = size_of_val(&actual) as libc::socklen_t;
     if unsafe {
@@ -162,7 +165,7 @@ pub(super) fn reserve_socket(socket: &impl AsRawFd, maximum: usize) -> io::Resul
         events: libc::POLLOUT,
         revents: 0,
     };
-    if actual < maximum as libc::c_int
+    if actual < libc::c_int::try_from(maximum).map_err(|_| failure())?
         || length as usize != size_of_val(&actual)
         || unsafe { libc::poll(&mut socket, 1, 0) } != 1
         || socket.revents != libc::POLLOUT
@@ -346,9 +349,10 @@ fn serve_dummy(stream: &mut UnixStream, state: &Mutex<DummyState>) -> io::Result
     let (status, body) = response.public_parts();
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    )
+    )?;
+    stream.write_all(body)
 }
 
 #[cfg(test)]

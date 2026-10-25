@@ -15,8 +15,7 @@
       "action": "issueReads",
       "repository": "quartermaster/demo",
       "role": "github-write",
-      "expiresUnix": 4600,
-      "budget": 100
+      "expiresUnix": 4600
     }
   }
 }

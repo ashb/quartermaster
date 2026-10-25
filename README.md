@@ -32,8 +32,12 @@ The tool talks directly to the service. QM controls whether it receives the cred
 
 Quartermaster is an early prototype. The development app can enrol a Vaultwarden
 account, unlock its encrypted cache with Touch ID, and mediate GitHub issue reads
-for configured repositories. Real writes, general REST/GraphQL forwarding and
-credential delivery through environment variables are not implemented yet.
+for configured repositories. The broker also supports one-use approval and
+request-preserving REST/GraphQL forwarding behind an explicit opt-in. That path
+has automated local TLS coverage; live-provider and hardware acceptance remain.
+Repository scope follows the requested name, as described in the
+[GitHub guide](docs/github.md#repository-identity). Credential delivery through
+environment variables is not implemented yet.
 
 ## Building and running
 

@@ -1,0 +1,13 @@
+{
+  "method": "POST",
+  "path": "/graphql?option=%2f",
+  "origin": "https://api.github.com",
+  "clientRequest": "UE9TVCAvZ3JhcGhxbD9vcHRpb249JTJmIEhUVFAvMS4xDQpIb3N0OiBhcGkuZ2l0aHViLmNvbQ0KWC1DdXN0b206IGZpcnN0DQp4LWN1c3RvbTogc2Vjb25kDQpBdXRob3JpemF0aW9uOiBjYWxsZXItcGxhY2Vob2xkZXINCkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vanNvbg0KQ29udGVudC1MZW5ndGg6IDU4DQoNCnsgInF1ZXJ5IjogInF1ZXJ5IHsgdmlld2VyIHsgbG9naW4gfSB9IiwgInZhcmlhYmxlcyI6IHt9IH0=",
+  "application": {
+    "version": "quartermaster.github-request.v1",
+    "request": "UE9TVCAvZ3JhcGhxbD9vcHRpb249JTJmIEhUVFAvMS4xDQpIb3N0OiBhcGkuZ2l0aHViLmNvbQ0KWC1DdXN0b206IGZpcnN0DQp4LWN1c3RvbTogc2Vjb25kDQpBdXRob3JpemF0aW9uOiBCZWFyZXIgPHNlbGVjdGVkIFF1YXJ0ZXJtYXN0ZXIgY3JlZGVudGlhbD4NCkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vanNvbg0KQ29udGVudC1MZW5ndGg6IDU4DQpDb25uZWN0aW9uOiBjbG9zZQ0KDQp7ICJxdWVyeSI6ICJxdWVyeSB7IHZpZXdlciB7IGxvZ2luIH0gfSIsICJ2YXJpYWJsZXMiOiB7fSB9",
+    "originalDigest": "tOyEdJSDgjip1kVKz0UZW10Jx0sI199T3o/5jtio7L0=",
+    "complete": false,
+    "effects": []
+  }
+}

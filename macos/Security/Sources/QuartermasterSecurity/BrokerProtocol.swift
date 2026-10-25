@@ -1,7 +1,7 @@
 import Dispatch
 import Foundation
 
-private let maximumBrokerPayload = 16384
+private let maximumBrokerPayload = BrokerLimits.payloadBytes
 
 public enum BrokerProtocolFailure: Error { case oversizedPayload }
 

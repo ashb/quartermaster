@@ -33,13 +33,19 @@ pub(super) struct GrantRule {
     role: String,
     #[serde(with = "time::serde::timestamp")]
     expires_unix: OffsetDateTime,
-    budget: Option<u32>,
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]
 pub(super) struct ReadGrantClaims {
     purpose: &'static str,
     grant: GrantRule,
+}
+
+impl ReadGrantClaims {
+    #[cfg(test)]
+    pub(super) fn role(&self) -> &str {
+        &self.grant.role
+    }
 }
 
 impl GrantRule {
@@ -56,7 +62,6 @@ impl GrantRule {
             || !super::github::configuration::valid_repository_name(&self.repository)
             || !matches!(self.role.as_str(), "github-read" | "github-write")
             || self.expires_unix <= OffsetDateTime::UNIX_EPOCH
-            || self.budget == Some(0)
         {
             return Err(AuthorizationError::InvalidPolicy);
         }
@@ -87,7 +92,6 @@ struct Grant {
     rule: GrantRule,
     expires: Instant,
     continuous_expiry: Deadline,
-    remaining: Option<u32>,
     credential: CredentialSelection,
 }
 
@@ -125,7 +129,6 @@ impl ReadGrantProposal {
                 repository: request.repository().to_owned(),
                 role: role.to_owned(),
                 expires_unix: OffsetDateTime::now_utc() + lifetime,
-                budget: Some(100),
             },
             expires: now
                 .checked_add(lifetime)
@@ -165,9 +168,6 @@ impl Grant {
         self.continuous_expiry
             .remaining()
             .map_err(|_| AuthorizationError::Expired)?;
-        if self.remaining == Some(0) {
-            return Err(AuthorizationError::BudgetExhausted);
-        }
         Ok(())
     }
 }
@@ -222,7 +222,6 @@ impl GrantTable {
                     .ok_or(AuthorizationError::InvalidPolicy)?;
                 let rule = rule.clone();
                 Ok(Grant {
-                    remaining: rule.budget,
                     credential: crate::owner::test_support::vault::selection(
                         &crate::owner::test_support::vault::snapshot(&rule.role),
                     ),
@@ -252,17 +251,13 @@ impl GrantTable {
         {
             return Err(AuthorizationError::Denied);
         }
-        let mut grant = Grant {
-            remaining: proposal.rule.budget,
+        let grant = Grant {
             rule: proposal.rule,
             expires: proposal.expires,
             continuous_expiry: proposal.continuous_expiry,
             credential: selection,
         };
         grant.check(now)?;
-        if let Some(remaining) = &mut grant.remaining {
-            *remaining -= 1;
-        }
         self.grants.push(grant);
         Ok(())
     }
@@ -315,27 +310,14 @@ impl GrantTable {
     }
 
     pub(super) fn consume(
-        &mut self,
+        &self,
         use_: GrantUse,
         principal: &VerifiedPrincipal,
         operation: &FrozenOperation,
         session: [u8; 16],
         now: Instant,
     ) -> Result<(), AuthorizationError> {
-        let grant = self
-            .grants
-            .iter_mut()
-            .find(|grant| {
-                grant.rule.id == use_.id
-                    && grant.rule.role == use_.role
-                    && grant.rule.matches(principal, operation, session)
-            })
-            .ok_or(AuthorizationError::Denied)?;
-        grant.check(now)?;
-        if let Some(remaining) = &mut grant.remaining {
-            *remaining -= 1;
-        }
-        Ok(())
+        self.check(&use_, principal, operation, session, now)
     }
 
     pub(super) fn deadline(
@@ -374,7 +356,7 @@ mod tests {
         let mut owner = Authorizer::new([1; 16]);
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1000),
                 now,
             )
@@ -386,7 +368,7 @@ mod tests {
     fn issuance_capacity_counts_only_usable_grants() {
         let principal = crate::owner::test_support::principal([1; 16]);
         let snapshot = crate::owner::test_support::vault::snapshot("github-read");
-        for exhaust in [false, true] {
+        for expired_uptime in [false, true] {
             let mut grants = super::GrantTable::default();
             for _ in 0..65 {
                 let proposal =
@@ -400,8 +382,8 @@ mod tests {
                     )
                     .unwrap();
                 let latest = grants.grants.last_mut().unwrap();
-                if exhaust {
-                    latest.remaining = Some(0);
+                if expired_uptime {
+                    latest.expires = Instant::now();
                 } else {
                     latest.continuous_expiry =
                         crate::owner::deadline::Deadline::after(Duration::ZERO).unwrap();
@@ -412,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn issuance_debits_the_initiating_read_and_rejects_overflow_without_removing_live_grants() {
+    fn issuance_rejects_overflow_without_removing_live_grants() {
         let principal = crate::owner::test_support::principal([1; 16]);
         let snapshot = crate::owner::test_support::vault::snapshot("github-read");
         let mut grants = super::GrantTable::default();
@@ -437,12 +419,6 @@ mod tests {
                 .is_err()
         );
         assert_eq!(grants.grants.len(), 64);
-        assert!(
-            grants
-                .grants
-                .iter()
-                .all(|grant| grant.remaining == Some(99))
-        );
     }
 
     #[test]
@@ -458,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_and_unchanged_policy_reload_do_not_extend_grant_expiry_or_budget() {
+    fn activity_and_unchanged_policy_reload_do_not_extend_grant_expiry() {
         let (mut owner, now) = setup();
         let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
         let AuthorizationOutcome::Allowed(permit) = owner
@@ -472,7 +448,7 @@ mod tests {
             .unwrap();
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1009),
                 now + Duration::from_secs(9),
             )
@@ -486,10 +462,11 @@ mod tests {
         owner
             .admit(permit, &principal, now + Duration::from_secs(9))
             .unwrap();
-        assert!(matches!(
-            owner.authorize(&principal, read_request(), now + Duration::from_secs(9)),
-            Err(AuthorizationError::BudgetExhausted)
-        ));
+        assert!(
+            owner
+                .authorize(&principal, read_request(), now + Duration::from_secs(9))
+                .is_ok()
+        );
 
         assert!(matches!(
             owner.authorize(&principal, read_request(), now + Duration::from_secs(10)),
@@ -503,7 +480,7 @@ mod tests {
         let mut owner = Authorizer::new([1; 16]);
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1009) + Duration::from_millis(500),
                 now,
             )
@@ -567,7 +544,7 @@ mod tests {
         assert!(
             !owner
                 .install(
-                    FixturePolicy::decode(&policy_bytes(1010, 2)),
+                    FixturePolicy::decode(&policy_bytes(1010)),
                     crate::owner::test_support::wall(1011),
                     now
                 )
@@ -582,7 +559,7 @@ mod tests {
     #[test]
     fn continuous_expiry_rejects_a_read_even_if_uptime_and_wall_clock_have_not_advanced() {
         let now = Instant::now();
-        let document: serde_json::Value = serde_json::from_slice(&policy_bytes(1010, 2)).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&policy_bytes(1010)).unwrap();
         let rule = serde_json::from_value(document["grants"][0].clone()).unwrap();
         let mut grants = super::GrantTable::new(
             &[rule],
@@ -614,7 +591,7 @@ mod tests {
      {
         let now = Instant::now();
         let anchor = crate::owner::deadline::continuous_now().unwrap();
-        let document: serde_json::Value = serde_json::from_slice(&policy_bytes(1010, 2)).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&policy_bytes(1010)).unwrap();
         let rule = serde_json::from_value(document["grants"][0].clone()).unwrap();
         let mut grants =
             super::GrantTable::new(&[rule], crate::owner::test_support::wall(1000), now, anchor)
@@ -653,7 +630,7 @@ mod tests {
         let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1005),
                 now,
             )
@@ -673,7 +650,7 @@ mod tests {
         ));
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(990),
                 now + Duration::from_secs(1),
             )
@@ -698,8 +675,7 @@ mod tests {
     }
 
     fn github_policy(id: u64) -> FixturePolicy {
-        let mut document: serde_json::Value =
-            serde_json::from_slice(&policy_bytes(1010, 2)).unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&policy_bytes(1010)).unwrap();
         document["grants"][0]["repository"] = "example/one".into();
         let mut list = document["grants"][0].clone();
         list["id"] = "22222222222222222222222222222222".into();
@@ -716,7 +692,7 @@ mod tests {
     ) -> crate::owner::request::FrozenOperation {
         crate::owner::request::read_configured(
             &mut std::io::Cursor::new(format!(
-                "GET {path} HTTP/1.1\r\nHost: api.github.com\r\n\r\n"
+                "GET {path} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
             )),
             Some(config),
         )
@@ -748,10 +724,11 @@ mod tests {
                 };
                 owner.admit(permit, &principal, now).unwrap();
             }
-            assert!(matches!(
-                owner.authorize(&principal, github_read(&github_config(123), path), now),
-                Err(AuthorizationError::BudgetExhausted)
-            ));
+            assert!(
+                owner
+                    .authorize(&principal, github_read(&github_config(123), path), now)
+                    .is_ok()
+            );
         }
         assert!(matches!(
             owner.authorize(
@@ -786,8 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn github_grants_keep_budget_and_expiry_on_reload_and_revoke_old_permits_on_change_and_revert()
-    {
+    fn github_grants_keep_expiry_on_reload_and_revoke_old_permits_on_change_and_revert() {
         let now = Instant::now();
         let mut owner = Authorizer::new([1; 16]);
         let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
@@ -823,10 +799,11 @@ mod tests {
         owner
             .admit(second, &principal, now + Duration::from_secs(9))
             .unwrap();
-        assert!(matches!(
-            owner.authorize(&principal, request(), now + Duration::from_secs(9)),
-            Err(AuthorizationError::BudgetExhausted)
-        ));
+        assert!(
+            owner
+                .authorize(&principal, request(), now + Duration::from_secs(9))
+                .is_ok()
+        );
         assert!(matches!(
             owner.authorize(&principal, request(), now + Duration::from_secs(10)),
             Err(AuthorizationError::Expired)

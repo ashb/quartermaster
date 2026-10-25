@@ -111,7 +111,7 @@ pub(crate) fn write_at(
     (id, session)
 }
 
-fn sign(
+pub(crate) fn sign(
     registry: &mut OperationRegistry,
     authorizer: &Authorizer,
     principal: &VerifiedPrincipal,
@@ -120,7 +120,11 @@ fn sign(
     created: Instant,
     proof_delay: Duration,
 ) -> (OperationId, ApprovalSession, EcdsaKeyPair, [u8; 32]) {
-    let document = review(requirement.request().clone(), requirement.grant_claims());
+    let document = selected_review(
+        requirement.request().clone(),
+        requirement.grant_claims(),
+        snapshot.binding().role(),
+    );
     let request_digest = ring::digest::digest(&ring::digest::SHA256, document.bytes())
         .as_ref()
         .try_into()
@@ -157,10 +161,37 @@ fn sign(
     (id, session, key, request_digest)
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct TestReviewContext {
+    role: String,
+}
+
+impl crate::owner::review::CredentialContext for TestReviewContext {
+    fn credential_role(&self) -> &str {
+        &self.role
+    }
+}
+
+pub(crate) fn selected_review(
+    request: crate::owner::request::FrozenOperation,
+    claims: Option<crate::owner::grant::ReadGrantClaims>,
+    role: &str,
+) -> crate::owner::review::ReviewDocument<TestReviewContext> {
+    crate::owner::review::ReviewDocument::new(
+        request,
+        claims,
+        TestReviewContext { role: role.into() },
+    )
+    .unwrap()
+}
+
 pub(crate) fn review(
     request: crate::owner::request::FrozenOperation,
     claims: Option<crate::owner::grant::ReadGrantClaims>,
-) -> crate::owner::review::ReviewDocument<std::collections::BTreeMap<String, String>> {
-    crate::owner::review::ReviewDocument::new(request, claims, std::collections::BTreeMap::new())
-        .unwrap()
+) -> crate::owner::review::ReviewDocument<TestReviewContext> {
+    let role = claims
+        .as_ref()
+        .map_or_else(|| request.role(), |claims| claims.role())
+        .to_owned();
+    selected_review(request, claims, &role)
 }

@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+use qm_api_github::{
+    Analysis, EffectKind, Pattern, PatternSet, Predicate, Repository as ApiRepository,
+};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
@@ -26,6 +29,8 @@ pub(in crate::owner) struct GitHubConfig {
     version: u8,
     mode: Mode,
     repositories: Vec<Repository>,
+    #[serde(rename = "approveUnverifiedRequests")]
+    approve_unverified_requests: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,12 +47,15 @@ impl GitHubConfig {
             version: u8,
             mode: Mode,
             repositories: Vec<Repository>,
+            #[serde(default, rename = "approveUnverifiedRequests")]
+            approve_unverified_requests: bool,
         }
         let document: Document = serde_json::from_slice(bytes).map_err(|_| Error)?;
         let mut config = Self {
             version: document.version,
             mode: document.mode,
             repositories: document.repositories,
+            approve_unverified_requests: document.approve_unverified_requests,
         };
         if config.version != 1 || config.repositories.len() > 64 {
             return Err(Error);
@@ -76,6 +84,42 @@ impl GitHubConfig {
 
     pub(in crate::owner) fn mode(&self) -> Mode {
         self.mode
+    }
+
+    pub(in crate::owner) fn approves_unverified_requests(&self) -> bool {
+        self.approve_unverified_requests
+    }
+
+    pub(in crate::owner) fn read_patterns(&self) -> PatternSet {
+        PatternSet::new(
+            self.repositories
+                .iter()
+                .map(|repository| Pattern {
+                    id: repository.read_pattern_id(),
+                    predicates: vec![
+                        Predicate::Method("GET".into()),
+                        Predicate::OnlyEffects(vec![EffectKind::ListIssues, EffectKind::ReadIssue]),
+                        Predicate::AllResourcesInRepository(ApiRepository {
+                            owner: repository.owner.clone(),
+                            name: repository.name.clone(),
+                        }),
+                    ],
+                })
+                .collect(),
+        )
+        .expect("validated repository IDs yield unique nonempty patterns")
+    }
+
+    pub(in crate::owner) fn matched_read_repository(
+        &self,
+        analysis: &Analysis,
+    ) -> Option<&Repository> {
+        self.repositories.iter().find(|repository| {
+            analysis
+                .matches
+                .iter()
+                .any(|matched| matched.complete && matched.id == repository.read_pattern_id())
+        })
     }
 
     pub(in crate::owner) fn repository(&self, owner: &str, name: &str) -> Option<&Repository> {
@@ -116,6 +160,9 @@ pub(in crate::owner) fn valid_repository_name(value: &str) -> bool {
 }
 
 impl Repository {
+    fn read_pattern_id(&self) -> String {
+        format!("issue-reads:{}", self.id)
+    }
     pub(in crate::owner) fn id(&self) -> NonZeroU64 {
         self.id
     }

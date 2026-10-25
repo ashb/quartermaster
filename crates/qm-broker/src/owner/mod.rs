@@ -98,7 +98,7 @@ mod test_support {
     pub(crate) mod github;
     pub(crate) mod vault;
 
-    pub(crate) fn policy_bytes(expires: u64, budget: u32) -> Vec<u8> {
+    pub(crate) fn policy_bytes(expires: u64) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "version": 1,
             "writes": "allow",
@@ -109,8 +109,7 @@ mod test_support {
                 "action": "readIssue",
                 "repository": "quartermaster/demo",
                 "role": "github-read",
-                "expiresUnix": expires,
-                "budget": budget
+                "expiresUnix": expires
             }]
         }))
         .unwrap()

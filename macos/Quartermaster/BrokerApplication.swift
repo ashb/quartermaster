@@ -102,7 +102,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, NSMenuItemValida
                                 continue
                             }
                             let presentation = ApprovalPresentation(
-                                request: pending.request, provider: pending.provider, readGrant: pending.readGrant)
+                                request: pending.request, provider: pending.provider, readGrant: pending.readGrant,
+                                apiRequest: pending.apiRequest)
                             let dialog = ApprovalDialog(presentation: presentation, backend: pending)
                             dialog.onClose = { [weak self] in
                                 self?.active = nil

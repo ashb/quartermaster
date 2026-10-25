@@ -23,7 +23,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const FRAME_LIMIT: usize = 32768;
+const APPLICATION_LIMIT: usize = 256 * 1024;
+const FRAME_LIMIT: usize = APPLICATION_LIMIT + 16 * 1024;
 static RESOLVING: AtomicUsize = AtomicUsize::new(0);
 
 fn unavailable() -> io::Error {
@@ -221,7 +222,7 @@ impl ReadyGitHub {
             return Err(unavailable());
         }
         socket.set_nonblocking(true)?;
-        reserve_socket(&socket, FRAME_LIMIT)?;
+        reserve_socket(&socket, 32 * 1024)?;
         remaining(deadline)?;
         Ok(Self {
             socket,
@@ -231,7 +232,7 @@ impl ReadyGitHub {
     }
 
     fn encrypt(&mut self, bytes: &[u8]) -> io::Result<Records> {
-        if bytes.len() > 8192 {
+        if bytes.len() > APPLICATION_LIMIT {
             return Err(unavailable());
         }
         remaining(self.deadline)?;
@@ -246,6 +247,7 @@ impl ReadyGitHub {
         if records.is_empty() {
             return Err(unavailable());
         }
+        reserve_socket(&self.socket, records.len())?;
         let digest = digest(&SHA256, &records).as_ref().try_into().unwrap();
         Ok(Records {
             bytes: records,
@@ -350,7 +352,7 @@ impl InFlightMetadata {
             deadline: self.ready.deadline,
         };
         let mut stream = rustls::Stream::new(&mut self.ready.tls, &mut connection);
-        let wire = response::read(&mut stream).map_err(|_| MetadataFailure::Invalid)?;
+        let wire = response::read(&mut stream, "GET").map_err(|_| MetadataFailure::Invalid)?;
         remaining(self.ready.deadline).map_err(|_| MetadataFailure::Invalid)?;
         let result = RepositoryBinding::from_authenticated(AuthenticatedMetadata {
             request: self.request,
@@ -370,15 +372,16 @@ impl InFlightGitHub {
                 deadline: self.ready.deadline,
             };
             let mut stream = rustls::Stream::new(&mut self.ready.tls, &mut connection);
-            let wire = response::read(&mut stream).map_err(|_| unavailable())?;
+            let wire =
+                response::read(&mut stream, self.request.method()).map_err(|_| unavailable())?;
             remaining(self.ready.deadline)?;
-            let response = wire
-                .issues(
-                    &self.request,
-                    self.prepared.repository(),
-                    self.prepared.credential(),
-                )
-                .map_err(|_| unavailable())?;
+            let response = match self.prepared.repository() {
+                Some(repository) => {
+                    wire.issues(&self.request, repository, self.prepared.credential())
+                }
+                None => wire.application(self.prepared.credential()),
+            }
+            .map_err(|_| unavailable())?;
             remaining(self.ready.deadline)?;
             Ok::<_, io::Error>(response)
         })();
@@ -473,6 +476,24 @@ mod tests {
         mpsc::Sender<()>,
         thread::JoinHandle<Vec<u8>>,
     ) {
+        let body = metadata_id.map(|id| format!("{{\"id\":{id},\"full_name\":\"example/one\"}}")).unwrap_or_else(|| r#"{"number":42,"state":"open","url":"https://api.github.com/repos/example/one/issues/42","repository_url":"https://api.github.com/repos/example/one","title":"Actual fixture response"}"#.to_owned());
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body.as_bytes());
+        peer_reply(stall, response)
+    }
+
+    fn peer_reply(
+        stall: bool,
+        response: Vec<u8>,
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::Sender<()>,
+        thread::JoinHandle<Vec<u8>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (resume, receive) = mpsc::channel();
@@ -504,22 +525,39 @@ mod tests {
             .unwrap();
             let mut tls = ServerConnection::new(Arc::new(config)).unwrap();
             let mut input = Vec::new();
-            let mut stream = rustls::Stream::new(&mut tls, &mut socket);
-            while !input.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                match stream.read(&mut byte) {
-                    Ok(1) => input.push(byte[0]),
-                    _ => return input,
+            {
+                let mut stream = rustls::Stream::new(&mut tls, &mut socket);
+                while !input.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    match stream.read(&mut byte) {
+                        Ok(1) => input.push(byte[0]),
+                        _ => return input,
+                    }
+                }
+                let mut headers = [httparse::EMPTY_HEADER; 64];
+                let mut head = httparse::Request::new(&mut headers);
+                head.parse(&input).unwrap();
+                let count = head
+                    .headers
+                    .iter()
+                    .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                    .map_or(0, |header| {
+                        std::str::from_utf8(header.value)
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap()
+                    });
+                let offset = input.len();
+                input.resize(offset + count, 0);
+                stream.read_exact(&mut input[offset..]).unwrap();
+                stream.write_all(&response).unwrap();
+            }
+            tls.send_close_notify();
+            while tls.wants_write() {
+                if tls.write_tls(&mut socket).is_err() {
+                    break;
                 }
             }
-            let body = metadata_id.map(|id| format!("{{\"id\":{id},\"full_name\":\"example/one\"}}")).unwrap_or_else(|| r#"{"number":42,"state":"open","url":"https://api.github.com/repos/example/one/issues/42","repository_url":"https://api.github.com/repos/example/one","title":"Actual fixture response"}"#.to_owned());
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            stream.write_all(body.as_bytes()).unwrap();
             input
         });
         (address, resume, worker)
@@ -542,9 +580,9 @@ mod tests {
                 Duration::ZERO
             };
         let config = GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}]}"#).unwrap();
-        let request = request::read_configured(&mut Cursor::new("GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer untrusted-caller-token\r\nCookie: forbidden\r\n\r\n"), Some(&config)).unwrap();
+        let request = request::read_configured(&mut Cursor::new("GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nAuthorization: Bearer untrusted-caller-token\r\n\r\n"), Some(&config)).unwrap();
         let mut document: serde_json::Value =
-            serde_json::from_slice(&test_support::policy_bytes(1010, 1)).unwrap();
+            serde_json::from_slice(&test_support::policy_bytes(1010)).unwrap();
         document["grants"][0]["repository"] = "example/one".into();
         let mut authorizer = Authorizer::new([1; 16]);
         authorizer
@@ -591,6 +629,314 @@ mod tests {
     }
 
     #[test]
+    fn cookie_bearing_requests_cannot_reuse_the_scoped_read_grant() {
+        let (authorizer, principal, _registry, _id, _snapshot, _prepared) = prepared(false);
+        let config = authorizer.github_configuration().unwrap();
+        let request = request::read_configured(&mut Cursor::new(
+            "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nCookie: forbidden\r\n\r\n"
+        ), Some(config)).unwrap();
+        assert_eq!(request.action(), request::Action::Api);
+        assert!(matches!(
+            authorizer.authorize(&principal, request, Instant::now()),
+            Err(crate::owner::policy::AuthorizationError::Denied)
+        ));
+    }
+
+    struct ApprovedApi {
+        authorizer: Authorizer,
+        principal: VerifiedPrincipal,
+        registry: OperationRegistry,
+        id: crate::owner::operation::OperationId,
+        snapshot: qm_providers::VaultSnapshot,
+        prepared: crate::owner::dispatch::PreparedGitHubRequest,
+        session: qm_providers::ApprovalSession,
+        original: crate::owner::request::FrozenOperation,
+    }
+
+    impl ApprovedApi {
+        fn new(raw: &str) -> Self {
+            Self::with_role(raw, "github-write")
+        }
+
+        fn with_role(raw: &str, role: &str) -> Self {
+            let config = GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true}"#).unwrap();
+            let request = request::read_configured(&mut Cursor::new(raw), Some(&config)).unwrap();
+            let mut authorizer = Authorizer::new([1; 16]);
+            authorizer
+                .install(
+                    Ok(FixturePolicy::default().with_github(config)),
+                    test_support::wall(1000),
+                    Instant::now(),
+                )
+                .unwrap();
+            let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
+            let snapshot = vault::snapshot(role);
+            let crate::owner::policy::AuthorizationOutcome::RequireApproval(requirement) =
+                authorizer
+                    .authorize(&principal, request.clone(), Instant::now())
+                    .unwrap()
+            else {
+                panic!()
+            };
+            assert!(requirement.grant_claims().is_none());
+            let mut registry = OperationRegistry::default();
+            let (id, session, _key, _digest) = test_support::approval::sign(
+                &mut registry,
+                &authorizer,
+                &principal,
+                &snapshot,
+                requirement,
+                Instant::now(),
+                Duration::ZERO,
+            );
+            let prepared = crate::owner::execution::prepare_unscoped_github(
+                &registry,
+                id,
+                &principal,
+                &authorizer,
+                &snapshot,
+                Instant::now(),
+            )
+            .unwrap();
+            Self {
+                authorizer,
+                principal,
+                registry,
+                id,
+                snapshot,
+                prepared,
+                session,
+                original: request,
+            }
+        }
+    }
+
+    #[test]
+    fn one_use_api_approval_uses_the_host_selected_read_or_write_credential_role() {
+        for role in ["github-read", "github-write"] {
+            let mut fixture = ApprovedApi::with_role(
+                "GET /future-api HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+                role,
+            );
+            assert_eq!(fixture.prepared.selection().role(), role);
+            let (address, _, worker) = peer(false);
+            let transport = ReadyGitHub::connect_to(
+                address,
+                client_config(true),
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+            )
+            .unwrap();
+            let operation = PreparedOperation::github(fixture.prepared, transport).unwrap();
+            assert!(matches!(
+                operation
+                    .handoff(
+                        &mut fixture.registry,
+                        &mut fixture.authorizer,
+                        &fixture.principal,
+                        &fixture.snapshot
+                    )
+                    .unwrap()
+                    .response(),
+                OperationResponse::Github(_)
+            ));
+            assert!(
+                worker
+                    .join()
+                    .unwrap()
+                    .starts_with(b"GET /future-api HTTP/1.1\r\n")
+            );
+        }
+    }
+
+    #[test]
+    fn one_use_api_responses_preserve_bodyless_text_and_binary_http_semantics_over_tls() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"\x00\xff\r\n").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut gzip_reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", compressed.len()).into_bytes();
+        gzip_reply.extend_from_slice(&compressed);
+        for (method, upstream, framing, expected) in [
+            ("HEAD", b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 41\r\n\r\n".as_slice(), Some("Content-Length: 41\r\n"), b"".as_slice()),
+            ("DELETE", b"HTTP/1.1 204 No Content\r\n\r\n".as_slice(), None, b"".as_slice()),
+            ("GET", b"HTTP/1.1 304 Not Modified\r\nContent-Length: 41\r\n\r\n".as_slice(), Some("Content-Length: 41\r\n"), b"".as_slice()),
+            ("GET", b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nhi!".as_slice(), Some("Content-Type: text/plain\r\n"), b"hi!".as_slice()),
+            ("GET", b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\n\r\n\x00\xff\r\n".as_slice(), Some("Content-Type: application/octet-stream\r\n"), b"\x00\xff\r\n".as_slice()),
+            ("GET", gzip_reply.as_slice(), Some("Content-Type: application/octet-stream\r\n"), b"\x00\xff\r\n".as_slice()),
+            ("GET", b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nuntil-close".as_slice(), Some("Content-Type: text/plain\r\n"), b"until-close".as_slice()),
+            ("HEAD", b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nContent-Length: 4194304\r\n\r\n".as_slice(), Some("Content-Length: 4194304\r\n"), b"".as_slice()),
+        ] {
+            let mut fixture = ApprovedApi::with_role(&format!("{method} /future-api HTTP/1.1\r\nHost: api.github.com\r\n\r\n"), "github-read");
+            let (address, _, worker) = peer_reply(false, upstream.to_vec());
+            let transport = ReadyGitHub::connect_to(address, client_config(true), Deadline::after(Duration::from_secs(3)).unwrap()).unwrap();
+            let outcome = PreparedOperation::github(fixture.prepared, transport).unwrap().handoff(&mut fixture.registry, &mut fixture.authorizer, &fixture.principal, &fixture.snapshot).unwrap().response();
+            let OperationResponse::Github(response) = outcome else { panic!("{method}: valid response became uncertain") };
+            let mut forwarded = Vec::new();
+            response.write(&mut forwarded).unwrap();
+            let boundary = forwarded.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
+            assert_eq!(&forwarded[boundary..], expected);
+            let head = std::str::from_utf8(&forwarded[..boundary]).unwrap();
+            if let Some(framing) = framing { assert!(head.contains(framing), "{head}"); }
+            else { assert!(!head.contains("Content-Length:"), "{head}"); }
+            assert!(worker.join().unwrap().starts_with(format!("{method} /future-api HTTP/1.1\r\n").as_bytes()));
+        }
+    }
+
+    #[test]
+    fn one_use_approval_forwards_original_rest_and_graphql_bodies_and_cookie_headers_over_tls() {
+        for target in ["/graphql", "/an-unfamiliar-endpoint?x=%2f&x=2"] {
+            let body = r#"{ "query": "query { viewer { login } }", "variables": {} }"#;
+            let raw = format!(
+                "POST {target} HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: caller-placeholder\r\nCookie: explicitly-reviewed\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut fixture = ApprovedApi::new(&raw);
+            let (address, _, worker) = peer(false);
+            let transport = ReadyGitHub::connect_to(
+                address,
+                client_config(true),
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+            )
+            .unwrap();
+            let receipt = PreparedOperation::github(fixture.prepared, transport)
+                .unwrap()
+                .handoff(
+                    &mut fixture.registry,
+                    &mut fixture.authorizer,
+                    &fixture.principal,
+                    &fixture.snapshot,
+                )
+                .unwrap();
+            assert!(matches!(receipt.response(), OperationResponse::Github(_)));
+            let actual = worker.join().unwrap();
+            let expected = raw
+                .replace(
+                    "Authorization: caller-placeholder",
+                    "Authorization: Bearer quartermaster-dummy-canary",
+                )
+                .replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n");
+            assert_eq!(actual, expected.as_bytes());
+            assert!(
+                crate::owner::execution::prepare_unscoped_github(
+                    &fixture.registry,
+                    fixture.id,
+                    &fixture.principal,
+                    &fixture.authorizer,
+                    &fixture.snapshot,
+                    Instant::now()
+                )
+                .is_err()
+            );
+            assert!(matches!(
+                fixture
+                    .authorizer
+                    .authorize(&fixture.principal, fixture.original, Instant::now())
+                    .unwrap(),
+                crate::owner::policy::AuthorizationOutcome::RequireApproval(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn canceled_or_stale_one_use_approvals_send_zero_application_bytes_over_tls() {
+        for failure in [
+            "cancel",
+            "ui-loss",
+            "policy-reversion",
+            "credential-replacement",
+        ] {
+            let mut fixture =
+                ApprovedApi::new("GET /future-api HTTP/1.1\r\nHost: api.github.com\r\n\r\n");
+            let (address, _, worker) = peer(false);
+            let transport = ReadyGitHub::connect_to(
+                address,
+                client_config(true),
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+            )
+            .unwrap();
+            let prepared = PreparedOperation::github(fixture.prepared, transport).unwrap();
+            match failure {
+                "cancel" => {
+                    assert_eq!(
+                        fixture.registry.cancel(fixture.id, &fixture.principal),
+                        CancellationResult::Canceled
+                    );
+                }
+                "ui-loss" => fixture
+                    .registry
+                    .cancel_interactive_session(fixture.session.id()),
+                "policy-reversion" => {
+                    let config = fixture.authorizer.github_configuration().unwrap().clone();
+                    fixture.authorizer.invalidate_policy().unwrap();
+                    fixture
+                        .authorizer
+                        .install(
+                            Ok(FixturePolicy::default().with_github(config)),
+                            test_support::wall(1000),
+                            Instant::now(),
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    fixture.snapshot = vault::snapshot_with(
+                        "github-write",
+                        "33333333-3333-4333-8333-333333333333",
+                        [4; 16],
+                    )
+                }
+            }
+            assert!(
+                prepared
+                    .handoff(
+                        &mut fixture.registry,
+                        &mut fixture.authorizer,
+                        &fixture.principal,
+                        &fixture.snapshot
+                    )
+                    .is_err(),
+                "{failure}"
+            );
+            assert!(worker.join().unwrap().is_empty(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn a_large_graphql_request_is_reviewed_and_forwarded_without_truncation() {
+        let body = serde_json::json!({"query":"query { viewer { login } }", "variables":{"padding":"x".repeat(100_000)}}).to_string();
+        let raw = format!(
+            "POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: caller-placeholder\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut fixture = ApprovedApi::new(&raw);
+        let (address, _, worker) = peer(false);
+        let transport = ReadyGitHub::connect_to(
+            address,
+            client_config(true),
+            Deadline::after(Duration::from_secs(3)).unwrap(),
+        )
+        .unwrap();
+        let operation = PreparedOperation::github(fixture.prepared, transport).unwrap();
+        assert!(matches!(
+            operation
+                .handoff(
+                    &mut fixture.registry,
+                    &mut fixture.authorizer,
+                    &fixture.principal,
+                    &fixture.snapshot
+                )
+                .unwrap()
+                .response(),
+            OperationResponse::Github(_)
+        ));
+        let expected = raw
+            .replace(
+                "Authorization: caller-placeholder",
+                "Authorization: Bearer quartermaster-dummy-canary",
+            )
+            .replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n");
+        assert_eq!(worker.join().unwrap(), expected.as_bytes());
+    }
+
+    #[test]
     fn github_https_stages_an_immutable_encrypted_request_and_sends_once_only_after_admission() {
         let (mut authorizer, principal, mut registry, _id, snapshot, request) = prepared(false);
         let (address, _, worker) = peer(false);
@@ -608,7 +954,7 @@ mod tests {
         let input = String::from_utf8(worker.join().unwrap()).unwrap();
         assert!(
             input.starts_with(
-                "GET /repositories/123/issues/42 HTTP/1.1\r\nHost: api.github.com\r\n"
+                "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n"
             )
         );
         assert_eq!(
@@ -617,13 +963,13 @@ mod tests {
                 .count(),
             1
         );
-        assert!(input.contains("X-GitHub-Api-Version: 2026-03-10\r\n"));
+        assert!(input.contains("X-GitHub-Api-Version: 2022-11-28\r\n"));
         assert!(!input.contains("untrusted-caller-token"));
         assert!(!input.contains("Cookie:"));
         let config = authorizer.github_configuration().unwrap();
         let request = request::read_configured(
             &mut Cursor::new(
-                "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+                "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n",
             ),
             Some(config),
         )
@@ -631,7 +977,7 @@ mod tests {
         assert!(
             authorizer
                 .authorize(&principal, request, Instant::now())
-                .is_err()
+                .is_ok()
         );
     }
 
@@ -696,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn github_https_tampered_encrypted_records_send_nothing_without_spending_the_read_budget() {
+    fn github_https_tampered_encrypted_records_send_nothing_and_preserve_read_access() {
         let (mut authorizer, principal, mut registry, id, snapshot, request) = prepared(false);
         let (address, _, worker) = peer(false);
         let transport = ReadyGitHub::connect_to(
@@ -720,7 +1066,7 @@ mod tests {
         );
         let request = request::read_configured(
             &mut Cursor::new(
-                "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+                "GET /repos/example/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n",
             ),
             authorizer.github_configuration(),
         )
@@ -750,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn github_https_metadata_authority_can_only_lookup_the_pinned_repository_and_preserves_issue_budget()
+    fn github_https_metadata_authority_can_only_lookup_the_pinned_repository_and_preserves_issue_access()
      {
         let (mut authorizer, principal, mut registry, id, snapshot, _) = prepared(false);
         let request = crate::owner::execution::prepare_metadata(

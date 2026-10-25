@@ -41,6 +41,18 @@ private func review(changing change: (inout [String: Any]) -> Void = { _ in }) t
     #expect(throws: AuthorizationWorkflow.Failure.self) { try AuthorizationWorkflow(review: changed, now: stamp(101)) }
 }
 
+@Test func approvalWorkflowAcceptsACompleteBoundedLargeRequestReview() throws {
+    let expanded = try review { fields in
+        let bytes = Data(base64Encoded: fields["request"] as! String)!
+        var request = try! JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+        request["application"] = String(repeating: "x", count: 100_000)
+        let encoded = try! JSONSerialization.data(withJSONObject: request)
+        fields["request"] = encoded.base64EncodedString()
+        fields["requestDigest"] = Data(SHA256.hash(data: encoded)).base64EncodedString()
+    }
+    _ = try AuthorizationWorkflow(review: expanded, now: stamp(101))
+}
+
 private func finalChallenge(
     _ review: ApprovalReview, authenticated: MonotonicTimestamp,
     digest: Data = Data(repeating: 4, count: 32)

@@ -206,4 +206,28 @@ impl OwnerState {
             .select_credential(id, principal, redirect.selection)?;
         Ok(id)
     }
+
+    pub(super) fn prepare_unscoped_github(
+        &mut self,
+        id: OperationId,
+        principal: &VerifiedPrincipal,
+        policy: &PolicyInput,
+    ) -> Result<PreparedGitHubRequest> {
+        self.refresh_policy(policy)?;
+        self.operations
+            .check_provider_generation(id, principal, self.provider.generation())?;
+        let snapshot = self
+            .provider
+            .snapshot()
+            .ok_or_else(|| Error::State(Fault::VaultLocked))?;
+        crate::owner::execution::prepare_unscoped_github(
+            &self.operations,
+            id,
+            principal,
+            &self.authorizer,
+            snapshot,
+            Instant::now(),
+        )
+        .map_err(Error::from)
+    }
 }

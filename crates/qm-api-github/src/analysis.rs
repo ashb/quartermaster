@@ -344,6 +344,20 @@ fn inspect_headers(request: &CapturedRequest, analysis: &mut Analysis) {
         let reason = match name.as_str() {
             "host" | "content-length" | "authorization" | "connection" | "keep-alive"
             | "user-agent" => None,
+            "accept-encoding"
+                if matches!(value.to_ascii_lowercase().as_str(), "gzip" | "identity") =>
+            {
+                None
+            }
+            "time-zone"
+                if !value.is_empty()
+                    && value.len() <= 128
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"/_+-".contains(&byte)) =>
+            {
+                None
+            }
             "accept" if matches!(value, "application/vnd.github+json" | "application/json") => None,
             "accept" => Some(UncoveredReason::MediaType),
             "content-type"
@@ -376,6 +390,28 @@ mod tests {
     use super::*;
     use crate::test_support::{raw_request, request};
     use hegel::{TestCase, generators as gs};
+
+    #[test]
+    fn standard_gzip_and_timezone_headers_keep_complete_issue_read_coverage() {
+        let input = request(
+            "GET",
+            "/repos/a/b/issues",
+            "Accept-Encoding: gzip\r\nTime-Zone: Europe/London\r\n",
+            "",
+        );
+        assert!(analyze(&input, &PatternSet::default()).unwrap().complete());
+        let unknown = request(
+            "GET",
+            "/repos/a/b/issues",
+            "Accept-Encoding: future-compression\r\n",
+            "",
+        );
+        assert!(
+            !analyze(&unknown, &PatternSet::default())
+                .unwrap()
+                .complete()
+        );
+    }
 
     #[hegel::test(test_cases = 500, database = None, derandomize = false)]
     fn rest_restrictions_survive_unknown_and_duplicate_companion_inputs(tc: TestCase) {

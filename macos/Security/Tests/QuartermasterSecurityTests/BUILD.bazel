@@ -22,6 +22,7 @@ filegroup(
 swift_test(
     name = "QuartermasterSecurityTests",
     srcs = [
+        "APIRequestReviewTests.swift",
         "ApprovalControlWorkflowTests.swift",
         "ApprovalControllerTests.swift",
         "ApprovalKeyStoreTests.swift",

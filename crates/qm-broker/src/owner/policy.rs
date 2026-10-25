@@ -17,7 +17,6 @@ pub(super) enum AuthorizationError {
     InvalidPolicy,
     Denied,
     Expired,
-    BudgetExhausted,
     PolicyChanged,
     SessionRevoked,
     WrongPrincipal,
@@ -79,6 +78,7 @@ impl Policy {
     pub(super) fn digest(&self) -> [u8; 32] {
         let mut hash = ring::digest::Context::new(&SHA256);
         hash.update(&serde_json::to_vec(self).expect("policy contains only serializable data"));
+        hash.update(b"\0quartermaster.github-pattern-catalog.v1\0");
         if let Some(config) = &self.github {
             hash.update(b"\0quartermaster.github-configuration.v1\0");
             hash.update(&config.digest());
@@ -101,7 +101,7 @@ struct ApprovalEvidence {
 }
 
 enum ApprovalPurpose {
-    Write,
+    SingleUse { role: String },
     ReadGrant(Box<ApprovedReadGrant>),
 }
 
@@ -130,7 +130,12 @@ pub(super) struct ApprovalRequirement {
     session_generation: u64,
     approval_generation: u64,
     grant: Option<ReadGrantProposal>,
-    review_digest: Option<[u8; 32]>,
+    review: Option<BoundReview>,
+}
+
+struct BoundReview {
+    digest: [u8; 32],
+    credential_role: String,
 }
 
 impl AuthorizationOutcome {
@@ -152,32 +157,38 @@ impl ApprovalRequirement {
     }
 
     pub(super) fn role(&self) -> &str {
+        if let Some(review) = &self.review {
+            return &review.credential_role;
+        }
         self.grant
             .as_ref()
             .map_or_else(|| self.request.role(), ReadGrantProposal::role)
     }
 
     pub(super) fn review_digest(&self) -> Option<[u8; 32]> {
-        self.review_digest
+        self.review.as_ref().map(|review| review.digest)
     }
 
-    pub(super) fn bind_review<C>(
+    pub(super) fn bind_review<C: super::review::CredentialContext>(
         &mut self,
         document: &super::review::ReviewDocument<C>,
     ) -> Result<(), AuthorizationError> {
         let bytes = document.bytes();
-        if bytes.len() > 12000
-            || self.review_digest.is_some()
+        if bytes.len() > crate::wire_limits::REVIEW_BYTES
+            || self.review.is_some()
             || !document.matches(&self.request, self.grant_claims())
+            || document.credential_role().is_empty()
+            || (self.request.action() != Action::Api && document.credential_role() != self.role())
         {
             return Err(AuthorizationError::InvalidApproval);
         }
-        self.review_digest = Some(
-            ring::digest::digest(&SHA256, bytes)
+        self.review = Some(BoundReview {
+            digest: ring::digest::digest(&SHA256, bytes)
                 .as_ref()
                 .try_into()
                 .unwrap(),
-        );
+            credential_role: document.credential_role().to_owned(),
+        });
         Ok(())
     }
 }
@@ -205,7 +216,7 @@ impl ExecutableOperation {
         match &self.evidence {
             AuthorizationEvidence::PolicyAllow(grant) => grant.role(),
             AuthorizationEvidence::VerifiedApproval(evidence) => match &evidence.purpose {
-                ApprovalPurpose::Write => "github-write",
+                ApprovalPurpose::SingleUse { role } => role,
                 ApprovalPurpose::ReadGrant(grant) => grant.selection.role(),
             },
         }
@@ -296,17 +307,17 @@ impl Authorizer {
         {
             return Err(AuthorizationError::Denied);
         }
-        if request.mode() == Mode::Github
-            && (request.action() == Action::CloseIssue
-                || policy
-                    .github
-                    .as_ref()
-                    .is_none_or(|config| !request.matches_configuration(config)))
-        {
-            return Err(AuthorizationError::Denied);
+        if request.mode() == Mode::Github {
+            let config = policy.github.as_ref().ok_or(AuthorizationError::Denied)?;
+            if !request.matches_service(config)
+                || (!request.matches_configuration(config)
+                    && !config.approves_unverified_requests())
+            {
+                return Err(AuthorizationError::Denied);
+            }
         }
-        if request.action() == Action::CloseIssue {
-            if policy.writes == PolicyDecision::Deny {
+        if matches!(request.action(), Action::CloseIssue | Action::Api) {
+            if request.has_mutation() && policy.writes == PolicyDecision::Deny {
                 return Err(AuthorizationError::Denied);
             }
             return Ok(AuthorizationOutcome::RequireApproval(ApprovalRequirement {
@@ -316,7 +327,7 @@ impl Authorizer {
                 session_generation: self.session_generation,
                 approval_generation: self.approval_generation,
                 grant: None,
-                review_digest: None,
+                review: None,
             }));
         }
         let grant = self
@@ -407,7 +418,8 @@ impl Authorizer {
                     return Err(AuthorizationError::SessionRevoked);
                 }
                 match purpose {
-                    ApprovalPurpose::Write if permit.request.action() == Action::CloseIssue => {}
+                    ApprovalPurpose::SingleUse { .. }
+                        if matches!(permit.request.action(), Action::CloseIssue | Action::Api) => {}
                     ApprovalPurpose::ReadGrant(grant)
                         if matches!(
                             permit.request.action(),
@@ -500,11 +512,18 @@ impl Authorizer {
         approved
             .verify_for_owner(&expected)
             .map_err(|_| AuthorizationError::InvalidApproval)?;
+        let review = requirement
+            .review
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidApproval)?;
+        if review.digest != expected.request_digest
+            || selection.role() != review.credential_role
+            || selection.digest() != expected.credential_digest
+        {
+            return Err(AuthorizationError::InvalidApproval);
+        }
         let purpose = if let Some(grant) = requirement.grant {
-            if requirement.review_digest != Some(expected.request_digest)
-                || selection.role() != grant.role()
-                || selection.digest() != expected.credential_digest
-            {
+            if selection.role() != grant.role() {
                 return Err(AuthorizationError::InvalidApproval);
             }
             grant.check(now)?;
@@ -513,7 +532,9 @@ impl Authorizer {
                 selection,
             }))
         } else {
-            ApprovalPurpose::Write
+            ApprovalPurpose::SingleUse {
+                role: review.credential_role.clone(),
+            }
         };
         Ok(ExecutableOperation {
             request: requirement.request,
@@ -583,7 +604,7 @@ impl Authorizer {
             session_generation: self.session_generation,
             approval_generation: self.approval_generation,
             grant: Some(grant),
-            review_digest: None,
+            review: None,
         })
     }
 
@@ -642,6 +663,71 @@ mod tests {
     };
     use std::{io::Cursor, time::Instant};
 
+    #[test]
+    fn unverified_requests_require_one_use_approval_after_explicit_service_opt_in() {
+        let now = Instant::now();
+        let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
+        for opt_in in [false, true] {
+            let config = GitHubConfig::decode(
+                &serde_json::to_vec(&serde_json::json!({
+                    "version": 1, "mode": "github", "repositories": [],
+                    "approveUnverifiedRequests": opt_in
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut owner = Authorizer::new([1; 16]);
+            owner
+                .install(
+                    Ok(FixturePolicy::default().with_github(config.clone())),
+                    crate::owner::test_support::wall(1000),
+                    now,
+                )
+                .unwrap();
+            let request = request::read_configured(&mut Cursor::new(
+                "GET /future-api HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
+            ), Some(&config)).unwrap();
+            if opt_in {
+                let AuthorizationOutcome::RequireApproval(requirement) =
+                    owner.authorize(&principal, request, now).unwrap()
+                else {
+                    panic!("unmatched input cannot use a reusable grant")
+                };
+                assert!(requirement.grant_claims().is_none());
+            } else {
+                assert!(matches!(
+                    owner.authorize(&principal, request, now),
+                    Err(AuthorizationError::Denied)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn known_mutation_denial_survives_unfamiliar_inputs_and_unverified_scope_opt_in() {
+        let now = Instant::now();
+        let config = GitHubConfig::decode(
+            br#"{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true}"#,
+        )
+        .unwrap();
+        let mut owner = Authorizer::new([1; 16]);
+        let policy = FixturePolicy::decode(br#"{"version":1,"writes":"deny","grants":[]}"#)
+            .unwrap()
+            .with_github(config.clone());
+        owner
+            .install(Ok(policy), crate::owner::test_support::wall(1000), now)
+            .unwrap();
+        let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
+        let body = r#"{"state":"closed","unfamiliar":true}"#;
+        let request = request::read_configured(&mut Cursor::new(format!(
+            "PATCH /repos/a/b/issues/1 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+        )), Some(&config)).unwrap();
+        assert!(matches!(
+            owner.authorize(&principal, request, now),
+            Err(AuthorizationError::Denied)
+        ));
+    }
+
     fn with_github(policy: FixturePolicy, id: u64) -> FixturePolicy {
         let config = super::super::github::configuration::GitHubConfig::decode(
             &serde_json::to_vec(&serde_json::json!({"version":1,"mode":"simulation",
@@ -657,7 +743,7 @@ mod tests {
         let now = Instant::now();
         let mut owner = Authorizer::new([1; 16]);
         let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
-        let policy = || FixturePolicy::decode(&policy_bytes(1010, 2)).unwrap();
+        let policy = || FixturePolicy::decode(&policy_bytes(1010)).unwrap();
         owner
             .install(
                 Ok(with_github(policy(), 123)),
@@ -702,11 +788,11 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_github_configuration_preserves_the_existing_read_budget() {
+    fn unchanged_github_configuration_preserves_existing_read_access() {
         let now = Instant::now();
         let mut owner = Authorizer::new([1; 16]);
         let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
-        let policy = || with_github(FixturePolicy::decode(&policy_bytes(1010, 1)).unwrap(), 123);
+        let policy = || with_github(FixturePolicy::decode(&policy_bytes(1010)).unwrap(), 123);
         owner
             .install(Ok(policy()), crate::owner::test_support::wall(1000), now)
             .unwrap();
@@ -722,10 +808,7 @@ mod tests {
                 .install(Ok(policy()), crate::owner::test_support::wall(1001), now)
                 .unwrap()
         );
-        assert!(matches!(
-            owner.authorize(&principal, read_request(), now),
-            Err(AuthorizationError::BudgetExhausted)
-        ));
+        assert!(owner.authorize(&principal, read_request(), now).is_ok());
     }
 
     #[test]
@@ -736,7 +819,7 @@ mod tests {
         let config = super::super::github::configuration::GitHubConfig::decode(
         br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"quartermaster","name":"demo","writes":true}]}"#
     ).unwrap();
-        let policy = FixturePolicy::decode(&policy_bytes(1010, 2))
+        let policy = FixturePolicy::decode(&policy_bytes(1010))
             .unwrap()
             .with_github(config);
         owner
@@ -759,7 +842,7 @@ mod tests {
         let mut owner = Authorizer::new([1; 16]);
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1000),
                 now,
             )
@@ -777,10 +860,7 @@ mod tests {
                 request::Action::ReadIssue
             );
         }
-        assert!(matches!(
-            owner.authorize(&principal, read_request(), now),
-            Err(AuthorizationError::BudgetExhausted)
-        ));
+        assert!(owner.authorize(&principal, read_request(), now).is_ok());
     }
 
     #[test]
@@ -789,7 +869,7 @@ mod tests {
         let mut owner = Authorizer::new([1; 16]);
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1000),
                 now,
             )
@@ -811,7 +891,7 @@ mod tests {
         assert!(owner.authorize(&principal, read_request(), now).is_err());
         owner
             .install(
-                FixturePolicy::decode(&policy_bytes(1010, 2)),
+                FixturePolicy::decode(&policy_bytes(1010)),
                 crate::owner::test_support::wall(1000),
                 now,
             )
@@ -1088,7 +1168,7 @@ mod read_grant_tests {
 
         assert!(
             operations
-                .read_deadline(id, &principal, &owner, Instant::now())
+                .dispatch_deadline(id, &principal, &owner, Instant::now())
                 .is_ok()
         );
     }
@@ -1215,7 +1295,7 @@ mod read_grant_tests {
         let mut operations = OperationRegistry::default();
         test_support::approval::read_grant(&mut operations, &mut owner, &principal, &snapshot);
 
-        for _ in 0..2 {
+        for _ in 0..150 {
             let AuthorizationOutcome::Allowed(permit) = owner
                 .authorize(&principal, test_support::read_request(), Instant::now())
                 .unwrap()
@@ -1243,7 +1323,7 @@ mod read_grant_tests {
     }
 
     #[test]
-    fn read_grant_approval_cannot_be_replayed_after_revocation_or_budget_exhaustion() {
+    fn read_grant_approval_cannot_be_replayed_before_or_after_revocation() {
         for revoke in [false, true] {
             let mut owner = Authorizer::new([1; 16]);
             let principal = test_support::principal([1; 16]);
@@ -1258,7 +1338,7 @@ mod read_grant_tests {
             if revoke {
                 owner.revoke_read_grants().unwrap();
             } else {
-                for _ in 0..99 {
+                for _ in 0..150 {
                     let AuthorizationOutcome::Allowed(permit) = owner
                         .authorize(&principal, test_support::read_request(), Instant::now())
                         .unwrap()
@@ -1268,10 +1348,11 @@ mod read_grant_tests {
                     owner.admit(permit, &principal, Instant::now()).unwrap();
                 }
             }
-            assert!(
+            assert_eq!(
                 owner
                     .authorize(&principal, test_support::read_request(), Instant::now())
-                    .is_err()
+                    .is_err(),
+                revoke
             );
             let pending = session
                 .begin_intent(request_digest)
@@ -1287,10 +1368,11 @@ mod read_grant_tests {
                     .proof(id, &principal, &owner, signature.as_ref(), Instant::now())
                     .is_err()
             );
-            assert!(
+            assert_eq!(
                 owner
                     .authorize(&principal, test_support::read_request(), Instant::now())
-                    .is_err()
+                    .is_err(),
+                revoke
             );
         }
     }
