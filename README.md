@@ -39,6 +39,10 @@ Repository scope follows the requested name, as described in the
 [GitHub guide](docs/github.md#repository-identity). Credential delivery through
 environment variables is not implemented yet.
 
+<img src="./docs/images/approval-dialog.png" alt="Approval screen" width="540">
+
+<img src="./docs/images/settings-vault.png" alt="Preferences screen" width="920">
+
 ## Building and running
 
 The current development target is Apple Silicon on macOS 26 with full Xcode.
