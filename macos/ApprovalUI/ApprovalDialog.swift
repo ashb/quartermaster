@@ -170,8 +170,15 @@ struct ApprovalDialogView: View {
             if let peer = presentation.request.peer {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Command").font(.caption).foregroundStyle(.secondary)
-                    Text(verbatim: peer.commandLine ?? "Command arguments unavailable")
+                    let command = Text(verbatim: peer.commandLine ?? "Command arguments unavailable")
                         .font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    ViewThatFits(in: .vertical) {
+                        command
+                        ScrollView(.vertical) { command }.frame(height: 80)
+                    }
+                    .frame(maxHeight: 80)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -190,7 +197,7 @@ struct ApprovalDialogView: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 Text("Process tree").font(.subheadline.weight(.semibold))
-                ForEach(Array(presentation.request.processChain.reversed().enumerated()), id: \.offset) {
+                ForEach(Array(presentation.request.processChain.enumerated()), id: \.offset) {
                     index, process in
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: index == 0 ? "terminal" : "arrow.turn.down.right").foregroundStyle(.secondary)
@@ -204,6 +211,8 @@ struct ApprovalDialogView: View {
             if let api = presentation.apiRequest, presentation.readGrant == nil {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("One request · no reusable access")
+                    Text(verbatim: "\(presentation.request.method) \(presentation.request.path)")
+                        .font(.body.monospaced()).lineLimit(2).truncationMode(.middle).textSelection(.enabled)
                     Text(
                         "Repository scope is unverified. This request may use the selected credential’s full upstream permissions."
                     )
@@ -214,14 +223,6 @@ struct ApprovalDialogView: View {
                     if !api.complete {
                         Text("Some inputs are unfamiliar; the complete effects are unverified.").font(.caption)
                     }
-                    ScrollView([.horizontal, .vertical]) {
-                        Text(verbatim: api.text).font(.caption.monospaced()).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }.frame(height: 180)
-                    Text(
-                        "Authentication is replaced with the selected credential. HTTP framing uses a fixed body length and closes the connection. Byte escapes are shown literally."
-                    )
-                    .font(.caption).foregroundStyle(.secondary)
                 }
             }
 
@@ -278,7 +279,7 @@ struct ApprovalDialogView: View {
                     }.font(.caption.monospaced()).textSelection(.enabled)
                 }.font(.caption)
             }
-            if let peer = presentation.request.peer {
+            if presentation.apiRequest != nil || presentation.request.peer != nil {
                 DisclosureSection("HTTP request", isExpanded: $showsHTTP) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(
@@ -288,11 +289,17 @@ struct ApprovalDialogView: View {
                             ScrollView([.horizontal, .vertical]) {
                                 Text(verbatim: api.text)
                             }.frame(height: 180)
+                            Text(
+                                "Authentication is replaced with the selected credential. HTTP framing uses a fixed body length and closes the connection. Byte escapes are shown literally."
+                            )
+                            .foregroundStyle(.secondary)
                         } else {
                             Text(presentation.request.body ?? "")
                         }
                     }.font(.caption.monospaced()).textSelection(.enabled)
                 }.font(.caption)
+            }
+            if let peer = presentation.request.peer {
                 DisclosureSection("Socket peer: PID \(String(peer.pid)) · signature checked", isExpanded: $showsPeer) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(peer.executable)

@@ -143,12 +143,12 @@ failure and cannot create permission.
 
 ### What the user approves
 
-For unfamiliar requests, show the verified caller, GitHub destination, selected
-provider/account/item/field and explicitly unverified effects. Complete method,
-target, query, application headers and body inspection stays outside collapsed
-Details. Render untrusted content as inert text or explicit bytes without hiding
-control characters, duplicates or omissions. A digest or truncated summary cannot
-replace complete inspection.
+For unfamiliar requests, keep the verified caller, GitHub destination, request
+summary and explicitly unverified effects visible. Details contains the selected
+provider/account/item/field and complete method, target, query, application
+headers and body. Render untrusted content as inert text or explicit bytes without
+hiding control characters, duplicates or omissions. The summary may be shortened;
+the complete request must remain inspectable before approval.
 
 State repository scope only when verified. Otherwise the dialog must say this is
 one use of the selected credential without a verified repository restriction.
