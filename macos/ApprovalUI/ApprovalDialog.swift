@@ -146,7 +146,6 @@ struct ApprovalDialogView: View {
     let presentation: ApprovalPresentation
     @ObservedObject var controller: ApprovalController
     let close: () -> Void
-    @State private var showsDetails = false
     @State private var showsVault = false
     @State private var showsHTTP = false
     @State private var showsPeer = false
@@ -226,7 +225,7 @@ struct ApprovalDialogView: View {
                 }
             }
 
-            DisclosureGroup("Details", isExpanded: $showsDetails) {
+            DisclosureSection("Details") {
                 ViewThatFits(in: .vertical) {
                     detailsContent
                     ScrollView(.vertical) {
@@ -270,7 +269,7 @@ struct ApprovalDialogView: View {
             let provider = presentation.provider
             Group {
                 Text("\(provider.email) · \(provider.server)").font(.caption)
-                DisclosureGroup("Vault selection", isExpanded: $showsVault) {
+                DisclosureSection("Vault selection", isExpanded: $showsVault) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Account: \(provider.account)")
                         Text("Item: \(provider.item)")
@@ -280,7 +279,7 @@ struct ApprovalDialogView: View {
                 }.font(.caption)
             }
             if let peer = presentation.request.peer {
-                DisclosureGroup("HTTP request", isExpanded: $showsHTTP) {
+                DisclosureSection("HTTP request", isExpanded: $showsHTTP) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(
                             "\(presentation.request.method) \(presentation.request.origin ?? "")\(presentation.request.path)"
@@ -294,7 +293,7 @@ struct ApprovalDialogView: View {
                         }
                     }.font(.caption.monospaced()).textSelection(.enabled)
                 }.font(.caption)
-                DisclosureGroup(isExpanded: $showsPeer) {
+                DisclosureSection("Socket peer: PID \(String(peer.pid)) · signature checked", isExpanded: $showsPeer) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(peer.executable)
                         Text(
@@ -302,8 +301,6 @@ struct ApprovalDialogView: View {
                         )
                         Text("CDHash: \(peer.cdHash)")
                     }.font(.caption.monospaced()).textSelection(.enabled)
-                } label: {
-                    Text(verbatim: "Socket peer: PID \(String(peer.pid)) · signature checked")
                 }.font(.caption)
             }
         }

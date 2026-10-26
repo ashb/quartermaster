@@ -19,7 +19,7 @@ private struct SettingsApprovalView: View {
                     record(document.previous, title: "Currently approved")
                     Divider()
                     record(document.proposed, title: "Proposed")
-                    DisclosureGroup("Complete signed change · literal byte escapes") {
+                    DisclosureSection("Complete signed change · literal byte escapes") {
                         ScrollView(.horizontal) {
                             Text(verbatim: review.text).font(.caption.monospaced()).textSelection(.enabled)
                         }

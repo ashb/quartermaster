@@ -1,3 +1,4 @@
+import QuartermasterApprovalUI
 import QuartermasterSecurity
 import SwiftUI
 
@@ -75,7 +76,7 @@ struct PreferencesView: View {
             PreferencesGroup(title: "Selected vault") {
                 if let provider = editor.snapshot?.provider {
                     providerIdentity(provider)
-                    DisclosureGroup("Enrolment details") {
+                    DisclosureSection("Enrolment details") {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(verbatim: "Account: \(provider.binding.accountID)")
                         }.font(.caption.monospaced()).textSelection(.enabled)
@@ -182,7 +183,7 @@ struct PreferencesView: View {
                     Text("Login password").foregroundStyle(.secondary)
                 }
                 if let provider = editor.snapshot?.provider {
-                    DisclosureGroup("Approved token source") {
+                    DisclosureSection("Approved token source") {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(verbatim: provider.binding.email)
                             Text(verbatim: "Login item: \(provider.binding.itemID)")

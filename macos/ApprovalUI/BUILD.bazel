@@ -6,6 +6,7 @@ swift_library(
     name = "QuartermasterApprovalUI",
     srcs = [
         "ApprovalDialog.swift",
+        "DisclosureSection.swift",
         "SettingsApprovalDialog.swift",
     ],
     copts = [
