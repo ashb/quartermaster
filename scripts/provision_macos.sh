@@ -19,15 +19,17 @@ mkdir -p "$destination"
 rm -rf "$destination/project"
 /usr/bin/ditto "$1" "$destination/project"
 chmod -R u+w "$destination/project"
-if ! /usr/bin/xcodebuild -project "$destination/project/QuartermasterProvisioning.xcodeproj" \
-    -alltargets -configuration Debug -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
-    "DEVELOPMENT_TEAM=$team" \
-    "SYMROOT=$destination/build" "OBJROOT=$destination/intermediates" \
-    "CONFIGURATION_BUILD_DIR=$destination/apps" build; then
-    echo 'Provisioning failed. Check your account and team in Xcode Settings > Accounts, then retry just provision.' >&2
-    exit 1
-fi
+# Xcode device registration needs a concrete run destination selected through a scheme.
 for app in Quartermaster QuartermasterBackend; do
+    if ! /usr/bin/xcodebuild -project "$destination/project/QuartermasterProvisioning.xcodeproj" \
+        -scheme "$app" -destination "platform=macOS,arch=$(/usr/bin/uname -m)" \
+        -configuration Debug -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
+        "DEVELOPMENT_TEAM=$team" \
+        "SYMROOT=$destination/build" "OBJROOT=$destination/intermediates" \
+        "CONFIGURATION_BUILD_DIR=$destination/apps" build; then
+        echo "Provisioning failed for $app. Review Xcode's error above; check the account and team in Xcode Settings > Accounts." >&2
+        exit 1
+    fi
     if [ ! -f "$destination/apps/$app.app/Contents/embedded.provisionprofile" ]; then
         echo "Xcode did not embed a provisioning profile for $app." >&2
         exit 1

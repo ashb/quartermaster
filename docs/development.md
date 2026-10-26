@@ -55,7 +55,8 @@ just build-signed
 ```
 
 `just provision` generates a disposable Xcode project from the app's bundle IDs
-and entitlement files, then builds two stub apps to let Xcode issue the profiles.
+and entitlement files, then builds two stub apps with this Mac selected as the
+destination so Xcode can register it and issue the profiles.
 Xcode manages signing for these disposable stubs and may create a development
 certificate or request account or signing-key authorization. Provisioning succeeds
 only if both resulting profiles authorize the certificate pinned in
