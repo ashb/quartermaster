@@ -159,15 +159,23 @@ impl PeerState {
         }));
         let response = match result {
             Ok(Ok(Response::Immediate(response))) if response.len() <= MESSAGE_LIMIT => response,
-            Ok(Ok(Response::Deferred(receive))) if authenticated.is_none() => {
-                // Only owned bytes cross into Rust async work. The native reply and
-                // admission slot stay in this bounded native dispatch adapter.
+            Ok(Ok(Response::Deferred(receive))) => {
+                // The borrowed context stays on its serial queue; only reply bytes wait here.
+                let generation = authenticated.map(|(generation, _)| generation);
                 DispatchQueue::global_queue(dispatch2::GlobalQueueIdentifier::QualityOfService(
                     dispatch2::DispatchQoS::Utility,
                 ))
                 .exec_async(move || {
                     let _slot = slot;
-                    let response = receive.recv_timeout(std::time::Duration::from_secs(120));
+                    let response = receive
+                        .recv_timeout(std::time::Duration::from_secs(120))
+                        .ok()
+                        .filter(|bytes| bytes.len() <= MESSAGE_LIMIT);
+                    if response.is_none()
+                        && let Some(generation) = generation
+                    {
+                        _slot.0.contexts.release(generation);
+                    }
                     objc2::rc::autoreleasepool(|_| {
                         reply.send(response.as_deref().unwrap_or(REJECTED))
                     });

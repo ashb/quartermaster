@@ -510,39 +510,98 @@ mod tests {
     }
 
     #[test]
-    fn failed_async_work_rejects_the_reply_and_releases_capacity() {
-        let fixture = Fixture::new(|event| {
-            if let Event::Message { payload, .. } = event {
-                if payload == b"failed" {
-                    let (_, receive) = mpsc::sync_channel(1);
-                    return Ok(Response::Deferred(receive));
+    fn failed_or_oversized_async_replies_release_capacity_and_contexts() {
+        for (authenticated, reply) in [
+            (false, None),
+            (true, None),
+            (true, Some(vec![b'x'; MESSAGE_LIMIT + 1])),
+        ] {
+            let fixture = Fixture::new(move |event| {
+                if let Event::Message {
+                    connection,
+                    payload,
+                    ..
+                } = event
+                {
+                    if payload == b"failed" {
+                        let (send, receive) = mpsc::sync_channel(1);
+                        if let Some(bytes) = &reply {
+                            send.send(bytes.clone()).unwrap();
+                        }
+                        return Ok(Response::Deferred(receive));
+                    }
+                    connection.release_context();
+                    return Ok(Response::Immediate(payload.to_vec()));
+                }
+                Ok(Response::Immediate(Vec::new()))
+            });
+            let client = fixture.client();
+            let first = authenticated.then(|| unsafe { LAContext::new() });
+            assert_eq!(send(&client, b"failed", first.as_deref()), REJECTED);
+            let second = authenticated.then(|| unsafe { LAContext::new() });
+            assert_eq!(send(&client, b"available", second.as_deref()), b"available");
+            client.invalidate();
+        }
+    }
+
+    #[test]
+    fn authenticated_work_can_defer_reply_bytes_while_its_context_stays_leased() {
+        let lease: Arc<Mutex<Option<ContextLease>>> = Arc::default();
+        let retained = Arc::clone(&lease);
+        let (entered, ready) = mpsc::sync_channel(1);
+        let (complete, result) = mpsc::sync_channel(1);
+        let result = Mutex::new(Some(result));
+        let fixture = Fixture::new(move |event| {
+            if let Event::Message {
+                connection,
+                context,
+                payload,
+            } = event
+            {
+                match payload {
+                    b"defer" => {
+                        assert!(context.is_some());
+                        *retained.lock().unwrap() = Some(
+                            connection.context_lease(
+                                qm_macos::presence_clock::monotonic_raw()?
+                                    .checked_add(Duration::from_secs(5))
+                                    .unwrap(),
+                            )?,
+                        );
+                        entered.send(()).unwrap();
+                        return Ok(Response::Deferred(result.lock().unwrap().take().unwrap()));
+                    }
+                    b"release" => {
+                        retained.lock().unwrap().take();
+                    }
+                    _ => connection.release_context(),
                 }
                 return Ok(Response::Immediate(payload.to_vec()));
             }
             Ok(Response::Immediate(Vec::new()))
         });
         let client = fixture.client();
-        assert_eq!(send(&client, b"failed", None), REJECTED);
-        assert_eq!(send(&client, b"available", None), b"available");
-        client.invalidate();
-    }
-
-    #[test]
-    fn authenticated_requests_cannot_defer_their_borrowed_context() {
-        let calls = AtomicUsize::new(0);
-        let fixture = Fixture::new(move |event| {
-            if matches!(event, Event::Message { .. }) && calls.fetch_add(1, Ordering::Relaxed) == 0
-            {
-                let (_, receive) = mpsc::sync_channel(1);
-                return Ok(Response::Deferred(receive));
-            }
-            Ok(Response::Immediate(b"accepted".to_vec()))
-        });
-        let client = fixture.client();
         let first = unsafe { LAContext::new() };
-        assert_eq!(send(&client, b"defer", Some(&first)), REJECTED);
+        let response = start_send(&client, b"defer", Some(&first));
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            response.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
         let second = unsafe { LAContext::new() };
-        assert_eq!(send(&client, b"retry", Some(&second)), b"accepted");
+        assert_eq!(send(&client, b"duplicate", Some(&second)), REJECTED);
+        assert_eq!(send(&client, b"control", None), b"control");
+        complete.send(b"completed".to_vec()).unwrap();
+        assert_eq!(
+            response
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            b"completed"
+        );
+        assert_eq!(send(&client, b"duplicate", Some(&second)), REJECTED);
+        assert_eq!(send(&client, b"release", None), b"release");
+        assert_eq!(send(&client, b"retry", Some(&second)), b"retry");
         client.invalidate();
     }
 }
