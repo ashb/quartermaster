@@ -6,6 +6,7 @@ import QuartermasterSecurity
 @MainActor
 final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject {
     @Published private(set) var status = "Disconnected"
+    @Published private(set) var vaultStatus: BrokerVaultStatus?
     private var client: BrokerConnection?
     private var task: Task<Void, Never>?
     private var active: (any ApprovalWindow)?
@@ -24,6 +25,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
 
     func reconnect() {
         status = "Starting Quartermaster…"
+        vaultStatus = nil
         active?.cancel()
         task?.cancel()
         client?.cancel()
@@ -50,6 +52,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     throw BrokerFailure.invalidMessage
                 }
                 await preferences.load()
+                await refreshVaultStatus()
+                try Task.checkCancellation()
                 status = "Connected"
                 while !Task.isCancelled {
                     guard !connection.disconnected else { throw BrokerFailure.disconnected }
@@ -69,6 +73,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 active?.cancel()
                 client?.cancel()
                 client = nil
+                vaultStatus = nil
                 status = "Backend unavailable: \(error)"
                 preferences.report(error)
             }
@@ -158,8 +163,22 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     throw BrokerFailure.disconnected
                 }
                 operationEnrolled = false
+                vaultStatus = vault
                 status = "Vault: \(vault.state.rawValue)"
             } catch { preferences.report(error) }
+        }
+    }
+
+    private func refreshVaultStatus() async {
+        do {
+            guard let client, case .vaultStatus(let vault) = try await client.call(.vaultStatus) else {
+                throw BrokerFailure.disconnected
+            }
+            try Task.checkCancellation()
+            vaultStatus = vault
+        } catch {
+            guard !Task.isCancelled else { return }
+            vaultStatus = nil
         }
     }
 
@@ -170,7 +189,10 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             releasePresentation()
             if settings {
                 operationEnrolled = false
-                Task { await preferences.load() }
+                Task {
+                    await preferences.load()
+                    await refreshVaultStatus()
+                }
             }
         }
         active = dialog

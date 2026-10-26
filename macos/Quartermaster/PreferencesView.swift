@@ -76,6 +76,16 @@ struct PreferencesView: View {
             PreferencesGroup(title: "Selected vault") {
                 if let provider = editor.snapshot?.provider {
                     providerIdentity(provider)
+                    HStack {
+                        Text("Last synced")
+                        Spacer()
+                        if let vault = application.vaultStatus, vault.binding == provider.binding {
+                            Text(vault.lastSync?.formatted(date: .abbreviated, time: .shortened) ?? "Never")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("Unavailable").foregroundStyle(.secondary)
+                        }
+                    }
                     DisclosureSection("Enrolment details") {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(verbatim: "Account: \(provider.binding.accountID)")
@@ -85,6 +95,7 @@ struct PreferencesView: View {
                     Text("No vault selected")
                 }
             }
+            vaultCache
             if editor.snapshot?.provider == nil, let retained = editor.snapshot?.retained, !retained.isEmpty {
                 PreferencesGroup(title: "Retained enrolments") {
                     ForEach(retained, id: \.slot) { provider in
@@ -269,22 +280,6 @@ struct PreferencesView: View {
                 }
                 Text("Restarting the backend also removes read grants.").font(.caption).foregroundStyle(.secondary)
             }
-            PreferencesGroup(title: "Vault cache") {
-                HStack {
-                    Text("Lock the selected vault")
-                    Spacer()
-                    Button("Lock Now") { application.vault(.vaultLock) }
-                }
-                Divider()
-                HStack {
-                    Text("Refresh from Vaultwarden")
-                    Spacer()
-                    Button("Sync Vault") { application.vault(.vaultSync) }.disabled(
-                        editor.busy || editor.snapshot?.provider == nil)
-                }
-                Text("Credentials and decrypted vault data stay in the Rust backend.").font(.caption).foregroundStyle(
-                    .secondary)
-            }
             PreferencesGroup(title: "Connection") {
                 HStack {
                     Text("Backend")
@@ -305,6 +300,24 @@ struct PreferencesView: View {
                 }
             }
         }
+    }
+
+    private var vaultCache: some View {
+        PreferencesGroup(title: "Vault cache") {
+            HStack {
+                Text("Lock the selected vault")
+                Spacer()
+                Button("Lock Now") { application.vault(.vaultLock) }
+            }
+            Divider()
+            HStack {
+                Text("Refresh from Vaultwarden")
+                Spacer()
+                Button("Sync Vault") { application.vault(.vaultSync) }
+            }
+            Text("Credentials and decrypted vault data stay in the Rust backend.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.disabled(editor.busy || editor.snapshot?.provider == nil)
     }
 
     private var newRepository: RepositorySetting? {
