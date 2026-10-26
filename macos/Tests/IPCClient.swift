@@ -157,7 +157,7 @@ final class IPCFixture: ApprovalBackend {
 
     func run() async throws {
         defer { connection.invalidate() }
-        let rejected = "{\"kind\":\"error\"}"
+        let rejected = "{\"kind\":\"error\",\"code\":\"unavailable\"}"
         try require(try await send("plain") == "plain", "plain message changed")
         if config.case == "transport" {
             let context = LAContext()
@@ -169,7 +169,8 @@ final class IPCFixture: ApprovalBackend {
             second.interactionNotAllowed = true
             try require(try await send("second", context: second) == "context", "replacement context failed")
             try require(
-                try await send(Data(repeating: 120, count: 16_385)) == Data(rejected.utf8), "oversized request accepted"
+                try await send(Data(repeating: 120, count: 1024 * 1024 + 1)) == Data(rejected.utf8),
+                "oversized request accepted"
             )
         } else {
             try await approve()
