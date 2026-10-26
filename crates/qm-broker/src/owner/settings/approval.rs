@@ -5,14 +5,13 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
     signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const DOMAIN: &[u8] = b"quartermaster.settings-approval.v1\0";
 
-#[derive(Clone, Serialize)]
-#[cfg_attr(test, derive(serde::Deserialize))]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::owner) struct Review {
     pub(in crate::owner) id: String,
     created: MonotonicTimestamp,
@@ -62,6 +61,7 @@ pub(in crate::owner) struct VerifiedChange<C> {
     expires: MonotonicTimestamp,
     connection: u64,
     context: C,
+    signed: SignedChange,
 }
 
 pub(in crate::owner) struct Admission<C> {
@@ -69,6 +69,87 @@ pub(in crate::owner) struct Admission<C> {
     record: Record,
     connection: u64,
     context: C,
+    pub(super) signed: SignedChange,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SignedChange {
+    review: Review,
+    authenticated: MonotonicTimestamp,
+    signature: String,
+}
+
+impl SignedChange {
+    pub(super) fn encoded(&self) -> Result<Vec<u8>, Error> {
+        let bytes = serde_json::to_vec(self).map_err(|_| Error::Invalid)?;
+        if bytes.len() > qm_types::PROTECTED_RECORD_BYTES {
+            return Err(Error::Invalid);
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn record(&self, key: &[u8]) -> Result<Record, Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Document {
+            version: String,
+            previous: Record,
+            proposed: Record,
+        }
+        let review = &self.review;
+        let document = BASE64
+            .decode(&review.document)
+            .map_err(|_| Error::Invalid)?;
+        if document.len() > 2 * super::RECORD_LIMIT
+            || BASE64.decode(&review.digest).map_err(|_| Error::Invalid)?
+                != digest(&SHA256, &document).as_ref()
+            || BASE64
+                .decode(&review.approval_key)
+                .map_err(|_| Error::Invalid)?
+                != key
+            || BASE64.decode(&review.id).map_err(|_| Error::Invalid)?.len() != 16
+            || BASE64
+                .decode(&review.session)
+                .map_err(|_| Error::Invalid)?
+                .len()
+                != 16
+            || BASE64
+                .decode(&review.nonce)
+                .map_err(|_| Error::Invalid)?
+                .len()
+                != 32
+            || u64::from(review.created) == 0
+            || self
+                .authenticated
+                .checked_duration_since(review.created)
+                .is_none_or(|age| age >= Duration::from_secs(120))
+        {
+            return Err(Error::Invalid);
+        }
+        let document: Document = serde_json::from_slice(&document).map_err(|_| Error::Invalid)?;
+        for record in [&document.previous, &document.proposed] {
+            Record::decode(&serde_json::to_vec(record).map_err(|_| Error::Invalid)?)?;
+            if record.public_key() != key {
+                return Err(Error::Invalid);
+            }
+        }
+        if document.version != "quartermaster.settings-review.v1"
+            || document.previous.revision() != review.revision
+            || document.proposed.revision() != review.revision.next()?
+            || document.proposed.settings().is_none()
+        {
+            return Err(Error::Invalid);
+        }
+        let signature = BASE64.decode(&self.signature).map_err(|_| Error::Invalid)?;
+        if signature.is_empty() || signature.len() > 72 {
+            return Err(Error::Invalid);
+        }
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, key)
+            .verify(&signing_bytes(review, self.authenticated)?, &signature)
+            .map_err(|_| Error::Invalid)?;
+        Ok(document.proposed)
+    }
 }
 
 impl<C> Admission<C> {
@@ -276,6 +357,12 @@ impl<C> Manager<C> {
         UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, self.record.public_key())
             .verify(&bytes, signature)
             .map_err(|_| Error::Invalid)?;
+        let signed = SignedChange {
+            review: pending.review,
+            authenticated,
+            signature: BASE64.encode(signature),
+        };
+        signed.encoded()?;
         self.phase = Phase::Ready {
             id: id.to_owned(),
             connection,
@@ -287,6 +374,7 @@ impl<C> Manager<C> {
             expires,
             connection,
             context: pending.context,
+            signed,
         })
     }
 
@@ -315,6 +403,7 @@ impl<C> Manager<C> {
             record: verified.proposed,
             connection: verified.connection,
             context: verified.context,
+            signed: verified.signed,
         })
     }
 

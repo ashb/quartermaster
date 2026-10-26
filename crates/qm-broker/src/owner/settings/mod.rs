@@ -63,14 +63,14 @@ impl Revision {
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum MutationRule {
     RequireApproval,
     Deny,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Settings {
     #[serde(default, deserialize_with = "decode_github")]
@@ -157,7 +157,7 @@ impl ProviderPin {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Record {
     version: u8,
@@ -480,6 +480,96 @@ mod tests {
             );
             assert_eq!(manager.record().revision, Revision(0));
             assert!(manager.policy().is_err());
+        }
+    }
+
+    #[test]
+    fn a_timely_settings_signature_cannot_extend_the_final_admission_deadline() {
+        for offset in [29_999_999_999_u64, 30_000_000_000, 30_000_000_001] {
+            let (key, mut manager) = fixture();
+            let authenticated = qm_types::MonotonicTimestamp::from(1_001);
+            let review = manager
+                .prepare(
+                    7,
+                    [1; 16],
+                    Proposal {
+                        revision: Revision(0),
+                        settings: rules(),
+                        provider: None,
+                    },
+                    1_000.into(),
+                    (),
+                )
+                .unwrap();
+            let challenge = manager
+                .authenticate(&review.id, 7, authenticated, authenticated)
+                .unwrap();
+            let signature = key
+                .sign(
+                    &SystemRandom::new(),
+                    &BASE64.decode(challenge.bytes).unwrap(),
+                )
+                .unwrap();
+            let verified = manager
+                .approve(&review.id, 7, signature.as_ref(), authenticated)
+                .unwrap();
+            let result = manager.admit(
+                verified,
+                authenticated
+                    .checked_add(std::time::Duration::from_nanos(offset))
+                    .unwrap(),
+            );
+            assert_eq!(result.is_ok(), offset < 30_000_000_000, "{offset}");
+            assert_eq!(manager.record().revision, Revision(0));
+        }
+    }
+
+    #[test]
+    fn an_oversized_signed_envelope_is_rejected_before_publication_admission() {
+        let (key, mut manager) = fixture();
+        let mut value = serde_json::to_value(pin()).unwrap();
+        value["binding"]["server"] =
+            format!("https://vault.example.invalid/{}", "x".repeat(50_000)).into();
+        let provider: ProviderPin = serde_json::from_value(value).unwrap();
+        for revision in 0..2 {
+            let review = manager
+                .prepare(
+                    7,
+                    [1; 16],
+                    Proposal {
+                        revision: Revision(revision),
+                        settings: rules(),
+                        provider: Some(provider.clone()),
+                    },
+                    1_000.into(),
+                    (),
+                )
+                .unwrap();
+            let challenge = manager
+                .authenticate(&review.id, 7, 1_001.into(), 1_002.into())
+                .unwrap();
+            let signature = key
+                .sign(
+                    &SystemRandom::new(),
+                    &BASE64.decode(challenge.bytes).unwrap(),
+                )
+                .unwrap();
+            let verified = manager.approve(&review.id, 7, signature.as_ref(), 1_003.into());
+            if revision == 0 {
+                let admission = manager.admit(verified.unwrap(), 1_004.into()).unwrap();
+                manager
+                    .finish(store::Publication {
+                        admission,
+                        result: Ok(()),
+                    })
+                    .unwrap();
+            } else {
+                assert_eq!(verified.err(), Some(Error::Invalid));
+                assert!(manager.idle());
+                assert!(!manager.failed());
+                assert!(manager.policy().is_ok());
+            }
+            assert_eq!(manager.record().revision, Revision(1));
         }
     }
 

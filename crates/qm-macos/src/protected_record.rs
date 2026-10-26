@@ -11,7 +11,7 @@ use security_framework_sys::{
     keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemUpdate},
 };
 
-const LIMIT: usize = 128 * 1024;
+use qm_types::PROTECTED_RECORD_BYTES as LIMIT;
 
 #[link(name = "Security", kind = "framework")]
 unsafe extern "C" {

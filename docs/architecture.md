@@ -32,8 +32,10 @@ Save Changes action with Touch ID. Enrolment edits invalidate verification and
 block review until reverified. Password entry is transient; vault snapshots, cache keys and selected
 API credentials remain in Rust.
 
-The backend persists approved settings, enrolment selection and approval-key
-continuity in one backend-only Keychain record. Cache slots contain encrypted
+The backend persists signed settings and enrolment selection in a backend-only
+Keychain record, with the enrolled approval-key pin in a separate protected item.
+It verifies the stored signature against that pin before trusting settings after
+restart. Cache slots contain encrypted
 provider snapshots. Runtime grants are separate, memory-only authority and are
 never restored from settings. See [settings authority](security-boundaries.md#settings-authority)
 for the commit and cancellation boundary.

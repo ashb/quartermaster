@@ -45,6 +45,14 @@ and proposed records, revision, session, nonce and authentication timestamp. Swi
 independently validates those bindings and presents the change as inert escaped
 bytes. Settings approval authorizes neither API requests nor runtime grants.
 
+Every configured settings record must retain its signature. Verify it against the
+enrolled frontend approval key before trusting the record, including after restart.
+The key requires Touch ID for signing; verification needs only its public key and
+does not prompt. The signature must cover the complete effective settings,
+including backend-resolved values. Rust may prepare drafts but must not publish
+or trust unsigned changes. An unsigned bootstrap record may pin the approval key
+but grants no settings or provider authority.
+
 Enrolment verification seals an inactive cache slot and retains its verified
 snapshot only in Rust. Approval selects its exact binding, device-key identity
 and cache revision. Cancellation, expiry, connection loss or a conflicting
@@ -96,6 +104,14 @@ authenticated NSXPC so the Rust owner can open its own protected cache. Native
 context handles remain confined to their owning queue and connection generation.
 The context grants neither Keychain-group access nor application write authority;
 a required write still needs a separate request-bound, single-use signature.
+
+An authenticated context can remain reusable until invalidated; its reuse-duration
+property controls recent device-unlock reuse, not its lifetime. Create a fresh
+context for each approval, enforce the original authentication deadline at use,
+and invalidate both holders when the operation ends. The context does not attest
+the fingerprint's time or the user's intent; freshness and faithful presentation
+remain responsibilities of the trusted UI. See
+[Apple's context reuse model](https://developer.apple.com/videos/play/wwdc2022/10108/?time=361).
 
 Freeze the full provider selection and operation before authentication, then
 compare the authenticated cache to that selection after opening it. Bind the

@@ -14,7 +14,7 @@ pub(in crate::owner) enum Mode {
     Github,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(in crate::owner) struct Repository {
     id: NonZeroU64,
@@ -24,7 +24,7 @@ pub(in crate::owner) struct Repository {
     writes: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub(in crate::owner) struct GitHubConfig {
     version: u8,
     mode: Mode,

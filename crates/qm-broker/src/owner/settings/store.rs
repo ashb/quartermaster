@@ -1,3 +1,4 @@
+use super::approval::SignedChange;
 use super::{Admission, Error, Manager, Record};
 
 trait Storage: Send + Sync {
@@ -8,25 +9,52 @@ trait Storage: Send + Sync {
 
 pub(in crate::owner) struct Store {
     storage: Box<dyn Storage>,
+    anchor: Box<dyn Storage>,
 }
 
 impl Store {
     #[cfg(target_os = "macos")]
     pub(in crate::owner) fn native() -> Result<Self, Error> {
-        qm_macos::protected_record::ProtectedRecord::open(
-            "dev.quartermaster.settings.development.v1",
-        )
-        .map(|storage| Self {
-            storage: Box::new(storage),
+        use qm_macos::protected_record::ProtectedRecord;
+        Ok(Self {
+            storage: Box::new(
+                ProtectedRecord::open("dev.quartermaster.settings.development.v1")
+                    .map_err(|_| Error::Storage)?,
+            ),
+            anchor: Box::new(
+                ProtectedRecord::open("dev.quartermaster.settings-key.development.v1")
+                    .map_err(|_| Error::Storage)?,
+            ),
         })
-        .map_err(|_| Error::Storage)
     }
 
     pub(in crate::owner) fn load<C>(&self) -> Result<Option<Manager<C>>, Error> {
-        self.storage
-            .load()?
-            .map(|bytes| Record::decode(&bytes).map(Manager::new))
-            .transpose()
+        let Some(bytes) = self.storage.load()? else {
+            return Ok(None);
+        };
+        if bytes.len() > qm_types::PROTECTED_RECORD_BYTES {
+            return Err(Error::Invalid);
+        }
+        if let Ok(signed) = serde_json::from_slice::<SignedChange>(&bytes) {
+            let key = self.anchor.load()?.ok_or(Error::Storage)?;
+            return signed.record(&key).map(Manager::new).map(Some);
+        }
+        let legacy = Record::decode(&bytes)?;
+        self.pin(legacy.public_key())?;
+        Ok(Some(Manager::new(Record::unconfigured(
+            legacy.public_key(),
+        )?)))
+    }
+
+    fn pin(&self, key: &[u8]) -> Result<(), Error> {
+        Record::unconfigured(key)?;
+        if self.anchor.load()?.is_none() {
+            self.anchor.create(key)?;
+        }
+        if self.anchor.load()?.as_deref() != Some(key) {
+            return Err(Error::Stale);
+        }
+        Ok(())
     }
 
     pub(in crate::owner) fn register<C>(&self, key: &[u8]) -> Result<Manager<C>, Error> {
@@ -37,6 +65,7 @@ impl Store {
             return Ok(manager);
         }
         let record = Record::unconfigured(key)?;
+        self.pin(key)?;
         self.storage
             .create(&serde_json::to_vec(&record).map_err(|_| Error::Invalid)?)?;
         let retained = self.load()?.ok_or(Error::Storage)?;
@@ -47,8 +76,16 @@ impl Store {
     }
 
     pub(in crate::owner) fn publish<C>(&self, admission: Admission<C>) -> Publication<C> {
-        let result = serde_json::to_vec(admission.record())
-            .map_err(|_| Error::Invalid)
+        let result = self
+            .anchor
+            .load()
+            .and_then(|key| {
+                let key = key.ok_or(Error::Storage)?;
+                if admission.signed.record(&key)? != *admission.record() {
+                    return Err(Error::Invalid);
+                }
+                admission.signed.encoded()
+            })
             .and_then(|bytes| self.storage.replace(&bytes));
         Publication { admission, result }
     }
@@ -57,6 +94,7 @@ impl Store {
     pub(in crate::owner) fn memory() -> Self {
         Self {
             storage: Box::<tests::Memory>::default(),
+            anchor: Box::<tests::Memory>::default(),
         }
     }
 
@@ -70,6 +108,7 @@ impl Store {
         let (release, waiting) = std::sync::mpsc::sync_channel(1);
         (
             Self {
+                anchor: Box::<tests::Memory>::default(),
                 storage: Box::new(tests::Paused {
                     memory: tests::Memory::default(),
                     entered,
@@ -103,6 +142,11 @@ impl Storage for qm_macos::protected_record::ProtectedRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owner::settings::{BASE64, Engine, Proposal, Revision, Settings};
+    use ring::{
+        rand::SystemRandom,
+        signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair},
+    };
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -155,6 +199,7 @@ mod tests {
     fn registration_pins_only_an_unconfigured_record_and_cannot_replace_its_key() {
         let store = Store {
             storage: Box::<Memory>::default(),
+            anchor: Box::<Memory>::default(),
         };
         let mut first = vec![1; 65];
         first[0] = 4;
@@ -175,10 +220,99 @@ mod tests {
     fn corrupt_protected_state_is_not_replaced_by_registration() {
         let store = Store {
             storage: Box::new(Memory(Mutex::new(Some(b"corrupted".to_vec())))),
+            anchor: Box::<Memory>::default(),
         };
         let mut key = vec![1; 65];
         key[0] = 4;
         assert!(store.load::<()>().is_err());
         assert!(store.register::<()>(&key).is_err());
+    }
+
+    fn signed_store() -> (Store, Record) {
+        let random = SystemRandom::new();
+        let bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &random).unwrap();
+        let key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, bytes.as_ref(), &random)
+                .unwrap();
+        let store = Store::memory();
+        let mut manager: Manager = store.register(key.public_key().as_ref()).unwrap();
+        let review = manager
+            .prepare(
+                7,
+                [1; 16],
+                Proposal {
+                    revision: Revision(0),
+                    settings: Settings::decode(br#"{"github":null,"mutations":"deny"}"#).unwrap(),
+                    provider: None,
+                },
+                1000.into(),
+                (),
+            )
+            .unwrap();
+        let challenge = manager
+            .authenticate(&review.id, 7, 1001.into(), 1002.into())
+            .unwrap();
+        let signature = key
+            .sign(&random, &BASE64.decode(challenge.bytes).unwrap())
+            .unwrap();
+        let verified = manager
+            .approve(&review.id, 7, signature.as_ref(), 1003.into())
+            .unwrap();
+        let admission = manager.admit(verified, 1004.into()).unwrap();
+        manager.finish(store.publish(admission)).unwrap();
+        (store, manager.record().clone())
+    }
+
+    #[test]
+    fn stored_settings_retain_the_signature_and_verify_without_a_live_authentication_context() {
+        let (store, expected) = signed_store();
+        let bytes = store.storage.load().unwrap().unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            document["signature"]
+                .as_str()
+                .is_some_and(|signature| !signature.is_empty())
+        );
+        assert!(document["review"]["document"].is_string());
+        assert!(store.load::<()>().unwrap().unwrap().record() == &expected);
+    }
+
+    #[test]
+    fn stored_settings_reject_tampered_documents_timestamps_signatures_and_a_replaced_signer() {
+        for field in ["signature", "authenticated", "document", "digest", "signer"] {
+            let (store, _) = signed_store();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&store.storage.load().unwrap().unwrap()).unwrap();
+            match field {
+                "signature" => value["signature"] = BASE64.encode([0; 70]).into(),
+                "authenticated" => value["authenticated"] = 1002.into(),
+                "signer" => {
+                    let (other, _) = signed_store();
+                    value =
+                        serde_json::from_slice(&other.storage.load().unwrap().unwrap()).unwrap();
+                }
+                _ => value["review"][field] = BASE64.encode(b"altered").into(),
+            }
+            store
+                .storage
+                .replace(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+            assert!(store.load::<()>().is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn legacy_unsigned_settings_can_retain_the_key_pin_but_supply_no_policy_or_provider_authority()
+    {
+        let (store, record) = signed_store();
+        store
+            .storage
+            .replace(&serde_json::to_vec(&record).unwrap())
+            .unwrap();
+        let manager = store.load::<()>().unwrap().unwrap();
+        assert_eq!(manager.record().public_key(), record.public_key());
+        assert!(manager.record().settings().is_none());
+        assert!(manager.record().provider().is_none());
+        assert!(manager.policy().is_err());
     }
 }
