@@ -39,8 +39,13 @@ public final class SettingsEditor: ObservableObject {
     }
 
     public enum Failure: LocalizedError {
-        case unverifiedEnrollment
-        public var errorDescription: String? { "Enrolment details changed. Verify Vault before reviewing changes." }
+        case unverifiedEnrollment, noChanges
+        public var errorDescription: String? {
+            switch self {
+            case .unverifiedEnrollment: "Enrolment details changed. Verify Vault before reviewing changes."
+            case .noChanges: "There are no changes to review."
+            }
+        }
     }
     @Published public var draft = BrokerSettings()
     @Published public var enrollment = EnrollmentDraft(provider: nil) {
@@ -79,7 +84,17 @@ public final class SettingsEditor: ObservableObject {
         return nil
     }
 
-    public var canReview: Bool { available && !busy && !enrollmentNeedsVerification }
+    private var hasChanges: Bool {
+        if draft != (snapshot?.settings ?? BrokerSettings()) { return true }
+        switch selection {
+        case .keep: return false
+        case .forget: return snapshot?.provider != nil
+        case .existing(let provider): return provider != snapshot?.provider
+        case .staged: return true
+        }
+    }
+
+    public var canReview: Bool { available && !busy && !enrollmentNeedsVerification && hasChanges }
 
     public func load() async {
         await perform {
@@ -127,6 +142,7 @@ public final class SettingsEditor: ObservableObject {
     public func review() async throws -> SettingsReview {
         guard !busy, available, let snapshot else { throw BrokerControlError.busy }
         guard !enrollmentNeedsVerification else { throw Failure.unverifiedEnrollment }
+        guard hasChanges else { throw Failure.noChanges }
         busy = true
         defer { busy = false }
         guard

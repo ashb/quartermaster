@@ -24,6 +24,41 @@ private func editorProvider(
         scope: "0123456789abcdef0123456789abcdef", deviceKey: Array(repeating: 7, count: 32))
 }
 
+@Test @MainActor func unchangedPreferencesCannotBeReviewed() async throws {
+    let snapshot = editorSnapshot(provider: editorProvider())
+    var preparations = 0
+    let editor = SettingsEditor { command in
+        if case .prepareSettings = command { preparations += 1 }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    #expect(!editor.canReview)
+    await #expect(throws: (any Error).self) { try await editor.review() }
+    #expect(preparations == 0)
+}
+
+@Test @MainActor func reviewRequiresAPendingSettingsOrProviderChange() async throws {
+    let snapshot = editorSnapshot(provider: editorProvider())
+    let editor = SettingsEditor { command in
+        if case .settingsCancel = command { return .canceled }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    #expect(!editor.canReview)
+    editor.draft.mutations = .requireApproval
+    #expect(editor.canReview)
+    editor.draft.mutations = .deny
+    #expect(!editor.canReview)
+    editor.draft.github = GitHubSettings()
+    #expect(editor.canReview)
+    editor.draft.github = nil
+    #expect(!editor.canReview)
+    editor.forget()
+    #expect(editor.canReview)
+    await editor.cancel()
+    #expect(!editor.canReview)
+}
+
 @Test @MainActor func editingPreferencesAndCancelingNeverSendsProofOrChangesApprovedSettings() async throws {
     var calls: [String] = []
     let snapshot = editorSnapshot()
@@ -90,6 +125,7 @@ private func editorProvider(
         return .settingsStatus(snapshot)
     }
     await editor.load()
+    editor.draft.mutations = .requireApproval
     #expect(editor.canReview)
     editor.enrollment.itemID = "a-different-item"
     #expect(!editor.canReview)
@@ -134,11 +170,11 @@ private func editorProvider(
     editor.enrollment.itemID = "edited-item"
     await editor.cancel()
     #expect(editor.enrollment == approved)
-    #expect(editor.canReview)
+    #expect(!editor.canReview)
     editor.enrollment.server = "https://other.example.invalid"
     await editor.load()
     #expect(editor.enrollment == approved)
-    #expect(editor.canReview)
+    #expect(!editor.canReview)
 }
 
 @Test @MainActor func unchangedVerifiedEnrollmentSubmitsTheExactStagedTicket() async throws {
