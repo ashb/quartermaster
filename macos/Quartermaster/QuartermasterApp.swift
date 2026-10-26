@@ -35,7 +35,7 @@ struct QuartermasterApp: App {
         }
         MenuBarExtra("Quartermaster", systemImage: "key.horizontal") {
             Text(application.status)
-            SettingsLink { Text("Settings…") }.keyboardShortcut(",")
+            SettingsMenuItem()
             Divider()
             Button("Revoke read access", action: application.revokeReads)
             Button("Lock vault") { application.vault(.vaultLock) }
@@ -44,5 +44,17 @@ struct QuartermasterApp: App {
             Divider()
             Button("Quit Quartermaster") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
         }
+    }
+}
+
+private struct SettingsMenuItem: View {
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Button("Settings…") {
+            NSApplication.shared.setActivationPolicy(.regular)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            openSettings()
+        }.keyboardShortcut(",")
     }
 }

@@ -63,6 +63,7 @@ public final class SettingsEditor: ObservableObject {
     @Published public private(set) var busy = false
     @Published public private(set) var message = "Connecting to Quartermaster…"
     private let call: @MainActor (BrokerCommand) async throws -> BrokerReply
+    private var generation = UUID()
 
     public init(call: @escaping @MainActor (BrokerCommand) async throws -> BrokerReply) { self.call = call }
 
@@ -102,12 +103,11 @@ public final class SettingsEditor: ObservableObject {
 
     public func load() async {
         await perform {
+            let generation = generation
             let snapshot = try await currentSnapshot()
+            guard generation == self.generation else { throw CancellationError() }
             self.snapshot = snapshot
-            draft = snapshot.settings ?? BrokerSettings()
-            enrollment = EnrollmentDraft(provider: snapshot.provider)
-            selection = .keep
-            pendingRepositories = []
+            discardDraft()
             message =
                 snapshot.state == "unavailable"
                 ? "Protected settings are unavailable. Reconnect to retry."
@@ -119,6 +119,7 @@ public final class SettingsEditor: ObservableObject {
         await perform {
             guard available else { throw BrokerControlError.unavailable }
             let inputs = enrollment.normalized
+            let generation = generation
             selection = .keep
             guard
                 case .enrollmentStaged(let ticket, let provider) = try await call(
@@ -126,6 +127,10 @@ public final class SettingsEditor: ObservableObject {
                         server: inputs.server, email: inputs.email, password: password,
                         itemID: inputs.itemID.isEmpty ? nil : inputs.itemID))
             else { throw BrokerControlError.invalidMessage }
+            guard generation == self.generation else {
+                _ = try? await call(.settingsCancel(id: nil))
+                throw CancellationError()
+            }
             guard enrollment.normalized == inputs else { throw Failure.unverifiedEnrollment }
             selection = .staged(ticket: ticket, provider: provider)
             message = "Vault verified. Review and approve to select this enrolment."
@@ -148,6 +153,7 @@ public final class SettingsEditor: ObservableObject {
         guard !busy, available, let snapshot else { throw BrokerControlError.busy }
         guard !enrollmentNeedsVerification else { throw Failure.unverifiedEnrollment }
         guard hasChanges else { throw Failure.noChanges }
+        let generation = generation
         busy = true
         defer { busy = false }
         guard
@@ -156,26 +162,39 @@ public final class SettingsEditor: ObservableObject {
                     revision: snapshot.revision, settings: draft, provider: selection.choice,
                     additions: pendingRepositories))
         else { throw BrokerControlError.invalidMessage }
+        guard generation == self.generation else {
+            _ = try? await call(.settingsCancel(id: review.id))
+            throw CancellationError()
+        }
         return review
+    }
+
+    public func discardDraft() {
+        generation = UUID()
+        draft = snapshot?.settings ?? BrokerSettings()
+        enrollment = EnrollmentDraft(provider: snapshot?.provider)
+        selection = .keep
+        pendingRepositories = []
+        message = "Changes discarded."
     }
 
     public func cancel() async {
         await perform {
-            switch try await call(.settingsCancel(id: nil)) {
+            let generation = generation
+            let reply = try await call(.settingsCancel(id: nil))
+            guard generation == self.generation else { throw CancellationError() }
+            switch reply {
             case .canceled:
-                draft = snapshot?.settings ?? BrokerSettings()
-                message = "Changes discarded."
+                discardDraft()
             case .alreadyAdmitted:
                 message = "This change is already being saved. Checking the approved revision…"
                 let current = try await currentSnapshot()
+                guard generation == self.generation else { throw CancellationError() }
                 snapshot = current
-                draft = current.settings ?? BrokerSettings()
+                discardDraft()
                 message = "The change was already admitted. Current approved revision: \(current.revision)."
             default: throw BrokerControlError.invalidMessage
             }
-            selection = .keep
-            pendingRepositories = []
-            enrollment = EnrollmentDraft(provider: snapshot?.provider)
         }
     }
 
@@ -198,12 +217,15 @@ public final class SettingsEditor: ObservableObject {
     public func removeRepository(_ name: RepositoryName) { pendingRepositories.removeAll { $0.id == name.id } }
 
     private func currentSnapshot() async throws -> SettingsSnapshot {
+        let generation = generation
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(30))
         while true {
+            guard generation == self.generation else { throw CancellationError() }
             guard case .settingsStatus(let current) = try await call(.settingsStatus) else {
                 throw BrokerControlError.invalidMessage
             }
+            guard generation == self.generation else { throw CancellationError() }
             if current.state != "applying" { return current }
             guard clock.now < deadline else { throw BrokerControlError.unavailable }
             try await Task.sleep(for: .milliseconds(100))
@@ -215,10 +237,32 @@ public final class SettingsEditor: ObservableObject {
             "Could not complete this change: \(error). Approved settings remain in the backend; reconnect to inspect the current revision."
     }
 
+    public func connectionLost(_ error: any Error) {
+        invalidateSession()
+        report(error)
+    }
+
+    public func connecting() {
+        invalidateSession()
+        message = "Connecting to Quartermaster…"
+    }
+
+    private func invalidateSession() {
+        generation = UUID()
+        if let snapshot {
+            self.snapshot = SettingsSnapshot(
+                state: "unavailable", revision: snapshot.revision, session: nil,
+                settings: snapshot.settings, provider: snapshot.provider, retained: snapshot.retained)
+        }
+    }
+
     private func perform(_ operation: () async throws -> Void) async {
         guard !busy else { return }
         busy = true
+        let generation = generation
         defer { busy = false }
-        do { try await operation() } catch { report(error) }
+        do { try await operation() } catch is CancellationError {} catch {
+            if generation == self.generation { report(error) }
+        }
     }
 }

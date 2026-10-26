@@ -309,3 +309,141 @@ private func editorProvider(
     editor.draft.github = nil
     #expect(editor.pendingRepositories.isEmpty)
 }
+
+@Test @MainActor func losingTheConnectionDisablesReviewAndRetainedSelectionDespiteACachedSnapshot() async throws {
+    let provider = editorProvider()
+    let snapshot = editorSnapshot(retained: [provider])
+    var preparations = 0
+    let editor = SettingsEditor { command in
+        if case .prepareSettings = command { preparations += 1 }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    editor.useExisting(provider)
+    #expect(editor.canReview)
+    editor.connectionLost(BrokerControlError.unavailable)
+    #expect(!editor.available)
+    #expect(!editor.canReview)
+    let failure = editor.message
+    editor.useExisting(provider)
+    #expect(editor.message == failure)
+    await #expect(throws: (any Error).self) { try await editor.review() }
+    #expect(preparations == 0)
+    await editor.load()
+    #expect(editor.available)
+}
+
+@Test @MainActor func discardingADraftRestoresApprovedFieldsWithoutChangingApprovedState() async throws {
+    let snapshot = editorSnapshot(provider: editorProvider())
+    let editor = SettingsEditor { _ in .settingsStatus(snapshot) }
+    await editor.load()
+    editor.draft.github = GitHubSettings()
+    editor.addRepository("example/one")
+    editor.enrollment.email = "unsaved@example.invalid"
+    editor.discardDraft()
+    #expect(editor.draft == snapshot.settings)
+    #expect(editor.enrollment.email == snapshot.provider?.binding.email)
+    #expect(editor.pendingRepositories.isEmpty)
+    #expect(!editor.canReview)
+    #expect(editor.snapshot?.revision == snapshot.revision)
+}
+
+@Test @MainActor func closingDuringReviewPreparationCancelsTheLateReviewInsteadOfPresentingIt() async throws {
+    let snapshot = editorSnapshot()
+    let url = try #require(
+        Bundle.module.url(forResource: "settings-review", withExtension: "json", subdirectory: "Fixtures"))
+    let review = try JSONDecoder().decode(SettingsChallenge.self, from: Data(contentsOf: url)).review
+    var prepared: CheckedContinuation<BrokerReply, Never>?
+    var canceled: [String] = []
+    let editor = SettingsEditor { command in
+        switch command {
+        case .prepareSettings: return await withCheckedContinuation { prepared = $0 }
+        case .settingsCancel(let id):
+            canceled.append(try #require(id))
+            return .canceled
+        default: return .settingsStatus(snapshot)
+        }
+    }
+    await editor.load()
+    editor.draft.mutations = .requireApproval
+    let pending = Task { try await editor.review() }
+    while prepared == nil { await Task.yield() }
+    editor.discardDraft()
+    prepared?.resume(returning: .settingsReview(review))
+    await #expect(throws: CancellationError.self) { try await pending.value }
+    #expect(canceled == [review.id])
+    #expect(editor.draft == snapshot.settings)
+    #expect(!editor.canReview)
+}
+
+@Test @MainActor func closingDuringEnrollmentPreventsALateTicketEvenWhenInputsMatchApprovedValues() async throws {
+    let snapshot = editorSnapshot(provider: editorProvider())
+    let provider = try #require(snapshot.provider)
+    var staged: CheckedContinuation<BrokerReply, Never>?
+    var cancellations = 0
+    let editor = SettingsEditor { command in
+        switch command {
+        case .stageEnrollment: return await withCheckedContinuation { staged = $0 }
+        case .settingsCancel:
+            cancellations += 1
+            return .canceled
+        default: return .settingsStatus(snapshot)
+        }
+    }
+    await editor.load()
+    let pending = Task { await editor.enroll(password: "dummy-password") }
+    while staged == nil { await Task.yield() }
+    editor.discardDraft()
+    staged?.resume(returning: .enrollmentStaged(ticket: "obsolete", provider: provider))
+    await pending.value
+    #expect(editor.stagedProvider == nil)
+    #expect(cancellations == 1)
+    #expect(!editor.canReview)
+    #expect(editor.message == "Changes discarded.")
+}
+
+@Test @MainActor func aDelayedStatusReplyCannotRestoreADisconnectedSession() async throws {
+    let snapshot = editorSnapshot()
+    var reads = 0
+    var reply: CheckedContinuation<BrokerReply, Never>?
+    let editor = SettingsEditor { _ in
+        reads += 1
+        if reads > 1 { return await withCheckedContinuation { reply = $0 } }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    let pending = Task { await editor.load() }
+    while reply == nil { await Task.yield() }
+    editor.connectionLost(BrokerControlError.unavailable)
+    let failure = editor.message
+    reply?.resume(returning: .settingsStatus(snapshot))
+    await pending.value
+    #expect(!editor.available)
+    #expect(editor.message == failure)
+}
+
+@Test(arguments: [false, true]) @MainActor
+func lateCancellationRepliesCannotRestoreASessionOrEraseItsConnectionError(_ alreadyAdmitted: Bool) async throws {
+    let snapshot = editorSnapshot()
+    var reads = 0
+    var reply: CheckedContinuation<BrokerReply, Never>?
+    let editor = SettingsEditor { command in
+        if case .settingsCancel = command {
+            if alreadyAdmitted { return .alreadyAdmitted }
+            return await withCheckedContinuation { reply = $0 }
+        }
+        reads += 1
+        if reads > 1 { return await withCheckedContinuation { reply = $0 } }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    editor.draft.mutations = .requireApproval
+    let pending = Task { await editor.cancel() }
+    while reply == nil { await Task.yield() }
+    editor.connectionLost(BrokerControlError.unavailable)
+    let failure = editor.message
+    reply?.resume(returning: alreadyAdmitted ? .settingsStatus(snapshot) : .canceled)
+    await pending.value
+    #expect(!editor.available)
+    #expect(editor.message == failure)
+}

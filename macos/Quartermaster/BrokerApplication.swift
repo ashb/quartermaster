@@ -5,6 +5,7 @@ import QuartermasterSecurity
 
 @MainActor
 final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject {
+    private enum ConnectionPhase { case disconnected, connecting, connected }
     @Published private(set) var status = "Disconnected"
     @Published private(set) var vaultStatus: BrokerVaultStatus?
     private var client: BrokerConnection?
@@ -12,6 +13,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private var active: (any ApprovalWindow)?
     private var presentation: Int32?
     private var operationEnrolled = false
+    private var connectionPhase: ConnectionPhase = .disconnected
     private let controls = ApprovalControlWorkflow()
     lazy var preferences = SettingsEditor { [weak self] command in
         guard let client = self?.client else { throw BrokerFailure.disconnected }
@@ -24,11 +26,14 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func reconnect() {
+        connectionPhase = .connecting
+        preferences.connecting()
         status = "Starting Quartermaster…"
         vaultStatus = nil
         active?.cancel()
         task?.cancel()
         client?.cancel()
+        client = nil
         operationEnrolled = false
         task = Task {
             do {
@@ -55,6 +60,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 await refreshVaultStatus()
                 try Task.checkCancellation()
                 status = "Connected"
+                connectionPhase = .connected
                 while !Task.isCancelled {
                     guard !connection.disconnected else { throw BrokerFailure.disconnected }
                     if active == nil && !controls.busy && !preferences.busy,
@@ -75,7 +81,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 client = nil
                 vaultStatus = nil
                 status = "Backend unavailable: \(error)"
-                preferences.report(error)
+                connectionPhase = .disconnected
+                preferences.connectionLost(error)
             }
         }
     }
@@ -111,7 +118,19 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func reviewPreferences() {
-        guard active == nil, !controls.busy, !preferences.busy, let client else { return }
+        if let active {
+            active.window.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            return
+        }
+        guard !controls.busy, !preferences.busy else {
+            preferences.report(BrokerControlError.busy)
+            return
+        }
+        guard let client, !client.disconnected else {
+            preferences.connectionLost(BrokerFailure.disconnected)
+            return
+        }
         Task {
             await controls.perform {
                 var reviewID: String?
@@ -124,7 +143,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     present(dialog, settings: true)
                 } catch {
                     if let reviewID { _ = try? await client.call(.settingsCancel(id: reviewID)) }
-                    preferences.report(error)
+                    if !(error is CancellationError) { preferences.report(error) }
                 }
             }
         }
@@ -140,8 +159,23 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func discardChanges() {
-        active?.cancel()
+        (active as? SettingsApprovalDialog)?.cancel()
+        preferences.discardDraft()
         Task { await controls.perform { await preferences.cancel() } }
+    }
+
+    func settingsOpened() {
+        if NSApplication.shared.activationPolicy() != .regular {
+            NSApplication.shared.setActivationPolicy(.regular)
+        }
+        if connectionPhase == .disconnected { reconnect() }
+    }
+
+    func settingsClosed() {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        (active as? SettingsApprovalDialog)?.cancel()
+        preferences.discardDraft()
+        Task { await preferences.cancel() }
     }
 
     func revokeReads() {

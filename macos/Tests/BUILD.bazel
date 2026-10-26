@@ -17,6 +17,17 @@ swift_test(
     module_name = "EntitlementTests",
 )
 
+swift_test(
+    name = "PreferencesTests",
+    srcs = ["PreferencesTests.swift"],
+    copts = ["-swift-version", "6"],
+    module_name = "PreferencesTests",
+    deps = [
+        "//macos/Quartermaster:Quartermaster",
+        "//macos/Security/Sources/QuartermasterSecurity",
+    ],
+)
+
 swift_binary(
     name = "QuartermasterIntegrationTests",
     testonly = True,

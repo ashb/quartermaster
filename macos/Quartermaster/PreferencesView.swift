@@ -68,6 +68,14 @@ struct PreferencesView: View {
         }
         .frame(minWidth: 820, idealWidth: 900, minHeight: 580, idealHeight: 625)
         .onDisappear { password = "" }
+        .background(
+            PreferencesWindowLifecycle(
+                opened: application.settingsOpened,
+                closed: {
+                    password = ""
+                    repository = ""
+                    application.settingsClosed()
+                }))
     }
 
     private var vault: some View {

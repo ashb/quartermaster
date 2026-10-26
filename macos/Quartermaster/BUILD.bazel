@@ -16,6 +16,7 @@ swift_library(
         "BrokerConnection.swift",
         "PreferencesLayout.swift",
         "PreferencesView.swift",
+        "PreferencesWindowLifecycle.swift",
         "QuartermasterApp.swift",
     ],
     copts = [
