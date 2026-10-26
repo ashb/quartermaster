@@ -21,6 +21,7 @@ public enum BrokerCommand: Encodable, Sendable {
     case revokeReadGrants
     case settingsRegister(publicKey: Data)
     case settingsStatus
+    case prepareSettingsImport(id: String)
     case stageEnrollment(server: String, email: String, password: String, itemID: String?)
     case prepareSettings(
         revision: UInt64, settings: BrokerSettings, provider: SettingsProviderChoice, additions: [RepositoryName] = [])
@@ -30,7 +31,8 @@ public enum BrokerCommand: Encodable, Sendable {
 
     public var timeout: DispatchTimeInterval {
         switch self {
-        case .presence, .settingsPresence, .settingsProof, .settingsRegister, .prepareSettings: .seconds(30)
+        case .presence, .settingsPresence, .settingsProof, .settingsRegister, .prepareSettings, .prepareSettingsImport:
+            .seconds(30)
         case .vaultLogin, .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard, .stageEnrollment: .seconds(120)
         case .hello, .enroll, .next, .proof, .cancel, .vaultStatus, .revokeReadGrants: .seconds(5)
         case .settingsStatus, .settingsCancel: .seconds(5)
@@ -84,6 +86,9 @@ public enum BrokerCommand: Encodable, Sendable {
             kind = "settingsRegister"
             try fields.encode(key, forKey: .publicKey)
         case .settingsStatus: kind = "settingsStatus"
+        case .prepareSettingsImport(let id):
+            kind = "prepareSettingsImport"
+            try fields.encode(id, forKey: .id)
         case .stageEnrollment(let server, let email, let password, let itemID):
             kind = "stageEnrollment"
             try fields.encode(server, forKey: .server)
@@ -134,6 +139,7 @@ public struct VaultBinding: Codable, Equatable, Sendable {
 public struct BrokerVaultStatus: Decodable, Sendable {
     public enum State: String, Decodable, Sendable {
         case unenrolled
+        case settingsImportRequired = "settings_import_required"
         case incompleteEnrollment = "incomplete_enrollment"
         case locked
         case onlineUnlocked = "online_unlocked"

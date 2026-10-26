@@ -74,6 +74,7 @@ impl std::error::Error for ServiceError {
 #[serde(rename_all = "snake_case")]
 pub enum VaultState {
     Unenrolled,
+    SettingsImportRequired,
     IncompleteEnrollment,
     Locked,
     OnlineUnlocked,

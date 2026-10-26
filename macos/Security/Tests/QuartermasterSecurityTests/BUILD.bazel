@@ -33,6 +33,7 @@ swift_test(
         "ReadGrantReviewTests.swift",
         "SecureEnclaveApprovalKeyStorageTests.swift",
         "SettingsEditorTests.swift",
+        "SettingsMigrationTests.swift",
         "SettingsWorkflowTests.swift",
         ":test_resource_accessor",  # keep
     ],

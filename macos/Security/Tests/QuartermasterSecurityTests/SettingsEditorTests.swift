@@ -3,12 +3,12 @@ import Testing
 
 @testable import QuartermasterSecurity
 
-private func editorSnapshot(provider: SettingsProvider? = nil, retained: [SettingsProvider] = []) -> SettingsSnapshot {
+private func editorSnapshot(provider: SettingsProvider? = nil) -> SettingsSnapshot {
     var settings = BrokerSettings()
     settings.mutations = .deny
     return SettingsSnapshot(
         state: "configured", revision: 4, session: Data(repeating: 1, count: 16),
-        settings: settings, provider: provider, retained: retained)
+        settings: settings, provider: provider, migration: nil)
 }
 
 private func editorProvider(
@@ -245,28 +245,6 @@ private func editorProvider(
     #expect(!editor.canReview)
 }
 
-@Test @MainActor func retainedEnrollmentSelectionIsExplicitAndEditingInvalidatesIt() async throws {
-    let snapshot = editorSnapshot(retained: [editorProvider()])
-    let retained = try #require(snapshot.retained.first)
-    let editor = SettingsEditor { command in
-        if case .settingsCancel = command { return .canceled }
-        return .settingsStatus(snapshot)
-    }
-    await editor.load()
-    #expect(editor.retainedProvider == nil)
-    #expect(editor.enrollment.itemID.isEmpty)
-    editor.useExisting(retained)
-    #expect(editor.enrollment.itemID == retained.binding.itemID)
-    #expect(editor.retainedProvider == retained)
-    #expect(editor.canReview)
-    #expect(editor.snapshot?.provider == nil)
-    editor.enrollment.email = "another@example.invalid"
-    #expect(editor.retainedProvider == nil)
-    #expect(!editor.canReview)
-    await editor.cancel()
-    #expect(editor.enrollment.itemID.isEmpty)
-}
-
 @Test @MainActor func cancelAfterAdmissionInspectsTheCommittedRevisionBeforeReportingAnOutcome() async throws {
     let snapshot = editorSnapshot()
     let editor = SettingsEditor { command in
@@ -287,7 +265,7 @@ private func editorProvider(
     settings.github = GitHubSettings()
     let snapshot = SettingsSnapshot(
         state: "configured", revision: 4, session: Data(repeating: 1, count: 16), settings: settings,
-        provider: editorProvider(), retained: [])
+        provider: editorProvider(), migration: nil)
     let editor = SettingsEditor { command in
         if case .settingsCancel = command { return .canceled }
         return .settingsStatus(snapshot)
@@ -310,22 +288,22 @@ private func editorProvider(
     #expect(editor.pendingRepositories.isEmpty)
 }
 
-@Test @MainActor func losingTheConnectionDisablesReviewAndRetainedSelectionDespiteACachedSnapshot() async throws {
+@Test @MainActor func losingTheConnectionDisablesReviewDespiteACachedSnapshot() async throws {
     let provider = editorProvider()
-    let snapshot = editorSnapshot(retained: [provider])
+    let snapshot = editorSnapshot(provider: provider)
     var preparations = 0
     let editor = SettingsEditor { command in
         if case .prepareSettings = command { preparations += 1 }
         return .settingsStatus(snapshot)
     }
     await editor.load()
-    editor.useExisting(provider)
+    editor.draft.mutations = .requireApproval
     #expect(editor.canReview)
     editor.connectionLost(BrokerControlError.unavailable)
     #expect(!editor.available)
     #expect(!editor.canReview)
     let failure = editor.message
-    editor.useExisting(provider)
+    editor.draft.mutations = .deny
     #expect(editor.message == failure)
     await #expect(throws: (any Error).self) { try await editor.review() }
     #expect(preparations == 0)

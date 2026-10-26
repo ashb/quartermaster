@@ -56,10 +56,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 guard case .settingsStatus = try await connection.call(.settingsRegister(publicKey: key)) else {
                     throw BrokerFailure.invalidMessage
                 }
-                await preferences.load()
-                await refreshVaultStatus()
+                await reloadPreferences()
                 try Task.checkCancellation()
-                status = "Connected"
                 connectionPhase = .connected
                 while !Task.isCancelled {
                     guard !connection.disconnected else { throw BrokerFailure.disconnected }
@@ -118,6 +116,14 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func reviewPreferences() {
+        reviewSettings(importing: false)
+    }
+
+    func reviewMigration() {
+        reviewSettings(importing: true)
+    }
+
+    private func reviewSettings(importing: Bool) {
         if let active {
             active.window.makeKeyAndOrderFront(nil)
             NSApplication.shared.activate(ignoringOtherApps: true)
@@ -135,7 +141,12 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             await controls.perform {
                 var reviewID: String?
                 do {
-                    let review = try await preferences.review()
+                    let review: SettingsReview
+                    if importing {
+                        review = try await preferences.reviewMigration()
+                    } else {
+                        review = try await preferences.review()
+                    }
                     reviewID = review.id
                     let pending = try SettingsPending(client: client, review: review)
                     presentation = try DialogPresentationLease.acquire()
@@ -218,6 +229,17 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         }
     }
 
+    func reloadPreferences() async {
+        await preferences.load()
+        await refreshVaultStatus()
+        guard !Task.isCancelled else { return }
+        if preferences.available {
+            status = preferences.snapshot?.migration == nil ? "Connected" : "Settings import required — open Settings"
+        } else {
+            status = "Protected settings unavailable"
+        }
+    }
+
     private func present(_ dialog: any ApprovalWindow, settings: Bool = false) {
         dialog.onClose = { [weak self] in
             guard let self else { return }
@@ -225,10 +247,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             releasePresentation()
             if settings {
                 operationEnrolled = false
-                Task {
-                    await preferences.load()
-                    await refreshVaultStatus()
-                }
+                Task { await reloadPreferences() }
             }
         }
         active = dialog

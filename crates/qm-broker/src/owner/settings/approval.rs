@@ -1,4 +1,4 @@
-use super::{BASE64, Engine, Error, Proposal, Record, Revision};
+use super::{BASE64, Engine, Error, Migration, MigrationSource, Proposal, Record, Revision};
 use qm_types::MonotonicTimestamp;
 use ring::{
     digest::{SHA256, digest},
@@ -59,6 +59,7 @@ enum Phase<C> {
 
 pub(in crate::owner) struct Manager<C = ()> {
     record: Record,
+    migration: Option<Migration>,
     phase: Phase<C>,
 }
 
@@ -88,6 +89,16 @@ pub(super) struct SignedChange {
     signature: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Document {
+    version: String,
+    previous: Record,
+    proposed: Record,
+    #[serde(default)]
+    migration: Option<MigrationSource>,
+}
+
 impl SignedChange {
     pub(super) fn encoded(&self) -> Result<Vec<u8>, Error> {
         let bytes = serde_json::to_vec(self).map_err(|_| Error::Invalid)?;
@@ -98,13 +109,6 @@ impl SignedChange {
     }
 
     pub(super) fn record(&self, key: &[u8]) -> Result<Record, Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Document {
-            version: String,
-            previous: Record,
-            proposed: Record,
-        }
         let review = &self.review;
         let document = BASE64
             .decode(&review.document)
@@ -136,6 +140,12 @@ impl SignedChange {
             return Err(Error::Invalid);
         }
         let document: Document = serde_json::from_slice(&document).map_err(|_| Error::Invalid)?;
+        if let Some(source) = &document.migration {
+            source.validate()?;
+            if document.previous.settings().is_some() || document.previous.provider().is_some() {
+                return Err(Error::Invalid);
+            }
+        }
         for record in [&document.previous, &document.proposed] {
             Record::decode(&serde_json::to_vec(record).map_err(|_| Error::Invalid)?)?;
             if record.public_key() != key {
@@ -157,6 +167,14 @@ impl SignedChange {
             .verify(&signing_bytes(review, self.authenticated)?, &signature)
             .map_err(|_| Error::Invalid)?;
         Ok(document.proposed)
+    }
+
+    pub(super) fn migration_source(&self) -> Result<Option<MigrationSource>, Error> {
+        let bytes = BASE64
+            .decode(&self.review.document)
+            .map_err(|_| Error::Invalid)?;
+        let document: Document = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
+        Ok(document.migration)
     }
 }
 
@@ -187,8 +205,23 @@ impl<C> Manager<C> {
     pub(super) fn new(record: Record) -> Self {
         Self {
             record,
+            migration: None,
             phase: Phase::Idle,
         }
+    }
+    pub(super) fn from_legacy(record: Record, bytes: &[u8]) -> Result<Self, Error> {
+        let migration = Migration::from_legacy(&record, bytes)?;
+        let mut inactive = record;
+        inactive.settings = None;
+        inactive.provider = None;
+        Ok(Self {
+            record: inactive,
+            migration,
+            phase: Phase::Idle,
+        })
+    }
+    pub(in crate::owner) fn migration(&self) -> Option<&Migration> {
+        self.migration.as_ref()
     }
     pub(in crate::owner) fn record(&self) -> &Record {
         &self.record
@@ -244,6 +277,49 @@ impl<C> Manager<C> {
         now: MonotonicTimestamp,
         context: C,
     ) -> Result<Review, Error> {
+        if self.migration.is_some() {
+            return Err(Error::Stale);
+        }
+        self.prepare_change(connection, session, proposal, now, context, None)
+    }
+
+    pub(in crate::owner) fn prepare_import(
+        &mut self,
+        id: &str,
+        connection: u64,
+        session: [u8; 16],
+        now: MonotonicTimestamp,
+        context: C,
+    ) -> Result<Review, Error> {
+        let migration = self
+            .migration
+            .as_ref()
+            .filter(|migration| migration.source.id == id)
+            .ok_or(Error::Stale)?
+            .clone();
+        self.prepare_change(
+            connection,
+            session,
+            Proposal {
+                revision: self.record.revision(),
+                settings: migration.settings,
+                provider: migration.provider,
+            },
+            now,
+            context,
+            Some(migration.source),
+        )
+    }
+
+    fn prepare_change(
+        &mut self,
+        connection: u64,
+        session: [u8; 16],
+        proposal: Proposal,
+        now: MonotonicTimestamp,
+        context: C,
+        migration: Option<MigrationSource>,
+    ) -> Result<Review, Error> {
         let Proposal {
             revision,
             settings,
@@ -272,11 +348,14 @@ impl<C> Manager<C> {
             version: &'static str,
             previous: &'a Record,
             proposed: &'a Record,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            migration: Option<MigrationSource>,
         }
         let bytes = serde_json::to_vec(&Document {
             version: "quartermaster.settings-review.v1",
             previous: &self.record,
             proposed: &proposed,
+            migration,
         })
         .map_err(|_| Error::Invalid)?;
         if bytes.len() > 2 * super::RECORD_LIMIT {
@@ -433,6 +512,7 @@ impl<C> Manager<C> {
         match result {
             Ok(()) => {
                 self.record = admission.record;
+                self.migration = None;
                 self.phase = Phase::Idle;
                 Ok(admission.context)
             }

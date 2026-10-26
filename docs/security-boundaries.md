@@ -53,6 +53,14 @@ including backend-resolved values. Rust may prepare drafts but must not publish
 or trust unsigned changes. An unsigned bootstrap record may pin the approval key
 but grants no settings or provider authority.
 
+Recognised older settings formats produce an inactive migration candidate, never
+an empty configured state. Preserve the source and its revision until the user
+reviews and signs the complete import. Bind the source format and digest into
+that review, and reject publication if the source changes. Cancel, expiry and
+restart preserve the pending import; a successful signed import loads normally
+without another migration. Unknown or damaged formats fail explicitly rather
+than falling back to defaults or discovering authority from cache files.
+
 Saving reviewed repository names may perform fixed GitHub metadata GETs using
 the selected credential, after an authenticated protected-key operation. This
 internal-read policy permits each frozen name once, under the save's original
@@ -64,9 +72,10 @@ partial lookup results never become active settings.
 Enrolment verification seals an inactive cache slot and retains its verified
 snapshot only in Rust. Approval selects its exact binding, device-key identity
 and cache revision. Cancellation, expiry, connection loss or a conflicting
-provider generation prevents selection and releases pending plaintext. Retained
-cache metadata only lists candidates: review freezes the slot, binding and key
-identity, substitution denies, and selection requires authenticated unwrap.
+provider generation prevents selection and releases pending plaintext. Importing
+a previous selection freezes its slot, binding and key identity, rejects cache
+substitution and requires authenticated unwrap. Orphan cache files cannot select
+an enrolment or initiate a settings import.
 Opening settings or reviewing drafts never arms authentication; the user chooses
 Save Changes before Touch ID authorizes publication.
 

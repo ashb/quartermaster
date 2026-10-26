@@ -17,6 +17,7 @@ use qm_macos::presence_clock::{MonotonicTimestamp, monotonic_raw as now};
 use qm_providers::{RbwProvider, VaultSnapshot};
 use std::{sync::Arc, time::Duration};
 
+mod import;
 mod repositories;
 
 struct Enrollment {
@@ -130,12 +131,18 @@ pub(super) fn status(
         .is_some_and(|manager| !manager.stable())
     {
         "applying"
+    } else if admin
+        .manager
+        .as_ref()
+        .is_some_and(|manager| manager.migration().is_some())
+    {
+        "migrationRequired"
     } else if record.is_some_and(|record| record.settings().is_some()) {
         "configured"
     } else {
         "unconfigured"
     };
-    let mut settings = Snapshot {
+    let settings = Snapshot {
         state: status,
         revision: record.map_or(Revision(0), |record| record.revision()),
         session: admin
@@ -145,12 +152,8 @@ pub(super) fn status(
             .map(|session| BASE64.encode(session.id)),
         settings: record.and_then(|record| record.settings()).cloned(),
         provider: record.and_then(|record| record.provider()).cloned(),
-        retained: Vec::new(),
+        migration: admin.manager.as_ref().and_then(Manager::migration).cloned(),
     };
-    drop(state);
-    if settings.provider.is_none() && matches!(status, "configured" | "unconfigured") {
-        settings.retained = crate::owner::settings::retained::discover(&paths.root);
-    }
     Ok(Reply::SettingsStatus { settings })
 }
 
@@ -240,6 +243,8 @@ pub(super) fn message(
     let paths = paths.clone();
     let cleanup_shared = Arc::clone(&shared);
     let cleanup_peer = peer.clone();
+    // Failed import preparation installs no pending state and owns no cleanup.
+    let cancel_on_error = !matches!(&request, Client::PrepareSettingsImport { .. });
     let cleanup_id = match &request {
         Client::SettingsPresence { id, .. } | Client::SettingsProof { id, .. } => Some(id.clone()),
         _ => None,
@@ -256,6 +261,9 @@ pub(super) fn message(
             } => stage(server, email, password, item_id, &peer, &shared, &paths).await,
             request => tokio::task::spawn_blocking(move || match request {
                 Client::SettingsStatus {} => status(&shared, &paths, peer.id()),
+                Client::PrepareSettingsImport { id } => {
+                    import::prepare(&id, &peer, &shared, &paths)
+                }
                 Client::SettingsRegister { public_key } => {
                     register(&public_key, &peer, &shared, &paths)
                 }
@@ -280,6 +288,7 @@ pub(super) fn message(
             .and_then(|result| result),
         };
         if result.is_err()
+            && cancel_on_error
             && let Ok(mut state) = cleanup_shared.0.lock()
             && state
                 .administration
@@ -372,23 +381,7 @@ fn prepare(
     choice: ProviderChoice,
     peer: &ipc::PeerHandle,
     shared: &Shared,
-    paths: &ServicePaths,
 ) -> Result<Reply> {
-    let existing = match &choice {
-        ProviderChoice::Existing { provider } => {
-            provider.validate()?;
-            let source = Source::capture(&provider.root(&paths.root))?;
-            let identity = source.identity()?;
-            if identity.binding != provider.binding
-                || identity.scope != provider.scope
-                || identity.device_key != provider.device_key
-            {
-                return Err(Fault::ProviderChanged.into());
-            }
-            Some((source, identity))
-        }
-        _ => None,
-    };
     let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
     state.ensure_interactive()?;
     if state.pending.is_some() {
@@ -409,13 +402,6 @@ fn prepare(
     let (pin, source, identity, warm) = match choice {
         ProviderChoice::Keep => (old.clone(), None, None, None),
         ProviderChoice::Forget => (None, None, None, None),
-        ProviderChoice::Existing { provider } => {
-            if old.is_some() {
-                return Err(ControlError::Denied.into());
-            }
-            let (source, identity) = existing.ok_or(ControlError::Denied)?;
-            (Some(provider), Some(source), Some(identity), None)
-        }
         ProviderChoice::Staged { ticket } => {
             let staged = admin
                 .staged
@@ -867,7 +853,7 @@ mod tests {
             .unwrap()
         }
 
-        fn review(&self) -> Value {
+        pub(super) fn review(&self) -> Value {
             self.review_with_settings(json!({"github":{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}],"approveUnverifiedRequests":true},"mutations":"requireApproval"}))
         }
 
@@ -922,6 +908,15 @@ mod tests {
             let signature = self.key.sign(&SystemRandom::new(), &bytes).unwrap();
             json!({"kind":"settingsProof", "id":review["id"], "signature":BASE64.encode(signature.as_ref())})
         }
+
+        pub(super) fn require_import(&self) -> Value {
+            let store = self.paths.settings.as_ref().unwrap();
+            crate::owner::settings::use_legacy_format(store);
+            let manager = store.load().unwrap().unwrap();
+            self.paths.policy.install(&manager).unwrap();
+            self.shared.0.lock().unwrap().administration.manager = Some(manager);
+            self.call(json!({"kind":"settingsStatus"}), None)["settings"]["migration"].clone()
+        }
     }
 
     impl Drop for Harness {
@@ -966,7 +961,8 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_enrollments_are_discoverable_and_reselection_requires_authenticated_unwrap() {
+    fn native_import_keeps_previous_settings_visible_but_inactive_and_requires_authenticated_unwrap()
+     {
         let harness = Harness::new();
         let review = harness.review();
         let challenge = harness.authenticate(&review);
@@ -977,63 +973,119 @@ mod tests {
         let document: Value =
             serde_json::from_slice(&BASE64.decode(review["document"].as_str().unwrap()).unwrap())
                 .unwrap();
-        let rules = &document["proposed"]["settings"];
-        let forget = harness.call(json!({"kind":"prepareSettings", "revision":1, "settings":rules, "provider":{"kind":"forget"}}), None);
-        let challenge = harness.authenticate(&forget["review"]);
-        assert_eq!(
-            harness.proof(&forget["review"], &challenge)["kind"],
-            "settingsApplied"
+        let migration = harness.require_import();
+        let status = harness.call(json!({"kind":"settingsStatus"}), None);
+        assert_eq!(status["settings"]["state"], "migrationRequired");
+        assert!(status["settings"]["provider"].is_null());
+        assert_eq!(migration["settings"], document["proposed"]["settings"]);
+        assert_eq!(migration["provider"], document["proposed"]["provider"]);
+        let importing = harness.call(
+            json!({"kind":"prepareSettingsImport", "id":migration["source"]["id"]}),
+            None,
         );
-        let status = harness.call(json!({"kind":"settingsStatus"}), None);
-        assert!(status["settings"]["provider"].is_null());
-        let retained = status["settings"]["retained"].as_array().unwrap();
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0]["slot"], "a".repeat(32));
-        let reselect = harness.call(json!({"kind":"prepareSettings", "revision":2, "settings":rules, "provider":{"kind":"existing", "provider":retained[0]}}), None);
-        assert_eq!(reselect["kind"], "settingsReview", "{reselect}");
-        let document: Value = serde_json::from_slice(
-            &BASE64
-                .decode(reselect["review"]["document"].as_str().unwrap())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(document["proposed"]["provider"], retained[0]);
-        let status = harness.call(json!({"kind":"settingsStatus"}), None);
-        assert_eq!(status["settings"]["revision"], 2);
-        assert!(status["settings"]["provider"].is_null());
-        let response = harness.call(json!({"kind":"settingsPresence", "id":reselect["review"]["id"], "authenticated":u64::from(now().unwrap())}), None);
+        assert_eq!(importing["kind"], "settingsReview", "{importing}");
+        let context = unsafe { LAContext::new() };
+        let response = harness.call(json!({"kind":"settingsPresence", "id":importing["review"]["id"], "authenticated":u64::from(now().unwrap())}), Some(&context));
         assert_eq!(response["kind"], "error");
+        assert_eq!(
+            harness.call(json!({"kind":"settingsStatus"}), None)["settings"]["state"],
+            "migrationRequired"
+        );
         assert!(
-            harness.call(json!({"kind":"settingsStatus"}), None)["settings"]["provider"].is_null()
+            harness
+                .paths
+                .settings
+                .as_ref()
+                .unwrap()
+                .load::<()>()
+                .unwrap()
+                .unwrap()
+                .migration()
+                .is_some()
         );
     }
 
     #[test]
-    fn retained_enrollment_selection_rejects_changed_identity_and_unsafe_slots() {
+    fn native_import_cannot_select_another_source_or_substituted_cache() {
         let harness = Harness::new();
         let review = harness.review();
-        harness.call(json!({"kind":"settingsCancel", "id":review["id"]}), None);
+        let challenge = harness.authenticate(&review);
+        assert_eq!(
+            harness.proof(&review, &challenge)["kind"],
+            "settingsApplied"
+        );
+        let migration = harness.require_import();
+        assert_eq!(
+            harness.call(
+                json!({"kind":"prepareSettingsImport", "id":"different"}),
+                None
+            )["kind"],
+            "error"
+        );
+        let pin: ProviderPin = serde_json::from_value(migration["provider"].clone()).unwrap();
+        vault::fixture::put(
+            &pin.root(&harness.paths.root),
+            &crate::owner::test_support::vault::snapshot("github-read"),
+        );
+        assert_eq!(
+            harness.call(
+                json!({"kind":"prepareSettingsImport", "id":migration["source"]["id"]}),
+                None
+            )["kind"],
+            "error"
+        );
+        assert_eq!(
+            harness.call(json!({"kind":"settingsStatus"}), None)["settings"]["state"],
+            "migrationRequired"
+        );
+    }
+
+    #[test]
+    fn native_import_uses_the_existing_signature_flow_and_does_not_recur_after_publication() {
+        let harness = Harness::new();
+        let prepared = harness.call(json!({"kind":"prepareSettings", "revision":0, "settings":{"github":null,"mutations":"deny"},"provider":{"kind":"keep"}}), None);
+        let challenge = harness.authenticate(&prepared["review"]);
+        assert_eq!(
+            harness.proof(&prepared["review"], &challenge)["kind"],
+            "settingsApplied"
+        );
+        let migration = harness.require_import();
+        let prepared = harness.call(
+            json!({"kind":"prepareSettingsImport", "id":migration["source"]["id"]}),
+            None,
+        );
+        harness.call(
+            json!({"kind":"settingsCancel", "id":prepared["review"]["id"]}),
+            None,
+        );
+        assert_eq!(
+            harness.call(json!({"kind":"settingsStatus"}), None)["settings"]["state"],
+            "migrationRequired"
+        );
+        let prepared = harness.call(
+            json!({"kind":"prepareSettingsImport", "id":migration["source"]["id"]}),
+            None,
+        );
+        let challenge = harness.authenticate(&prepared["review"]);
+        assert_eq!(
+            harness.proof(&prepared["review"], &challenge)["kind"],
+            "settingsApplied"
+        );
         let status = harness.call(json!({"kind":"settingsStatus"}), None);
-        let retained = &status["settings"]["retained"][0];
-        assert!(retained.is_object());
-        let document: Value =
-            serde_json::from_slice(&BASE64.decode(review["document"].as_str().unwrap()).unwrap())
-                .unwrap();
-        for field in ["binding", "scope", "deviceKey", "slot"] {
-            let mut changed = retained.clone();
-            match field {
-                "binding" => changed[field]["email"] = json!("other@example.invalid"),
-                "scope" => changed[field] = json!("b".repeat(32)),
-                "deviceKey" => changed[field] = json!([8; 32].to_vec()),
-                _ => changed[field] = json!("../../outside"),
-            }
-            let response = harness.call(json!({"kind":"prepareSettings", "revision":0, "settings":document["proposed"]["settings"], "provider":{"kind":"existing", "provider":changed}}), None);
-            assert_eq!(response["kind"], "error", "{field}: {response}");
-            assert!(
-                harness.call(json!({"kind":"settingsStatus"}), None)["settings"]["provider"]
-                    .is_null()
-            );
-        }
+        assert_eq!(status["settings"]["state"], "configured");
+        assert!(status["settings"]["migration"].is_null());
+        assert!(
+            harness
+                .paths
+                .settings
+                .as_ref()
+                .unwrap()
+                .load::<()>()
+                .unwrap()
+                .unwrap()
+                .migration()
+                .is_none()
+        );
     }
 
     #[test]

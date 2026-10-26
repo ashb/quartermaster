@@ -59,7 +59,7 @@ pub(super) fn prepare(
     shared: &Shared,
     paths: &ServicePaths,
 ) -> Result<Reply> {
-    let reply = super::prepare(revision, settings, provider, peer, shared, paths)?;
+    let reply = super::prepare(revision, settings, provider, peer, shared)?;
     if additions.is_empty() {
         return Ok(reply);
     }

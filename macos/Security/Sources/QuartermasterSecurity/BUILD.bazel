@@ -17,6 +17,7 @@ swift_library(
         "RepositoryName.swift",
         "SecureEnclaveApprovalKeyStorage.swift",
         "SettingsEditor.swift",
+        "SettingsMigration.swift",
         "SettingsWorkflow.swift",
     ],
     copts = [

@@ -8,17 +8,28 @@ private struct SettingsApprovalView: View {
     @ObservedObject var controller: ApprovalController
     let close: () -> Void
     @State private var saving = false
+    private var importing: Bool { document.migration != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Label("Approve preferences", systemImage: "gearshape.fill").font(.title2.bold())
-            Text("Revision \(document.previous.revision) → \(document.proposed.revision)")
-                .foregroundStyle(.secondary)
+            Label(
+                importing ? "Import and trust previous settings" : "Approve preferences", systemImage: "gearshape.fill"
+            ).font(.title2.bold())
+            Text(
+                importing
+                    ? "Review these settings before importing them."
+                    : "Revision \(document.previous.revision) → \(document.proposed.revision)"
+            )
+            .foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    record(document.previous, title: "Currently approved")
-                    Divider()
-                    record(document.proposed, title: "Proposed", additions: document.additions ?? [])
+                    if !importing {
+                        record(document.previous, title: "Currently approved")
+                        Divider()
+                    }
+                    record(
+                        document.proposed, title: importing ? "Settings to import" : "Proposed",
+                        additions: document.additions ?? [])
                     DisclosureSection("Complete proposal · literal byte escapes") {
                         ScrollView(.horizontal) {
                             Text(verbatim: review.text).font(.caption.monospaced()).textSelection(.enabled)
@@ -42,7 +53,7 @@ private struct SettingsApprovalView: View {
                     )
                     .frame(width: 32, height: 32)
                 } else {
-                    Button("Save Changes") { saving = true }
+                    Button(importing ? "Import and Trust" : "Save Changes") { saving = true }
                         .keyboardShortcut(.defaultAction)
                         .disabled(controller.phase != .review)
                 }
@@ -95,12 +106,16 @@ public final class SettingsApprovalDialog: NSObject, NSWindowDelegate, ApprovalW
     public var onClose: (() -> Void)?
 
     public init(review: SettingsReview, document: SettingsDocument, backend: any ApprovalBackend) {
-        controller = ApprovalController(backend: backend, reason: "approve these Quartermaster preferences")
+        controller = ApprovalController(
+            backend: backend,
+            reason: document.migration == nil
+                ? "approve these Quartermaster preferences" : "import and trust these Quartermaster settings")
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 648, height: 530), styleMask: [.titled, .closable],
             backing: .buffered, defer: false)
         super.init()
-        window.title = "Quartermaster preferences approval"
+        window.title =
+            document.migration == nil ? "Quartermaster preferences approval" : "Quartermaster settings import"
         window.isReleasedWhenClosed = false
         window.delegate = self
         let window = window

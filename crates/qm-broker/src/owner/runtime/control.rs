@@ -55,6 +55,7 @@ pub(super) fn handle(
         | Client::VaultDiscard {} => Err(Error::State(Fault::UnsupportedVaultCommand)),
         Client::SettingsRegister { .. }
         | Client::SettingsStatus {}
+        | Client::PrepareSettingsImport { .. }
         | Client::StageEnrollment { .. }
         | Client::PrepareSettings { .. }
         | Client::SettingsPresence { .. }

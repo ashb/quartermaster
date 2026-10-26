@@ -41,9 +41,7 @@ impl Store {
         }
         let legacy = Record::decode(&bytes)?;
         self.pin(legacy.public_key())?;
-        Ok(Some(Manager::new(Record::unconfigured(
-            legacy.public_key(),
-        )?)))
+        Manager::from_legacy(legacy, &bytes).map(Some)
     }
 
     fn pin(&self, key: &[u8]) -> Result<(), Error> {
@@ -83,6 +81,9 @@ impl Store {
                 let key = key.ok_or(Error::Storage)?;
                 if admission.signed.record(&key)? != *admission.record() {
                     return Err(Error::Invalid);
+                }
+                if let Some(source) = admission.signed.migration_source()? {
+                    source.check_current(&self.storage.load()?.ok_or(Error::Storage)?)?;
                 }
                 admission.signed.encoded()
             })
@@ -140,7 +141,7 @@ impl Storage for qm_macos::protected_record::ProtectedRecord {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::owner::settings::{BASE64, Engine, Proposal, Revision, Settings};
     use ring::{
@@ -228,7 +229,15 @@ mod tests {
         assert!(store.register::<()>(&key).is_err());
     }
 
-    fn signed_store() -> (Store, Record) {
+    pub(in crate::owner) fn use_legacy_format(store: &Store) {
+        let record = store.load::<()>().unwrap().unwrap().record().clone();
+        store
+            .storage
+            .replace(&serde_json::to_vec(&record).unwrap())
+            .unwrap();
+    }
+
+    fn signed_store() -> (Store, Record, EcdsaKeyPair) {
         let random = SystemRandom::new();
         let bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &random).unwrap();
         let key =
@@ -243,7 +252,14 @@ mod tests {
                 Proposal {
                     revision: Revision(0),
                     settings: Settings::decode(br#"{"github":null,"mutations":"deny"}"#).unwrap(),
-                    provider: None,
+                    provider: Some(super::super::ProviderPin {
+                        slot: "legacy".into(),
+                        binding: crate::owner::test_support::vault::snapshot("github-write")
+                            .binding()
+                            .clone(),
+                        scope: "0".repeat(32),
+                        device_key: [7; 32],
+                    }),
                 },
                 1000.into(),
                 (),
@@ -260,12 +276,12 @@ mod tests {
             .unwrap();
         let admission = manager.admit(verified, 1004.into()).unwrap();
         manager.finish(store.publish(admission)).unwrap();
-        (store, manager.record().clone())
+        (store, manager.record().clone(), key)
     }
 
     #[test]
     fn stored_settings_retain_the_signature_and_verify_without_a_live_authentication_context() {
-        let (store, expected) = signed_store();
+        let (store, expected, _) = signed_store();
         let bytes = store.storage.load().unwrap().unwrap();
         let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
@@ -275,19 +291,20 @@ mod tests {
         );
         assert!(document["review"]["document"].is_string());
         assert!(store.load::<()>().unwrap().unwrap().record() == &expected);
+        assert!(store.load::<()>().unwrap().unwrap().migration().is_none());
     }
 
     #[test]
     fn stored_settings_reject_tampered_documents_timestamps_signatures_and_a_replaced_signer() {
         for field in ["signature", "authenticated", "document", "digest", "signer"] {
-            let (store, _) = signed_store();
+            let (store, _, _) = signed_store();
             let mut value: serde_json::Value =
                 serde_json::from_slice(&store.storage.load().unwrap().unwrap()).unwrap();
             match field {
                 "signature" => value["signature"] = BASE64.encode([0; 70]).into(),
                 "authenticated" => value["authenticated"] = 1002.into(),
                 "signer" => {
-                    let (other, _) = signed_store();
+                    let (other, _, _) = signed_store();
                     value =
                         serde_json::from_slice(&other.storage.load().unwrap().unwrap()).unwrap();
                 }
@@ -302,17 +319,165 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unsigned_settings_can_retain_the_key_pin_but_supply_no_policy_or_provider_authority()
-    {
-        let (store, record) = signed_store();
+    fn legacy_settings_preserve_the_source_revision_without_policy_or_provider_authority() {
+        let (store, record, _) = signed_store();
         store
             .storage
             .replace(&serde_json::to_vec(&record).unwrap())
             .unwrap();
         let manager = store.load::<()>().unwrap().unwrap();
         assert_eq!(manager.record().public_key(), record.public_key());
+        assert_eq!(manager.record().revision(), record.revision());
         assert!(manager.record().settings().is_none());
         assert!(manager.record().provider().is_none());
         assert!(manager.policy().is_err());
+        assert_eq!(
+            store.storage.load().unwrap().unwrap(),
+            serde_json::to_vec(&record).unwrap()
+        );
+        let migration = manager.migration().unwrap();
+        assert!(Some(&migration.settings) == record.settings());
+        assert!(migration.provider == record.provider);
+        assert_eq!(migration.revision, record.revision());
+    }
+
+    #[test]
+    fn import_requires_fresh_proof_and_canceling_preserves_the_complete_source() {
+        let (store, _, _) = signed_store();
+        use_legacy_format(&store);
+        let original = store.storage.load().unwrap().unwrap();
+        let mut manager = store.load::<()>().unwrap().unwrap();
+        let source = manager.migration().unwrap().source.clone();
+        assert!(
+            manager
+                .prepare_import("another source", 7, [1; 16], 1000.into(), ())
+                .is_err()
+        );
+        let review = manager
+            .prepare_import(&source.id, 7, [1; 16], 1000.into(), ())
+            .unwrap();
+        assert!(
+            manager
+                .approve(&review.id, 7, b"unsigned", 1001.into())
+                .is_err()
+        );
+        let review = manager
+            .prepare_import(&source.id, 7, [1; 16], 1002.into(), ())
+            .unwrap();
+        assert!(manager.cancel(&review.id, 7).unwrap());
+        assert!(manager.migration().unwrap().source == source);
+        assert!(manager.policy().is_err());
+        assert_eq!(store.storage.load().unwrap().unwrap(), original);
+        assert!(store.load::<()>().unwrap().unwrap().migration().is_some());
+    }
+
+    #[test]
+    fn importing_publishes_the_full_signed_settings_once_and_reloads_without_migration() {
+        let (store, previous, key) = signed_store();
+        use_legacy_format(&store);
+        let mut manager = store.load::<()>().unwrap().unwrap();
+        let source = manager.migration().unwrap().source.clone();
+        let review = manager
+            .prepare_import(&source.id, 7, [1; 16], 2000.into(), ())
+            .unwrap();
+        let encoded = serde_json::to_value(&review).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(
+            &BASE64
+                .decode(encoded["document"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["migration"]["id"], source.id);
+        let challenge = manager
+            .authenticate(&review.id, 7, 2001.into(), 2002.into())
+            .unwrap();
+        let signature = key
+            .sign(
+                &SystemRandom::new(),
+                &BASE64.decode(&challenge.bytes).unwrap(),
+            )
+            .unwrap();
+        let verified = manager
+            .approve(&review.id, 7, signature.as_ref(), 2003.into())
+            .unwrap();
+        let admission = manager.admit(verified, 2004.into()).unwrap();
+        manager.finish(store.publish(admission)).unwrap();
+        assert!(manager.migration().is_none());
+        assert!(manager.record().settings() == previous.settings());
+        assert!(manager.record().provider() == previous.provider());
+        assert_eq!(
+            manager.record().revision(),
+            previous.revision().next().unwrap()
+        );
+        let loaded = store.load::<()>().unwrap().unwrap();
+        assert!(loaded.migration().is_none());
+        assert!(loaded.record() == manager.record());
+        assert!(
+            manager
+                .prepare_import(&source.id, 7, [1; 16], 2005.into(), ())
+                .is_err()
+        );
+        let mut changed: serde_json::Value =
+            serde_json::from_slice(&store.storage.load().unwrap().unwrap()).unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(
+            &BASE64
+                .decode(changed["review"]["document"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        document["migration"]["id"] = BASE64.encode([7; 32]).into();
+        let bytes = serde_json::to_vec(&document).unwrap();
+        changed["review"]["document"] = BASE64.encode(&bytes).into();
+        changed["review"]["digest"] = BASE64
+            .encode(ring::digest::digest(&ring::digest::SHA256, &bytes))
+            .into();
+        store
+            .storage
+            .replace(&serde_json::to_vec(&changed).unwrap())
+            .unwrap();
+        assert!(store.load::<()>().is_err());
+    }
+
+    #[test]
+    fn changing_the_source_during_import_cannot_overwrite_it() {
+        let (store, _, key) = signed_store();
+        use_legacy_format(&store);
+        let mut manager = store.load::<()>().unwrap().unwrap();
+        let source = manager.migration().unwrap().source.clone();
+        let review = manager
+            .prepare_import(&source.id, 7, [1; 16], 2000.into(), ())
+            .unwrap();
+        let challenge = manager
+            .authenticate(&review.id, 7, 2001.into(), 2002.into())
+            .unwrap();
+        let signature = key
+            .sign(
+                &SystemRandom::new(),
+                &BASE64.decode(&challenge.bytes).unwrap(),
+            )
+            .unwrap();
+        let verified = manager
+            .approve(&review.id, 7, signature.as_ref(), 2003.into())
+            .unwrap();
+        let admission = manager.admit(verified, 2004.into()).unwrap();
+        let changed = b"changed source";
+        store.storage.replace(changed).unwrap();
+        assert!(manager.finish(store.publish(admission)).is_err());
+        assert_eq!(store.storage.load().unwrap().unwrap(), changed);
+    }
+
+    #[test]
+    fn unsupported_or_corrupt_formats_cannot_become_import_candidates() {
+        for bytes in [
+            br#"{"version":999}"#.as_slice(),
+            br#"{"review":{},"signature":"invalid"}"#,
+        ] {
+            let store = Store {
+                storage: Box::new(Memory(Mutex::new(Some(bytes.to_vec())))),
+                anchor: Box::<Memory>::default(),
+            };
+            assert!(store.load::<()>().is_err());
+            assert_eq!(store.storage.load().unwrap().unwrap(), bytes);
+        }
     }
 }

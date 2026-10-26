@@ -25,14 +25,12 @@ public struct EnrollmentDraft: Equatable, Sendable {
 public final class SettingsEditor: ObservableObject {
     private enum Selection {
         case keep, forget
-        case existing(SettingsProvider)
         case staged(ticket: String, provider: SettingsProvider)
 
         var choice: SettingsProviderChoice {
             switch self {
             case .keep: .keep
             case .forget: .forget
-            case .existing(let provider): .existing(provider)
             case .staged(let ticket, _): .staged(ticket)
             }
         }
@@ -68,7 +66,7 @@ public final class SettingsEditor: ObservableObject {
     public init(call: @escaping @MainActor (BrokerCommand) async throws -> BrokerReply) { self.call = call }
 
     public var available: Bool {
-        snapshot?.session != nil && ["configured", "unconfigured"].contains(snapshot?.state ?? "")
+        snapshot?.session != nil && ["configured", "unconfigured", "migrationRequired"].contains(snapshot?.state ?? "")
     }
 
     public var enrollmentNeedsVerification: Bool {
@@ -83,23 +81,20 @@ public final class SettingsEditor: ObservableObject {
         return nil
     }
 
-    public var retainedProvider: SettingsProvider? {
-        if case .existing(let provider) = selection { return provider }
-        return nil
-    }
-
     private var hasChanges: Bool {
         if !pendingRepositories.isEmpty { return true }
         if draft != (snapshot?.settings ?? BrokerSettings()) { return true }
         switch selection {
         case .keep: return false
         case .forget: return snapshot?.provider != nil
-        case .existing(let provider): return provider != snapshot?.provider
         case .staged: return true
         }
     }
 
-    public var canReview: Bool { available && !busy && !enrollmentNeedsVerification && hasChanges }
+    public var canReview: Bool {
+        available && !busy && snapshot?.migration == nil && !enrollmentNeedsVerification && hasChanges
+    }
+    public var canImport: Bool { available && !busy && snapshot?.migration?.source.supported == true }
 
     public func load() async {
         await perform {
@@ -111,7 +106,9 @@ public final class SettingsEditor: ObservableObject {
             message =
                 snapshot.state == "unavailable"
                 ? "Protected settings are unavailable. Reconnect to retry."
-                : "Changes take effect only after you review and approve them with Touch ID."
+                : snapshot.migration != nil
+                    ? "Review and approve the import before Quartermaster can use your previous settings."
+                    : "Changes take effect only after you review and approve them with Touch ID."
         }
     }
 
@@ -137,12 +134,6 @@ public final class SettingsEditor: ObservableObject {
         }
     }
 
-    public func useExisting(_ provider: SettingsProvider) {
-        guard available, !busy, snapshot?.retained.contains(provider) == true else { return }
-        enrollment = EnrollmentDraft(provider: provider)
-        selection = .existing(provider)
-        message = "The retained enrolment will be verified and unlocked when you approve."
-    }
     public func forget() {
         enrollment = EnrollmentDraft(provider: snapshot?.provider)
         selection = .forget
@@ -150,21 +141,41 @@ public final class SettingsEditor: ObservableObject {
     }
 
     public func review() async throws -> SettingsReview {
-        guard !busy, available, let snapshot else { throw BrokerControlError.busy }
+        guard !busy, available, let snapshot, snapshot.migration == nil else { throw BrokerControlError.busy }
         guard !enrollmentNeedsVerification else { throw Failure.unverifiedEnrollment }
         guard hasChanges else { throw Failure.noChanges }
+        return try await prepareReview(
+            .prepareSettings(
+                revision: snapshot.revision, settings: draft, provider: selection.choice, additions: pendingRepositories
+            ))
+    }
+
+    public func reviewMigration() async throws -> SettingsReview {
+        guard canImport, let migration = snapshot?.migration else { throw BrokerControlError.unavailable }
+        return try await prepareReview(.prepareSettingsImport(id: migration.source.id), expectedMigration: migration)
+    }
+
+    private func prepareReview(_ command: BrokerCommand, expectedMigration: SettingsMigration? = nil) async throws
+        -> SettingsReview
+    {
         let generation = generation
         busy = true
         defer { busy = false }
         guard
-            case .settingsReview(let review) = try await call(
-                .prepareSettings(
-                    revision: snapshot.revision, settings: draft, provider: selection.choice,
-                    additions: pendingRepositories))
+            case .settingsReview(let review) = try await call(command)
         else { throw BrokerControlError.invalidMessage }
         guard generation == self.generation else {
             _ = try? await call(.settingsCancel(id: review.id))
             throw CancellationError()
+        }
+        if let expected = expectedMigration {
+            let document = try? JSONDecoder().decode(SettingsDocument.self, from: review.document)
+            guard document?.migration == expected.source, document?.previous.revision == expected.revision,
+                document?.proposed.settings == expected.settings, document?.proposed.provider == expected.provider
+            else {
+                _ = try? await call(.settingsCancel(id: review.id))
+                throw BrokerControlError.invalidMessage
+            }
         }
         return review
     }
@@ -175,7 +186,9 @@ public final class SettingsEditor: ObservableObject {
         enrollment = EnrollmentDraft(provider: snapshot?.provider)
         selection = .keep
         pendingRepositories = []
-        message = "Changes discarded."
+        message =
+            snapshot?.migration == nil
+            ? "Changes discarded." : "Import postponed. Your previous settings are unchanged."
     }
 
     public func cancel() async {
@@ -252,7 +265,7 @@ public final class SettingsEditor: ObservableObject {
         if let snapshot {
             self.snapshot = SettingsSnapshot(
                 state: "unavailable", revision: snapshot.revision, session: nil,
-                settings: snapshot.settings, provider: snapshot.provider, retained: snapshot.retained)
+                settings: snapshot.settings, provider: snapshot.provider, migration: snapshot.migration)
         }
     }
 

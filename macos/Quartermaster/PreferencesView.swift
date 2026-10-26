@@ -44,14 +44,19 @@ struct PreferencesView: View {
             .frame(minWidth: 220, idealWidth: 220, maxWidth: 220)
             .navigationSplitViewColumnWidth(min: 220, ideal: 220, max: 220)
             .toolbar(removing: .sidebarToggle)
+            .disabled(editor.snapshot?.migration != nil)
         } detail: {
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
-                        switch selection ?? .vault {
-                        case .vault: vault
-                        case .github: github
-                        case .access: access
+                        if let migration = editor.snapshot?.migration {
+                            SettingsMigrationView(migration: migration)
+                        } else {
+                            switch selection ?? .vault {
+                            case .vault: vault
+                            case .github: github
+                            case .access: access
+                            }
                         }
                     }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -61,10 +66,13 @@ struct PreferencesView: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .lineLimit(3).help(editor.message).textSelection(.enabled)
                     Spacer()
-                    Button("Review Changes…", action: application.reviewPreferences)
-                        .disabled(!editor.canReview)
+                    if editor.snapshot?.migration != nil {
+                        Button("Review Import…", action: application.reviewMigration).disabled(!editor.canImport)
+                    } else {
+                        Button("Review Changes…", action: application.reviewPreferences).disabled(!editor.canReview)
+                    }
                 }.padding(.horizontal, 24).padding(.vertical, 15)
-            }.navigationTitle((selection ?? .vault).rawValue)
+            }.navigationTitle(editor.snapshot?.migration == nil ? (selection ?? .vault).rawValue : "Import settings")
         }
         .frame(minWidth: 820, idealWidth: 900, minHeight: 580, idealHeight: 625)
         .onDisappear { password = "" }
@@ -103,28 +111,6 @@ struct PreferencesView: View {
                 }
             }
             vaultCache
-            if editor.snapshot?.provider == nil, let retained = editor.snapshot?.retained, !retained.isEmpty {
-                PreferencesGroup(title: "Retained enrolments") {
-                    ForEach(retained, id: \.slot) { provider in
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(verbatim: provider.binding.email)
-                                Text(verbatim: provider.binding.server).foregroundStyle(.secondary)
-                                Text(verbatim: "Login item: \(provider.binding.itemID)\nEnrollment: \(provider.slot)")
-                                    .font(.caption.monospaced())
-                            }.textSelection(.enabled)
-                            Spacer()
-                            Button(editor.retainedProvider == provider ? "Selected for Review" : "Select…") {
-                                editor.useExisting(provider)
-                            }.disabled(!editor.available || editor.busy || editor.retainedProvider == provider)
-                        }
-                    }
-                    Text(
-                        "Retained details are verified when you save with Touch ID. Selecting one does not activate it."
-                    )
-                    .font(.caption).foregroundStyle(.secondary)
-                }
-            }
             if let staged = editor.stagedProvider {
                 PreferencesGroup(title: "Verified replacement · awaiting approval") {
                     VStack(alignment: .leading, spacing: 5) {

@@ -1,8 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod approval;
-#[cfg(target_os = "macos")]
-pub(super) mod retained;
+mod migration;
 mod store;
 
 use super::{
@@ -12,10 +11,13 @@ use super::{
 pub(super) use approval::{Admission, Challenge, Manager, Review};
 pub(super) use approval::{LookupAdmission, LookupResult, PreparedLookup, RepositoryName};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+pub(super) use migration::{Migration, MigrationSource};
 use qm_providers::ProviderBinding;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub(super) use store::Store;
+#[cfg(test)]
+pub(in crate::owner) use store::tests::use_legacy_format;
 
 pub(super) const RECORD_LIMIT: usize = 96 * 1024;
 
@@ -24,7 +26,6 @@ pub(super) const RECORD_LIMIT: usize = 96 * 1024;
 pub(super) enum ProviderChoice {
     Keep,
     Forget,
-    Existing { provider: ProviderPin },
     Staged { ticket: String },
 }
 
@@ -42,7 +43,7 @@ pub(super) struct Snapshot {
     pub(super) session: Option<String>,
     pub(super) settings: Option<Settings>,
     pub(super) provider: Option<ProviderPin>,
-    pub(super) retained: Vec<ProviderPin>,
+    pub(super) migration: Option<Migration>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,7 +231,14 @@ pub(super) fn persisted_status(root: &Path, store: &Store) -> Result<crate::Cach
     else {
         return Ok(crate::CacheStatus {
             kind: crate::StatusKind::VaultStatus,
-            state: crate::VaultState::Unenrolled,
+            state: if manager
+                .as_ref()
+                .is_some_and(|manager| manager.migration().is_some())
+            {
+                crate::VaultState::SettingsImportRequired
+            } else {
+                crate::VaultState::Unenrolled
+            },
             binding: None,
             last_sync: None,
             error: None,
@@ -326,25 +334,12 @@ mod tests {
     }
 
     #[test]
-    fn the_swift_retained_selection_command_binds_the_complete_provider() {
-        let command = crate::owner::protocol::decode_client(include_bytes!("../../../../../macos/Security/Tests/QuartermasterSecurityTests/Fixtures/settings-existing-command.json")).unwrap();
-        let crate::owner::protocol::Client::PrepareSettings {
-            revision,
-            provider: ProviderChoice::Existing { provider },
-            ..
-        } = command
-        else {
+    fn the_swift_import_command_selects_only_a_frozen_migration_source() {
+        let command = crate::owner::protocol::decode_client(include_bytes!("../../../../../macos/Security/Tests/QuartermasterSecurityTests/Fixtures/settings-import-command.json")).unwrap();
+        let crate::owner::protocol::Client::PrepareSettingsImport { id } = command else {
             panic!("wrong command")
         };
-        assert_eq!(revision, Revision(4));
-        assert_eq!(provider.slot, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(
-            provider.binding.item_id(),
-            "22222222-2222-4222-8222-222222222222"
-        );
-        assert_eq!(provider.scope, "0123456789abcdef0123456789abcdef");
-        assert_eq!(provider.device_key, [7; 32]);
-        assert!(provider.validate().is_ok());
+        assert_eq!(id, BASE64.encode([1; 32]));
     }
 
     #[test]

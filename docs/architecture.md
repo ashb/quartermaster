@@ -40,6 +40,13 @@ provider snapshots. Runtime grants are separate, memory-only authority and are
 never restored from settings. See [settings authority](security-boundaries.md#settings-authority)
 for the commit and cancellation boundary.
 
+When a supported settings format needs migration, Settings explains the change
+and offers the previous vault selection and rules for review. **Import and Trust**
+uses the normal Touch ID approval flow; closing the review leaves the source
+intact and inactive. Format decoders produce a versioned import candidate for
+this common flow. They never publish migrated authority themselves. Existing
+signed records remain usable without a new approval merely because the app restarts.
+
 ## Components
 
 ```mermaid

@@ -15,16 +15,11 @@ import Testing
     #expect(NSDictionary(dictionary: encoded).isEqual(to: expected))
 }
 
-@Test func retainedEnrollmentCommandsEncodeTheCompleteSharedRustSelection() throws {
+@Test func importCommandsSelectTheSharedRustMigrationSource() throws {
     let url = try #require(
-        Bundle.module.url(forResource: "settings-existing-command", withExtension: "json", subdirectory: "Fixtures"))
+        Bundle.module.url(forResource: "settings-import-command", withExtension: "json", subdirectory: "Fixtures"))
     let expected = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-    let selection = try #require(expected["provider"] as? [String: Any])
-    let provider = try JSONDecoder().decode(
-        SettingsProvider.self, from: JSONSerialization.data(withJSONObject: selection["provider"]!))
-    var settings = BrokerSettings()
-    settings.mutations = .deny
-    let command = BrokerCommand.prepareSettings(revision: 4, settings: settings, provider: .existing(provider))
+    let command = BrokerCommand.prepareSettingsImport(id: Data(repeating: 1, count: 32).base64EncodedString())
     let encoded = try #require(JSONSerialization.jsonObject(with: command.encoded()) as? [String: Any])
     #expect(NSDictionary(dictionary: encoded).isEqual(to: expected))
 }

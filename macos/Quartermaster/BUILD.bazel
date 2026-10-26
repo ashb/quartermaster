@@ -18,6 +18,7 @@ swift_library(
         "PreferencesView.swift",
         "PreferencesWindowLifecycle.swift",
         "QuartermasterApp.swift",
+        "SettingsMigrationView.swift",
     ],
     copts = [
         "-swift-version",

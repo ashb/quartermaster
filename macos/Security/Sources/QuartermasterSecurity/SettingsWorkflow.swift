@@ -44,7 +44,7 @@ public struct SettingsSnapshot: Decodable, Sendable {
     public let session: Data?
     public let settings: BrokerSettings?
     public let provider: SettingsProvider?
-    public let retained: [SettingsProvider]
+    public let migration: SettingsMigration?
 }
 
 public struct SettingsRecord: Decodable, Equatable, Sendable {
@@ -61,6 +61,7 @@ public struct SettingsDocument: Decodable, Sendable {
     public let previous: SettingsRecord
     public let proposed: SettingsRecord
     public let additions: [RepositoryName]?
+    public let migration: SettingsMigrationSource?
 }
 
 public struct SettingsReview: Codable, Equatable, Sendable {
@@ -94,10 +95,9 @@ public struct SettingsChallenge: Codable, Sendable {
 
 public enum SettingsProviderChoice: Encodable, Sendable {
     case keep, forget
-    case existing(SettingsProvider)
     case staged(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, ticket, provider }
+    private enum CodingKeys: String, CodingKey { case kind, ticket }
 
     public func encode(to encoder: any Encoder) throws {
         var fields = encoder.container(keyedBy: CodingKeys.self)
@@ -105,9 +105,6 @@ public enum SettingsProviderChoice: Encodable, Sendable {
         switch self {
         case .keep: kind = "keep"
         case .forget: kind = "forget"
-        case .existing(let provider):
-            kind = "existing"
-            try fields.encode(provider, forKey: .provider)
         case .staged(let ticket):
             kind = "staged"
             try fields.encode(ticket, forKey: .ticket)
@@ -143,6 +140,11 @@ public struct SettingsWorkflow: Sendable {
             document.previous.revision == review.revision, review.revision < UInt64.max,
             document.proposed.revision == review.revision + 1, document.proposed.settings != nil
         else { throw Failure.invalidReview }
+        if let migration = document.migration {
+            guard migration.supported, document.previous.settings == nil, document.previous.provider == nil,
+                document.additions == nil
+            else { throw Failure.invalidReview }
+        }
         self.document = document
         self.review = review
     }
