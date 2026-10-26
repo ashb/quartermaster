@@ -17,6 +17,8 @@ use qm_macos::presence_clock::{MonotonicTimestamp, monotonic_raw as now};
 use qm_providers::{RbwProvider, VaultSnapshot};
 use std::{sync::Arc, time::Duration};
 
+mod repositories;
+
 struct Enrollment {
     ticket: String,
     pin: ProviderPin,
@@ -161,9 +163,9 @@ pub(super) fn message(
     runtime: &tokio::runtime::Handle,
     work_limit: &Arc<tokio::sync::Semaphore>,
 ) -> Result<ipc::Response> {
-    if let Client::SettingsPresence { id, authenticated } = request {
+    if let Client::SettingsPresence { id, authenticated } = &request {
         let result = match context {
-            Some(context) => presence(&id, authenticated, context, connection, shared),
+            Some(context) => presence(id, *authenticated, context, connection, shared),
             None => Err(Fault::NativeContextRequired.into()),
         };
         if result.is_err() {
@@ -173,14 +175,21 @@ pub(super) fn message(
                     .session
                     .as_ref()
                     .is_some_and(|session| session.peer.id() == connection.id())
+                && state
+                    .administration
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.pending(id, connection.id().value()))
             {
                 state.administration.cancel_changes();
             }
             connection.release_context();
         }
-        return super::control::encode_result(result).map(Into::into);
+        if result.is_err() || !repositories::needed(id, &connection.handle(), shared)? {
+            return super::control::encode_result(result).map(Into::into);
+        }
     }
-    if context.is_some() {
+    if context.is_some() && !matches!(&request, Client::SettingsPresence { .. }) {
         connection.release_context();
         return Err(Fault::UnexpectedContext.into());
     }
@@ -216,14 +225,25 @@ pub(super) fn message(
         };
         return super::control::encode_result(Ok(reply)).map(Into::into);
     }
-    let permit = Arc::clone(work_limit)
-        .try_acquire_owned()
-        .map_err(|_| ControlError::Busy)?;
+    let permit = match Arc::clone(work_limit).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if let Client::SettingsPresence { id, .. } = &request {
+                repositories::cancel_matching(id, &connection.handle(), shared);
+                connection.release_context();
+            }
+            return Err(ControlError::Busy.into());
+        }
+    };
     let peer = connection.handle();
     let shared = Arc::clone(shared);
     let paths = paths.clone();
     let cleanup_shared = Arc::clone(&shared);
     let cleanup_peer = peer.clone();
+    let cleanup_id = match &request {
+        Client::SettingsPresence { id, .. } | Client::SettingsProof { id, .. } => Some(id.clone()),
+        _ => None,
+    };
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     runtime.spawn(async move {
         let _permit = permit;
@@ -243,7 +263,13 @@ pub(super) fn message(
                     revision,
                     settings,
                     provider,
-                } => prepare(revision, settings, provider, &peer, &shared, &paths),
+                    additions,
+                } => repositories::prepare(
+                    revision, settings, provider, additions, &peer, &shared, &paths,
+                ),
+                Client::SettingsPresence { id, authenticated } => {
+                    repositories::resolve(&id, authenticated, &peer, &shared, &paths)
+                }
                 Client::SettingsProof { id, signature } => {
                     commit(&id, &signature, &peer, &shared, &paths)
                 }
@@ -260,6 +286,13 @@ pub(super) fn message(
                 .session
                 .as_ref()
                 .is_some_and(|session| session.peer.id() == cleanup_peer.id())
+            && cleanup_id.as_ref().is_none_or(|id| {
+                state
+                    .administration
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.pending(id, cleanup_peer.id().value()))
+            })
         {
             state.administration.cancel_changes();
         }
@@ -762,18 +795,18 @@ mod tests {
         sync::{Condvar, Mutex},
     };
 
-    struct Harness {
-        client: Retained<NSXPCConnection>,
+    pub(super) struct Harness {
+        pub(super) client: Retained<NSXPCConnection>,
         _native: Fixture,
         _runtime: tokio::runtime::Runtime,
         _directory: tempfile::TempDir,
-        paths: ServicePaths,
-        shared: Shared,
+        pub(super) paths: ServicePaths,
+        pub(super) shared: Shared,
         key: EcdsaKeyPair,
     }
 
     impl Harness {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self::with_store(crate::owner::settings::Store::memory())
         }
 
@@ -825,7 +858,7 @@ mod tests {
             harness
         }
 
-        fn call(&self, request: Value, context: Option<&LAContext>) -> Value {
+        pub(super) fn call(&self, request: Value, context: Option<&LAContext>) -> Value {
             serde_json::from_slice(&send(
                 &self.client,
                 &serde_json::to_vec(&request).unwrap(),
@@ -835,6 +868,10 @@ mod tests {
         }
 
         fn review(&self) -> Value {
+            self.review_with_settings(json!({"github":{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}],"approveUnverifiedRequests":true},"mutations":"requireApproval"}))
+        }
+
+        pub(super) fn review_with_settings(&self, settings: Value) -> Value {
             let snapshot = crate::owner::test_support::vault::snapshot("github-write");
             let slot = "a".repeat(32);
             let identity =
@@ -857,7 +894,7 @@ mod tests {
                     .checked_add(Duration::from_secs(120))
                     .unwrap(),
             });
-            let reply = self.call(json!({"kind":"prepareSettings", "revision":0, "settings":{"github":{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}],"approveUnverifiedRequests":true},"mutations":"requireApproval"}, "provider":{"kind":"staged","ticket":"selection"}}), None);
+            let reply = self.call(json!({"kind":"prepareSettings", "revision":0, "settings":settings, "provider":{"kind":"staged","ticket":"selection"}}), None);
             assert_eq!(reply["kind"], "settingsReview", "{reply}");
             let review = reply["review"].clone();
             let document = BASE64.decode(review["document"].as_str().unwrap()).unwrap();
@@ -869,14 +906,14 @@ mod tests {
             review
         }
 
-        fn authenticate(&self, review: &Value) -> Value {
+        pub(super) fn authenticate(&self, review: &Value) -> Value {
             let context = unsafe { LAContext::new() };
             let reply = self.call(json!({"kind":"settingsPresence", "id":review["id"], "authenticated":u64::from(now().unwrap())}), Some(&context));
             assert_eq!(reply["kind"], "settingsChallenge", "{reply}");
             reply["authorization"].clone()
         }
 
-        fn proof(&self, review: &Value, challenge: &Value) -> Value {
+        pub(super) fn proof(&self, review: &Value, challenge: &Value) -> Value {
             self.call(self.proof_command(review, challenge), None)
         }
 

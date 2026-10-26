@@ -51,20 +51,24 @@ impl GitHubConfig {
             approve_unverified_requests: bool,
         }
         let document: Document = serde_json::from_slice(bytes).map_err(|_| Error)?;
-        let mut config = Self {
+        Self {
             version: document.version,
             mode: document.mode,
             repositories: document.repositories,
             approve_unverified_requests: document.approve_unverified_requests,
-        };
-        if config.version != 1 || config.repositories.len() > 64 {
+        }
+        .validated()
+    }
+
+    fn validated(mut self) -> Result<Self, Error> {
+        if self.version != 1 || self.repositories.len() > 64 {
             return Err(Error);
         }
-        for (index, repository) in config.repositories.iter().enumerate() {
+        for (index, repository) in self.repositories.iter().enumerate() {
             let owner = &repository.owner;
             let name = &repository.name;
             if !valid_repository_name(&repository.full_name())
-                || config.repositories[..index].iter().any(|previous| {
+                || self.repositories[..index].iter().any(|previous| {
                     previous.id == repository.id
                         || (previous.owner.eq_ignore_ascii_case(owner)
                             && previous.name.eq_ignore_ascii_case(name))
@@ -73,17 +77,37 @@ impl GitHubConfig {
                 return Err(Error);
             }
         }
-        config.repositories.sort_by_cached_key(|repository| {
+        self.repositories.sort_by_cached_key(|repository| {
             (
                 repository.owner.to_ascii_lowercase(),
                 repository.name.to_ascii_lowercase(),
             )
         });
-        Ok(config)
+        Ok(self)
     }
 
     pub(in crate::owner) fn mode(&self) -> Mode {
         self.mode
+    }
+
+    pub(in crate::owner) fn repositories(&self) -> &[Repository] {
+        &self.repositories
+    }
+
+    pub(in crate::owner) fn with_repository(
+        &self,
+        id: NonZeroU64,
+        full_name: &str,
+    ) -> Result<Self, Error> {
+        let (owner, name) = full_name.split_once('/').ok_or(Error)?;
+        let mut config = self.clone();
+        config.repositories.push(Repository {
+            id,
+            owner: owner.into(),
+            name: name.into(),
+            writes: false,
+        });
+        config.validated()
     }
 
     pub(in crate::owner) fn approves_unverified_requests(&self) -> bool {

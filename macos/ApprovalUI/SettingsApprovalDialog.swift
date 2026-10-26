@@ -18,8 +18,8 @@ private struct SettingsApprovalView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     record(document.previous, title: "Currently approved")
                     Divider()
-                    record(document.proposed, title: "Proposed")
-                    DisclosureSection("Complete signed change · literal byte escapes") {
+                    record(document.proposed, title: "Proposed", additions: document.additions ?? [])
+                    DisclosureSection("Complete proposal · literal byte escapes") {
                         ScrollView(.horizontal) {
                             Text(verbatim: review.text).font(.caption.monospaced()).textSelection(.enabled)
                         }
@@ -52,7 +52,7 @@ private struct SettingsApprovalView: View {
         .onChange(of: controller.phase) { _, phase in if phase == .approved { close() } }
     }
 
-    private func record(_ record: SettingsRecord, title: String) -> some View {
+    private func record(_ record: SettingsRecord, title: String, additions: [RepositoryName] = []) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.headline)
             if let provider = record.provider {
@@ -66,9 +66,14 @@ private struct SettingsApprovalView: View {
                 Text("No vault selected")
             }
             if let github = record.settings?.github {
-                Text("GitHub enabled · \(github.repositories.count) repositories")
+                Text("GitHub enabled · \(github.repositories.count + additions.count) repositories")
                 ForEach(github.repositories) { repo in
-                    Text(verbatim: "\(repo.owner)/\(repo.name) · ID \(repo.id)").font(.caption.monospaced())
+                    Text(verbatim: "\(repo.owner)/\(repo.name)").font(.caption.monospaced())
+                }
+                ForEach(additions) { repo in Text(verbatim: repo.fullName).font(.caption.monospaced()) }
+                if !additions.isEmpty {
+                    Text("Repository identities will be checked using the selected token before saving.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Text(
                     github.approveUnverifiedRequests

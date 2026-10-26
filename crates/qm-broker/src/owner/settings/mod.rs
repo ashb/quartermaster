@@ -10,6 +10,7 @@ use super::{
     policy::{AuthorizationError, Policy, PolicyDecision},
 };
 pub(super) use approval::{Admission, Challenge, Manager, Review};
+pub(super) use approval::{LookupAdmission, LookupResult, PreparedLookup, RepositoryName};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use qm_providers::ProviderBinding;
 use serde::{Deserialize, Serialize};
@@ -277,11 +278,11 @@ mod tests {
         }
     }
 
-    fn rules() -> Settings {
+    pub(super) fn rules() -> Settings {
         Settings::decode(br#"{"github":{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}],"approveUnverifiedRequests":false},"mutations":"requireApproval"}"#).unwrap()
     }
 
-    fn fixture() -> (EcdsaKeyPair, Manager) {
+    pub(super) fn fixture() -> (EcdsaKeyPair, Manager) {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
         let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
@@ -290,7 +291,7 @@ mod tests {
         (key, manager)
     }
 
-    fn pin() -> ProviderPin {
+    pub(super) fn pin() -> ProviderPin {
         ProviderPin {
             slot: "legacy".into(),
             binding: crate::owner::test_support::vault::snapshot("github-write")

@@ -39,23 +39,20 @@ read-only token above; the label does not give that token write permissions.
 
 ## Select a repository
 
-Set the repository name and obtain its numeric ID. With an existing authenticated
-`gh` configuration, before using Quartermaster's isolated configuration:
+Choose the repository by name:
 
 ```sh
 QM_REPOSITORY=owner/repository
-QM_REPOSITORY_ID=$(gh api --hostname github.com "repos/$QM_REPOSITORY" --jq '.id')
 QM_DATA="$HOME/Library/Application Support/Quartermaster/Development"
 QM_GH_CONFIG="$QM_DATA/gh"
 ```
 
-Replace `owner/repository`. For a public repository, you can instead read `id`
-from `https://api.github.com/repos/OWNER/REPO` in a browser and assign that value
-to `QM_REPOSITORY_ID`.
-
 Open **Settings → GitHub**, enable GitHub mediation, and add the repository's
-`owner/repository` name and numeric ID. Choose **Review Changes…**, inspect the
-proposal, then **Save Changes** with Touch ID. Adding a repository does not create a read grant.
+`owner/repository` name. Choose **Review Changes…**, inspect the proposal, then
+**Save Changes** with Touch ID. Quartermaster uses the selected vault token to
+verify the repository's identity before saving; no numeric ID is needed.
+Failed verification leaves approved settings unchanged. Adding a repository
+does not create a read grant.
 
 Approved settings live in the backend's Data Protection Keychain group. The
 backend ignores the old `github.json`; editing or replaying it cannot change
@@ -66,7 +63,9 @@ access. Runtime read grants remain in memory.
 Repository grants follow the requested `owner/name`. Quartermaster preserves the
 client URL rather than replacing the name with a numeric repository ID.
 Metadata must match the configured name and ID when checked; this is a
-point-in-time consistency check. If the name is reused after that check, the
+point-in-time consistency check. A different ID cannot use the old grant: remove
+and add the name again, then save with Touch ID to select a replacement.
+If the name is reused after the metadata check, the
 request reaches whichever repository GitHub serves under that name at dispatch.
 
 ## Make a request

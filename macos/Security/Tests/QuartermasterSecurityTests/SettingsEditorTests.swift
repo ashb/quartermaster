@@ -187,7 +187,7 @@ private func editorProvider(
     let editor = SettingsEditor { command in
         switch command {
         case .stageEnrollment: return .enrollmentStaged(ticket: "verified-ticket", provider: provider)
-        case .prepareSettings(_, _, let selection):
+        case .prepareSettings(_, _, let selection, _):
             submitted = selection
             return .settingsReview(review)
         default: return .settingsStatus(snapshot)
@@ -280,4 +280,32 @@ private func editorProvider(
     #expect(editor.draft.mutations == .deny)
     #expect(!editor.message.contains("discarded"))
     #expect(editor.message.contains("already admitted"))
+}
+
+@Test @MainActor func repositoryNamesRemainDraftsUntilReviewedAndAreClearedOnDiscardOrDisable() async throws {
+    var settings = BrokerSettings()
+    settings.github = GitHubSettings()
+    let snapshot = SettingsSnapshot(
+        state: "configured", revision: 4, session: Data(repeating: 1, count: 16), settings: settings,
+        provider: editorProvider(), retained: [])
+    let editor = SettingsEditor { command in
+        if case .settingsCancel = command { return .canceled }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    #expect(!editor.canReview)
+    #expect(editor.addRepository("example/one"))
+    #expect(editor.canReview)
+    #expect(!editor.addRepository("EXAMPLE/ONE"))
+    #expect(!editor.addRepository("example/../two"))
+    #expect(editor.snapshot?.settings?.github?.repositories.isEmpty == true)
+    editor.removeRepository(try #require(editor.pendingRepositories.first))
+    #expect(!editor.canReview)
+    editor.addRepository("example/one")
+    await editor.cancel()
+    #expect(editor.pendingRepositories.isEmpty)
+    #expect(!editor.canReview)
+    editor.addRepository("example/one")
+    editor.draft.github = nil
+    #expect(editor.pendingRepositories.isEmpty)
 }

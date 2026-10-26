@@ -43,7 +43,7 @@ Only an authenticated UI may register a key into an unconfigured record. Setting
 changes require a fresh, settings-domain signature binding the complete previous
 and proposed records, revision, session, nonce and authentication timestamp. Swift
 independently validates those bindings and presents the change as inert escaped
-bytes. Settings approval authorizes neither API requests nor runtime grants.
+bytes. Settings publication creates no runtime grants or general API authority.
 
 Every configured settings record must retain its signature. Verify it against the
 enrolled frontend approval key before trusting the record, including after restart.
@@ -52,6 +52,14 @@ does not prompt. The signature must cover the complete effective settings,
 including backend-resolved values. Rust may prepare drafts but must not publish
 or trust unsigned changes. An unsigned bootstrap record may pin the approval key
 but grants no settings or provider authority.
+
+Saving reviewed repository names may perform fixed GitHub metadata GETs using
+the selected credential, after an authenticated protected-key operation. This
+internal-read policy permits each frozen name once, under the save's original
+deadline and cancellation, session, provider and cache checks. Redirects and
+mismatched names fail. Swift must verify the resolved proposal preserves the
+reviewed draft except for those identities before signing the complete record;
+partial lookup results never become active settings.
 
 Enrolment verification seals an inactive cache slot and retains its verified
 snapshot only in Rust. Approval selects its exact binding, device-key identity

@@ -60,6 +60,7 @@ public struct SettingsDocument: Decodable, Sendable {
     public let version: String
     public let previous: SettingsRecord
     public let proposed: SettingsRecord
+    public let additions: [RepositoryName]?
 }
 
 public struct SettingsReview: Codable, Equatable, Sendable {
@@ -157,17 +158,65 @@ public struct SettingsWorkflow: Sendable {
     public mutating func validate(_ challenge: SettingsChallenge, now: MonotonicTimestamp) throws -> Data {
         guard case .authenticated(let authenticated) = phase else { throw Failure.invalidState }
         try deadline(authenticated, now: now)
+        let resolved = try resolvedReview(challenge.review, authenticated: authenticated)
         var revision = review.revision.bigEndian
         var timestamp = authenticated.serializedNanoseconds.bigEndian
         var expected = Data("quartermaster.settings-approval.v1\0".utf8) + review.session + review.nonce
         withUnsafeBytes(of: &revision) { expected.append(contentsOf: $0) }
-        expected.append(review.digest)
+        expected.append(resolved.digest)
         withUnsafeBytes(of: &timestamp) { expected.append(contentsOf: $0) }
-        guard challenge.review == review, challenge.authenticated == authenticated,
+        guard challenge.authenticated == authenticated,
             challenge.expires == (try authenticated.advanced(by: .seconds(30))), challenge.bytes == expected
         else { throw Failure.invalidChallenge }
         phase = .validated(authenticated)
         return challenge.bytes
+    }
+
+    private func resolvedReview(_ final: SettingsReview, authenticated: MonotonicTimestamp) throws -> SettingsReview {
+        guard let additions = document.additions, !additions.isEmpty else {
+            guard final == review else { throw Failure.invalidChallenge }
+            return final
+        }
+        guard final.id == review.id, final.created == review.created, final.session == review.session,
+            final.nonce == review.nonce, final.revision == review.revision, final.approvalKey == review.approvalKey,
+            Set(additions.map(\.id)).count == additions.count,
+            additions.allSatisfy({ RepositoryName(fullName: $0.fullName) == $0 })
+        else { throw Failure.invalidChallenge }
+        let completed = try SettingsWorkflow(review: final, expectedKey: review.approvalKey, now: authenticated)
+            .document
+        guard completed.additions == nil, let repositories = completed.proposed.settings?.github?.repositories,
+            let base = document.proposed.settings?.github?.repositories,
+            repositories.count == base.count + additions.count,
+            Set(repositories.map(\.id)).count == repositories.count, repositories.allSatisfy({ $0.id > 0 }),
+            var expected = try JSONSerialization.jsonObject(with: review.document) as? [String: Any],
+            var proposed = expected["proposed"] as? [String: Any],
+            var settings = proposed["settings"] as? [String: Any],
+            var github = settings["github"] as? [String: Any],
+            var encodedRepositories = github["repositories"] as? [[String: Any]]
+        else { throw Failure.invalidReview }
+        for addition in additions {
+            let matches = repositories.filter { "\($0.owner)/\($0.name)".lowercased() == addition.id }
+            guard matches.count == 1, let repository = matches.first, !repository.writes,
+                RepositoryName(fullName: "\(repository.owner)/\(repository.name)") != nil,
+                let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(repository)) as? [String: Any]
+            else { throw Failure.invalidReview }
+            encodedRepositories.append(encoded)
+        }
+        try encodedRepositories.sort {
+            guard let leftOwner = $0["owner"] as? String, let leftName = $0["name"] as? String,
+                let rightOwner = $1["owner"] as? String, let rightName = $1["name"] as? String
+            else { throw Failure.invalidReview }
+            return (leftOwner.lowercased(), leftName.lowercased()) < (rightOwner.lowercased(), rightName.lowercased())
+        }
+        github["repositories"] = encodedRepositories
+        settings["github"] = github
+        proposed["settings"] = settings
+        expected["proposed"] = proposed
+        expected.removeValue(forKey: "additions")
+        guard let actual = try JSONSerialization.jsonObject(with: final.document) as? [String: Any],
+            NSDictionary(dictionary: expected).isEqual(to: actual)
+        else { throw Failure.invalidReview }
+        return final
     }
 
     public mutating func checkSubmission(now: MonotonicTimestamp) throws {

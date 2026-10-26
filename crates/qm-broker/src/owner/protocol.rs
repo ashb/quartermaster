@@ -56,6 +56,8 @@ pub(super) enum Client {
         revision: super::settings::Revision,
         settings: super::settings::Settings,
         provider: super::settings::ProviderChoice,
+        #[serde(default)]
+        additions: Vec<super::settings::RepositoryName>,
     },
     SettingsPresence {
         id: String,

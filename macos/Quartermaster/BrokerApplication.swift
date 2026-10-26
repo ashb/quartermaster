@@ -114,16 +114,18 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         guard active == nil, !controls.busy, !preferences.busy, let client else { return }
         Task {
             await controls.perform {
+                var reviewID: String?
                 do {
                     let review = try await preferences.review()
+                    reviewID = review.id
                     let pending = try SettingsPending(client: client, review: review)
-                    do { presentation = try DialogPresentationLease.acquire() } catch {
-                        pending.cancel()
-                        throw error
-                    }
+                    presentation = try DialogPresentationLease.acquire()
                     let dialog = SettingsApprovalDialog(review: review, document: pending.document, backend: pending)
                     present(dialog, settings: true)
-                } catch { preferences.report(error) }
+                } catch {
+                    if let reviewID { _ = try? await client.call(.settingsCancel(id: reviewID)) }
+                    preferences.report(error)
+                }
             }
         }
     }

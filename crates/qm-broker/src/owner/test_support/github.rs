@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -39,6 +40,7 @@ pub(crate) struct Reply {
     headers: String,
     body: String,
     id_bound_body: Option<String>,
+    gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
 }
 
 pub(crate) fn repository(id: u64) -> Reply {
@@ -47,6 +49,7 @@ pub(crate) fn repository(id: u64) -> Reply {
         headers: String::new(),
         body: serde_json::json!({"id":id,"full_name":"example/one"}).to_string(),
         id_bound_body: None,
+        gate: None,
     }
 }
 
@@ -61,6 +64,7 @@ pub(crate) fn issue(number: u64) -> Reply {
         })
         .to_string(),
         id_bound_body: None,
+        gate: None,
     }
 }
 
@@ -90,6 +94,7 @@ pub(crate) fn redirect(url: &str) -> Reply {
         headers: format!("Location: {url}\r\n"),
         body: String::new(),
         id_bound_body: None,
+        gate: None,
     }
 }
 pub(crate) fn unauthorized() -> Reply {
@@ -98,6 +103,7 @@ pub(crate) fn unauthorized() -> Reply {
         headers: "X-RateLimit-Remaining: 17\r\n".into(),
         body: "private upstream authentication detail".into(),
         id_bound_body: None,
+        gate: None,
     }
 }
 
@@ -168,6 +174,10 @@ pub(crate) fn serve(replies: Vec<Reply>) -> (SocketAddr, Server) {
                 }
             }
             let request = String::from_utf8(bytes).unwrap();
+            if let Some((entered, release)) = reply.gate {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
             let body = if request.starts_with("GET /repositories/123/issues/") {
                 reply.id_bound_body.as_deref().unwrap_or(&reply.body)
             } else {
@@ -185,4 +195,11 @@ pub(crate) fn serve(replies: Vec<Reply>) -> (SocketAddr, Server) {
             worker: Some(worker),
         },
     )
+}
+
+pub(crate) fn gated(mut reply: Reply) -> (Reply, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, proceed) = mpsc::sync_channel(1);
+    reply.gate = Some((entered, proceed));
+    (reply, waiting, release)
 }

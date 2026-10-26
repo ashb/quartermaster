@@ -22,7 +22,8 @@ public enum BrokerCommand: Encodable, Sendable {
     case settingsRegister(publicKey: Data)
     case settingsStatus
     case stageEnrollment(server: String, email: String, password: String, itemID: String?)
-    case prepareSettings(revision: UInt64, settings: BrokerSettings, provider: SettingsProviderChoice)
+    case prepareSettings(
+        revision: UInt64, settings: BrokerSettings, provider: SettingsProviderChoice, additions: [RepositoryName] = [])
     case settingsPresence(id: String, authenticated: MonotonicTimestamp)
     case settingsProof(id: String, signature: Data)
     case settingsCancel(id: String?)
@@ -44,7 +45,7 @@ public enum BrokerCommand: Encodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case kind, id, publicKey, authenticated, signature, server, email, password, itemId, revision, settings,
-            provider
+            provider, additions
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -89,11 +90,12 @@ public enum BrokerCommand: Encodable, Sendable {
             try fields.encode(email, forKey: .email)
             try fields.encode(password, forKey: .password)
             try fields.encodeIfPresent(itemID, forKey: .itemId)
-        case .prepareSettings(let revision, let settings, let provider):
+        case .prepareSettings(let revision, let settings, let provider, let additions):
             kind = "prepareSettings"
             try fields.encode(revision, forKey: .revision)
             try fields.encode(settings, forKey: .settings)
             try fields.encode(provider, forKey: .provider)
+            if !additions.isEmpty { try fields.encode(additions, forKey: .additions) }
         case .settingsPresence(let id, let authenticated):
             kind = "settingsPresence"
             try fields.encode(id, forKey: .id)

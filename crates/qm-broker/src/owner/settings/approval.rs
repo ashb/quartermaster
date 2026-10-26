@@ -10,6 +10,11 @@ use std::time::Duration;
 
 const DOMAIN: &[u8] = b"quartermaster.settings-approval.v1\0";
 
+mod repositories;
+pub(in crate::owner) use repositories::{
+    LookupAdmission, LookupResult, PreparedLookup, RepositoryName,
+};
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::owner) struct Review {
@@ -39,6 +44,9 @@ struct Pending<C> {
     proposed: Record,
     authentication: Option<(MonotonicTimestamp, MonotonicTimestamp, Vec<u8>)>,
     context: C,
+    additions: Vec<RepositoryName>,
+    lookup_next: usize,
+    lookup_complete: usize,
 }
 
 enum Phase<C> {
@@ -290,6 +298,9 @@ impl<C> Manager<C> {
             proposed,
             authentication: None,
             context,
+            additions: Vec::new(),
+            lookup_next: 0,
+            lookup_complete: 0,
         }));
         Ok(review)
     }
@@ -347,6 +358,9 @@ impl<C> Manager<C> {
         let Phase::Reviewing(pending) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
         };
+        if !pending.additions.is_empty() {
+            return Err(Error::Stale);
+        }
         let (authenticated, expires, bytes) = pending.authentication.ok_or(Error::Invalid)?;
         if now < authenticated || now >= expires {
             return Err(Error::Expired);

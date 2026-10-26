@@ -47,7 +47,10 @@ public final class SettingsEditor: ObservableObject {
             }
         }
     }
-    @Published public var draft = BrokerSettings()
+    @Published public var draft = BrokerSettings() {
+        didSet { if draft.github == nil { pendingRepositories = [] } }
+    }
+    @Published public private(set) var pendingRepositories: [RepositoryName] = []
     @Published public var enrollment = EnrollmentDraft(provider: nil) {
         didSet {
             guard enrollment.normalized != oldValue.normalized else { return }
@@ -85,6 +88,7 @@ public final class SettingsEditor: ObservableObject {
     }
 
     private var hasChanges: Bool {
+        if !pendingRepositories.isEmpty { return true }
         if draft != (snapshot?.settings ?? BrokerSettings()) { return true }
         switch selection {
         case .keep: return false
@@ -103,6 +107,7 @@ public final class SettingsEditor: ObservableObject {
             draft = snapshot.settings ?? BrokerSettings()
             enrollment = EnrollmentDraft(provider: snapshot.provider)
             selection = .keep
+            pendingRepositories = []
             message =
                 snapshot.state == "unavailable"
                 ? "Protected settings are unavailable. Reconnect to retry."
@@ -147,7 +152,9 @@ public final class SettingsEditor: ObservableObject {
         defer { busy = false }
         guard
             case .settingsReview(let review) = try await call(
-                .prepareSettings(revision: snapshot.revision, settings: draft, provider: selection.choice))
+                .prepareSettings(
+                    revision: snapshot.revision, settings: draft, provider: selection.choice,
+                    additions: pendingRepositories))
         else { throw BrokerControlError.invalidMessage }
         return review
     }
@@ -167,9 +174,28 @@ public final class SettingsEditor: ObservableObject {
             default: throw BrokerControlError.invalidMessage
             }
             selection = .keep
+            pendingRepositories = []
             enrollment = EnrollmentDraft(provider: snapshot?.provider)
         }
     }
+
+    public func canAddRepository(_ value: String) -> Bool {
+        guard !busy, available, let name = RepositoryName(fullName: value), let github = draft.github,
+            github.repositories.count + pendingRepositories.count < 64,
+            !pendingRepositories.contains(where: { $0.id == name.id }),
+            !github.repositories.contains(where: { "\($0.owner)/\($0.name)".lowercased() == name.id })
+        else { return false }
+        return true
+    }
+
+    @discardableResult public func addRepository(_ value: String) -> Bool {
+        guard canAddRepository(value), let name = RepositoryName(fullName: value) else { return false }
+        pendingRepositories.append(name)
+        message = "Repository identities will be verified when you save."
+        return true
+    }
+
+    public func removeRepository(_ name: RepositoryName) { pendingRepositories.removeAll { $0.id == name.id } }
 
     private func currentSnapshot() async throws -> SettingsSnapshot {
         let clock = ContinuousClock()

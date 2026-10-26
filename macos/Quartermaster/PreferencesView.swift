@@ -22,7 +22,6 @@ struct PreferencesView: View {
     @State private var selection: Pane? = .vault
     @State private var password = ""
     @State private var repository = ""
-    @State private var repositoryID = ""
 
     var body: some View {
         NavigationSplitView {
@@ -225,7 +224,6 @@ struct PreferencesView: View {
                         HStack {
                             Text(verbatim: "\(repo.owner)/\(repo.name)")
                             Spacer()
-                            Text("ID \(repo.id)").foregroundStyle(.secondary)
                             Button {
                                 editor.draft.github?.repositories.removeAll { $0.id == repo.id }
                             } label: {
@@ -235,10 +233,24 @@ struct PreferencesView: View {
                         }
                         Divider()
                     }
+                    ForEach(editor.pendingRepositories) { repo in
+                        HStack {
+                            Text(verbatim: repo.fullName)
+                            Spacer()
+                            Text("Verify on save").foregroundStyle(.secondary)
+                            Button {
+                                editor.removeRepository(repo)
+                            } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                            .buttonStyle(.borderless).accessibilityLabel("Remove \(repo.fullName)")
+                        }
+                        Divider()
+                    }
                     HStack {
                         TextField("owner/repository", text: $repository)
-                        TextField("Numeric ID", text: $repositoryID).frame(width: 125)
-                        Button("Add", action: addRepository).disabled(newRepository == nil)
+                            .onSubmit(addRepository)
+                        Button("Add", action: addRepository).disabled(!editor.canAddRepository(repository))
                     }.textFieldStyle(.roundedBorder)
                     Text("Eligible for issue read grants. A grant still requires a separate approval.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -320,20 +332,8 @@ struct PreferencesView: View {
         }.disabled(editor.busy || editor.snapshot?.provider == nil)
     }
 
-    private var newRepository: RepositorySetting? {
-        let parts = repository.split(separator: "/", omittingEmptySubsequences: false)
-        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty, let id = UInt64(repositoryID), id > 0,
-            !(editor.draft.github?.repositories.contains {
-                $0.id == id || "\($0.owner)/\($0.name)".caseInsensitiveCompare(repository) == .orderedSame
-            } ?? false)
-        else { return nil }
-        return RepositorySetting(id: id, owner: String(parts[0]), name: String(parts[1]))
-    }
-
     private func addRepository() {
-        guard let repo = newRepository else { return }
-        editor.draft.github?.repositories.append(repo)
+        guard editor.addRepository(repository) else { return }
         repository = ""
-        repositoryID = ""
     }
 }

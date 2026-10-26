@@ -1,4 +1,6 @@
 use super::repository::{PreparedMetadata, RepositoryBinding};
+#[cfg(target_os = "macos")]
+mod settings_lookup;
 use super::response::{self, MetadataFailure, Outcome};
 use crate::owner::{
     deadline::Deadline,
@@ -10,6 +12,8 @@ use ring::digest::{SHA256, digest};
 #[cfg(test)]
 use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, pki_types::ServerName};
+#[cfg(target_os = "macos")]
+pub(in crate::owner) use settings_lookup::AuthenticatedLookup;
 use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
