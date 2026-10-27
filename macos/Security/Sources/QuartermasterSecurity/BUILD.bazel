@@ -12,6 +12,7 @@ swift_library(
         "AuthorizationWorkflow.swift",
         "BrokerLimits.swift",
         "BrokerProtocol.swift",
+        "JSONRequestBody.swift",
         "MonotonicTimestamp.swift",
         "ReadGrantReview.swift",
         "RepositoryName.swift",

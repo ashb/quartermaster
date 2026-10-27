@@ -159,6 +159,7 @@ struct ApprovalDialogView: View {
     let close: () -> Void
     @State private var showsVault = false
     @State private var showsHTTP = false
+    @State private var showsRawHTTP = false
     @State private var showsPeer = false
 
     var body: some View {
@@ -292,8 +293,18 @@ struct ApprovalDialogView: View {
                             "\(presentation.request.method) \(presentation.request.origin ?? "")\(presentation.request.path)"
                         )
                         if let api = presentation.apiRequest {
+                            if api.readableText != nil {
+                                Picker("HTTP view", selection: $showsRawHTTP) {
+                                    Text("Readable").tag(false)
+                                    Text("Raw").tag(true)
+                                }
+                                .pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                            } else {
+                                Text("Raw").foregroundStyle(.secondary)
+                            }
                             ScrollView([.horizontal, .vertical]) {
-                                Text(verbatim: api.text)
+                                Text(verbatim: showsRawHTTP ? api.text : api.readableText ?? api.text)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }.frame(height: 180)
                             Text(
                                 "Authentication is replaced with the selected credential. HTTP framing uses a fixed body length and closes the connection. Byte escapes are shown literally."

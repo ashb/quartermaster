@@ -122,7 +122,9 @@ grant or authorize a request by itself.
 The dialog shows the action, repository name when understood, command and process
 tree. Additional known actions and unfamiliar inputs remain visible. Details
 contains the selected credential and complete effective HTTP request as inert
-escaped bytes. The displayed name does not create a repository grant: approval
+escaped bytes. JSON bodies offer **Readable** and **Raw** views. Readable expands
+query strings and formats the remaining fields; ambiguous or malformed bodies
+stay in Raw. The displayed name does not create a repository grant: approval
 covers this request only. Only authentication and HTTP framing are replaced;
 application headers, query and body are preserved. Redirects need authorization
 again, and uncertain delivery is never retried automatically.
