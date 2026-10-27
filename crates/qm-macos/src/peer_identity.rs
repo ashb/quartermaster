@@ -42,6 +42,13 @@ pub struct ObservedProcess {
 }
 
 #[derive(Serialize)]
+struct ObservedAncestry {
+    process_chain: Vec<String>,
+    complete: bool,
+    note: Option<String>,
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerIdentity {
     pid: u32,
@@ -50,8 +57,7 @@ pub struct PeerIdentity {
     team_identifier: Option<String>,
     cd_hash: String,
     ad_hoc: bool,
-    ancestry: Vec<ObservedProcess>,
-    ancestry_complete: bool,
+    ancestry: ObservedAncestry,
     command_line: Option<String>,
     #[serde(skip)]
     started: (u64, u64),
@@ -67,6 +73,7 @@ pub struct PeerPresentation {
     pub cd_hash: String,
     pub ad_hoc: bool,
     pub ancestry_complete: bool,
+    pub ancestry_note: Option<String>,
     pub command_line: Option<String>,
 }
 
@@ -79,7 +86,8 @@ impl PeerIdentity {
             team_identifier: self.team_identifier.clone(),
             cd_hash: self.cd_hash.clone(),
             ad_hoc: self.ad_hoc,
-            ancestry_complete: self.ancestry_complete,
+            ancestry_complete: self.ancestry.complete,
+            ancestry_note: self.ancestry.note.clone(),
             command_line: self.command_line.clone(),
         }
     }
@@ -179,13 +187,14 @@ impl PeerIdentity {
             .and_then(|v| v.downcast::<CFNumber>())
             .and_then(|n| n.to_i64())
             .is_some_and(|f| f & 2 != 0);
-        let (ancestry, ancestry_complete) = ancestry(pid as u32)?;
+        let process = observed_process(pid as u32)?;
+        let started = process.started;
+        let ancestry = ancestry_with(process, bsd_info, process_path);
         let fresh = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
             .map_err(io::Error::other)?;
         fresh
             .check_validity(flags, &requirement)
             .map_err(io::Error::other)?;
-        let started = ancestry.last().unwrap().started;
         Ok(Self {
             pid: pid as u32,
             executable: display_text(&executable.to_string_lossy()),
@@ -194,7 +203,6 @@ impl PeerIdentity {
             cd_hash,
             ad_hoc,
             ancestry,
-            ancestry_complete,
             command_line: None,
             started,
         })
@@ -234,17 +242,7 @@ impl PeerIdentity {
     }
 
     pub fn process_chain(&self) -> Vec<String> {
-        self.ancestry
-            .iter()
-            .map(|p| {
-                let name = if p.pid == self.pid {
-                    crate::process_display::display_name(Path::new(&p.executable), &p.name)
-                } else {
-                    &p.name
-                };
-                format!("{name} · PID {}", p.pid)
-            })
-            .collect()
+        self.ancestry.process_chain.clone()
     }
 }
 
@@ -332,26 +330,44 @@ fn bsd_info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
             size,
         )
     };
+    if result <= 0 {
+        return Err(io::Error::last_os_error());
+    }
     if result != size {
-        return Err(io::Error::other("process exited or metadata unavailable"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete process metadata",
+        ));
     }
     Ok(unsafe { info.assume_init() })
 }
 
 fn observed_process(pid: u32) -> io::Result<ObservedProcess> {
-    let before = bsd_info(pid)?;
+    observed_process_with(pid, &mut bsd_info, &mut process_path)
+}
+
+fn process_path(pid: u32) -> io::Result<String> {
     let mut bytes = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let size =
         unsafe { libc::proc_pidpath(pid as i32, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
     if size <= 0 {
-        return Err(io::Error::other("process executable unavailable"));
+        return Err(io::Error::last_os_error());
     }
     let end = bytes
         .iter()
         .position(|b| *b == 0)
-        .ok_or_else(|| io::Error::other("invalid process path"))?;
-    let executable = display_text(&String::from_utf8_lossy(&bytes[..end]));
-    let after = bsd_info(pid)?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process path"))?;
+    Ok(display_text(&String::from_utf8_lossy(&bytes[..end])))
+}
+
+fn observed_process_with(
+    pid: u32,
+    info: &mut impl FnMut(u32) -> io::Result<libc::proc_bsdinfo>,
+    path: &mut impl FnMut(u32) -> io::Result<String>,
+) -> io::Result<ObservedProcess> {
+    let before = info(pid)?;
+    let executable = path(pid)?;
+    let after = info(pid)?;
     if (
         before.pbi_start_tvsec,
         before.pbi_start_tvusec,
@@ -361,7 +377,10 @@ fn observed_process(pid: u32) -> io::Result<ObservedProcess> {
         after.pbi_start_tvusec,
         after.pbi_ppid,
     ) {
-        return Err(io::Error::other("process changed during observation"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process changed during observation",
+        ));
     }
     let name = PathBuf::from(&executable)
         .file_name()
@@ -377,23 +396,63 @@ fn observed_process(pid: u32) -> io::Result<ObservedProcess> {
     })
 }
 
-fn ancestry(pid: u32) -> io::Result<(Vec<ObservedProcess>, bool)> {
-    let mut result = vec![observed_process(pid)?];
+fn ancestry_with(
+    peer: ObservedProcess,
+    mut info: impl FnMut(u32) -> io::Result<libc::proc_bsdinfo>,
+    mut path: impl FnMut(u32) -> io::Result<String>,
+) -> ObservedAncestry {
+    let pid = peer.pid;
+    let mut result = vec![peer];
     let mut complete = false;
+    let mut unavailable_ancestor = None;
+    let mut note = Some("Earlier ancestors could not be inspected.".to_owned());
     while result.len() < 6 {
         let parent = result.last().unwrap().parent_pid;
         if parent <= 1 {
             complete = true;
+            note = None;
             break;
         }
         if result.iter().any(|p| p.pid == parent) {
             break;
         }
-        let Ok(process) = observed_process(parent) else {
-            break;
+        let process = match observed_process_with(parent, &mut info, &mut path) {
+            Ok(process) => process,
+            Err(error) => {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    break;
+                }
+                let exited = error.raw_os_error() == Some(libc::ESRCH)
+                    || error.kind() == io::ErrorKind::NotFound;
+                let executable = if exited { None } else { path(parent).ok() };
+                let child = result.last().unwrap();
+                let Ok(current) = info(child.pid) else {
+                    break;
+                };
+                if !child_link_is_current(child, &current) {
+                    break;
+                }
+                let name = executable
+                    .as_deref()
+                    .and_then(|path| Path::new(path).file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Process");
+                unavailable_ancestor = Some(format!("{name} · PID {parent} · limited information"));
+                note = Some(
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        "Earlier ancestors unavailable: macOS denied access to process information."
+                    } else if exited {
+                        "Earlier ancestors unavailable: the parent process exited."
+                    } else {
+                        "Earlier ancestors could not be inspected."
+                    }
+                    .to_owned(),
+                );
+                break;
+            }
         };
         let child = result.last().unwrap();
-        let Ok(current) = bsd_info(child.pid) else {
+        let Ok(current) = info(child.pid) else {
             break;
         };
         if !parent_link_is_current(child, &process, &current) {
@@ -402,7 +461,22 @@ fn ancestry(pid: u32) -> io::Result<(Vec<ObservedProcess>, bool)> {
         result.push(process);
     }
     result.reverse();
-    Ok((result, complete))
+    let process_chain = unavailable_ancestor
+        .into_iter()
+        .chain(result.iter().map(|p| {
+            let name = if p.pid == pid {
+                crate::process_display::display_name(Path::new(&p.executable), &p.name)
+            } else {
+                &p.name
+            };
+            format!("{name} · PID {}", p.pid)
+        }))
+        .collect();
+    ObservedAncestry {
+        process_chain,
+        complete,
+        note,
+    }
 }
 
 fn parent_link_is_current(
@@ -410,10 +484,14 @@ fn parent_link_is_current(
     parent: &ObservedProcess,
     current: &libc::proc_bsdinfo,
 ) -> bool {
-    child.started == (current.pbi_start_tvsec, current.pbi_start_tvusec)
-        && child.parent_pid == current.pbi_ppid
+    child_link_is_current(child, current)
         && child.parent_pid == parent.pid
         && parent.started <= child.started
+}
+
+fn child_link_is_current(child: &ObservedProcess, current: &libc::proc_bsdinfo) -> bool {
+    child.started == (current.pbi_start_tvsec, current.pbi_start_tvusec)
+        && child.parent_pid == current.pbi_ppid
 }
 
 fn display_text(value: &str) -> String {
@@ -459,6 +537,214 @@ mod tests {
             current.pbi_ppid = current_parent;
             assert!(!parent_link_is_current(&child, &parent, &current));
         }
+    }
+
+    fn fixture_info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
+        let (parent, started) = match pid {
+            10 => return Err(io::Error::from_raw_os_error(libc::EPERM)),
+            20 => (10, 200),
+            30 => (20, 300),
+            _ => panic!("unexpected PID {pid}"),
+        };
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        info.pbi_ppid = parent;
+        info.pbi_start_tvsec = started;
+        Ok(info)
+    }
+
+    fn fixture_path(pid: u32) -> io::Result<String> {
+        Ok(match pid {
+            10 => "/usr/bin/login",
+            20 => "/bin/zsh",
+            30 => "/bin/gh",
+            _ => panic!("unexpected PID {pid}"),
+        }
+        .into())
+    }
+
+    fn fixture_peer() -> ObservedProcess {
+        ObservedProcess {
+            name: "gh".into(),
+            executable: "/bin/gh".into(),
+            ..observation(30, 20, (300, 0))
+        }
+    }
+
+    #[test]
+    fn permission_denied_ancestor_keeps_its_available_path_and_explains_the_gap() {
+        let ancestry = ancestry_with(fixture_peer(), fixture_info, fixture_path);
+        assert_eq!(
+            ancestry.process_chain,
+            [
+                "login · PID 10 · limited information",
+                "zsh · PID 20",
+                "gh · PID 30"
+            ]
+        );
+        assert!(!ancestry.complete);
+        assert_eq!(
+            ancestry.note.as_deref(),
+            Some("Earlier ancestors unavailable: macOS denied access to process information.")
+        );
+    }
+
+    #[test]
+    fn an_exited_ancestor_keeps_its_known_pid_without_a_stale_name() {
+        let ancestry = ancestry_with(
+            fixture_peer(),
+            |pid| {
+                if pid == 10 {
+                    Err(io::Error::from_raw_os_error(libc::ESRCH))
+                } else {
+                    fixture_info(pid)
+                }
+            },
+            fixture_path,
+        );
+        assert_eq!(
+            ancestry.process_chain,
+            [
+                "Process · PID 10 · limited information",
+                "zsh · PID 20",
+                "gh · PID 30"
+            ]
+        );
+        assert!(!ancestry.complete);
+        assert_eq!(
+            ancestry.note.as_deref(),
+            Some("Earlier ancestors unavailable: the parent process exited.")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_path_still_leaves_the_parent_pid_visible() {
+        let ancestry = ancestry_with(fixture_peer(), fixture_info, |pid| {
+            if pid == 10 {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            } else {
+                fixture_path(pid)
+            }
+        });
+        assert_eq!(
+            ancestry.process_chain,
+            [
+                "Process · PID 10 · limited information",
+                "zsh · PID 20",
+                "gh · PID 30"
+            ]
+        );
+        assert!(!ancestry.complete);
+    }
+
+    #[test]
+    fn a_changed_child_cannot_attach_a_partially_observed_parent() {
+        for reused in [false, true] {
+            let mut shell_reads = 0;
+            let ancestry = ancestry_with(
+                fixture_peer(),
+                |pid| {
+                    let mut info = fixture_info(pid)?;
+                    if pid == 20 {
+                        shell_reads += 1;
+                        if shell_reads > 2 {
+                            if reused {
+                                info.pbi_start_tvsec += 1;
+                            } else {
+                                info.pbi_ppid = 1;
+                            }
+                        }
+                    }
+                    Ok(info)
+                },
+                fixture_path,
+            );
+            assert_eq!(ancestry.process_chain, ["zsh · PID 20", "gh · PID 30"]);
+            assert!(!ancestry.complete);
+            assert!(ancestry.note.is_some());
+        }
+    }
+
+    #[test]
+    fn missing_metadata_for_the_caller_still_fails_identity_capture() {
+        let error = observed_process_with(
+            30,
+            &mut |_| Err(io::Error::from_raw_os_error(libc::EPERM)),
+            &mut fixture_path,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn a_complete_chain_has_no_missing_ancestor_notice() {
+        let ancestry = ancestry_with(
+            fixture_peer(),
+            |pid| {
+                if pid == 10 {
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    info.pbi_ppid = 1;
+                    info.pbi_start_tvsec = 100;
+                    Ok(info)
+                } else {
+                    fixture_info(pid)
+                }
+            },
+            fixture_path,
+        );
+        assert_eq!(
+            ancestry.process_chain,
+            ["login · PID 10", "zsh · PID 20", "gh · PID 30"]
+        );
+        assert!(ancestry.complete);
+        assert!(ancestry.note.is_none());
+    }
+
+    #[test]
+    fn ancestry_remains_bounded_to_six_processes() {
+        let ancestry = ancestry_with(
+            observation(30, 29, (300, 0)),
+            |pid| {
+                assert!(pid >= 25, "walk exceeded the process limit");
+                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                info.pbi_ppid = pid - 1;
+                info.pbi_start_tvsec = u64::from(pid) * 10;
+                Ok(info)
+            },
+            |_| Ok("/process".into()),
+        );
+        assert_eq!(ancestry.process_chain.len(), 6);
+        assert!(!ancestry.complete);
+        assert!(ancestry.note.is_some());
+    }
+
+    #[test]
+    fn a_racing_ancestor_is_not_reattached_as_a_partial_process() {
+        let mut login_reads = 0;
+        let ancestry = ancestry_with(
+            fixture_peer(),
+            |pid| {
+                if pid == 10 {
+                    login_reads += 1;
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    info.pbi_ppid = 1;
+                    info.pbi_start_tvsec = 100 + login_reads;
+                    Ok(info)
+                } else {
+                    fixture_info(pid)
+                }
+            },
+            fixture_path,
+        );
+        assert_eq!(ancestry.process_chain, ["zsh · PID 20", "gh · PID 30"]);
+        assert!(!ancestry.complete);
+        assert!(ancestry.note.is_some());
+    }
+
+    #[test]
+    fn failed_native_metadata_queries_preserve_the_os_error() {
+        let error = bsd_info(u32::MAX).err().unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
     }
 
     fn argument_buffer(arguments: &[&str]) -> Vec<u8> {

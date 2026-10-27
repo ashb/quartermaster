@@ -5,7 +5,8 @@ import Testing
 @testable import QuartermasterApprovalUI
 
 private func approvalPresentation(
-    complete: Bool = true, effects: [String] = ["Close issue"], repository: String? = "quartermaster/one"
+    complete: Bool = true, effects: [String] = ["Close issue"], repository: String? = "quartermaster/one",
+    ancestryComplete: Bool? = nil, ancestryNote: String? = nil
 ) throws -> ApprovalPresentation {
     let path = "/repos/quartermaster/one/issues/42"
     var application: [String: Any] = [
@@ -15,10 +16,19 @@ private func approvalPresentation(
             .base64EncodedString(),
     ]
     if complete, let repository { application["requestedRepository"] = repository }
-    let bytes = try JSONSerialization.data(withJSONObject: [
+    var payload: [String: Any] = [
         "repository": "", "issue": 42, "method": "PATCH", "path": path, "origin": "https://api.github.com",
         "processChain": ["codex", "gh"], "application": application,
-    ])
+    ]
+    if let ancestryComplete {
+        var peer: [String: Any] = [
+            "pid": 30, "executable": "/bin/gh", "signingIdentifier": "gh", "cdHash": "dummy",
+            "adHoc": false, "ancestryComplete": ancestryComplete,
+        ]
+        if let ancestryNote { peer["ancestryNote"] = ancestryNote }
+        payload["peer"] = peer
+    }
+    let bytes = try JSONSerialization.data(withJSONObject: payload)
     let request = try JSONDecoder().decode(DialogRequest.self, from: bytes)
     let provider = try JSONDecoder().decode(
         ApprovalProviderIdentity.self,
@@ -48,4 +58,23 @@ private func approvalPresentation(
     #expect(presentation.repository == nil)
     #expect(presentation.additionalEffects == ["Close issue"])
     #expect(presentation.apiRequest?.complete == false)
+}
+
+@Test func incompleteAncestryShowsTheBackendsExplanation() throws {
+    let presentation = try approvalPresentation(
+        ancestryComplete: false,
+        ancestryNote: "Earlier ancestors unavailable: macOS denied access to process information.")
+    #expect(
+        presentation.ancestryNotice
+            == "Earlier ancestors unavailable: macOS denied access to process information.")
+}
+
+@Test func incompleteAncestryWithoutAnExplanationStillShowsTheGap() throws {
+    let presentation = try approvalPresentation(ancestryComplete: false)
+    #expect(presentation.ancestryNotice == "Earlier ancestors could not be inspected.")
+}
+
+@Test func completeAncestryDoesNotShowAGap() throws {
+    let presentation = try approvalPresentation(ancestryComplete: true)
+    #expect(presentation.ancestryNotice == nil)
 }

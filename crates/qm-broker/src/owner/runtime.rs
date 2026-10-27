@@ -1199,6 +1199,7 @@ mod tests {
                 cd_hash: principal.code_hash().into(),
                 ad_hoc: true,
                 ancestry_complete: true,
+                ancestry_note: None,
                 command_line: None,
             },
         };

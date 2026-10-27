@@ -198,6 +198,9 @@ remains independent of the daemon and credential authority.
 The broker verifies the socket peer's running code through its kernel audit
 token. Process ancestry is advisory context, with birth-time checks for observed
 PID reuse. It cannot establish a particular script or attached terminal session.
+When an ancestor cannot be fully inspected, the dialog shows its available name
+and PID as limited information and explains where inspection stopped. Partial
+observations never substitute for the socket peer's required identity checks.
 The local approval dialog shows observed arguments independently of CLI syntax
 or API classification. Quoting preserves argument boundaries and makes control
 characters and invisible formatting explicit. Environment values are excluded;

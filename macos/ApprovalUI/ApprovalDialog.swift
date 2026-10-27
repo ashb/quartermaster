@@ -53,6 +53,7 @@ public struct DialogPeer: Codable, Equatable {
     let cdHash: String
     let adHoc: Bool
     let ancestryComplete: Bool
+    let ancestryNote: String?
     let commandLine: String?
 }
 
@@ -95,6 +96,11 @@ public struct ApprovalPresentation {
 
     var additionalEffects: [String] {
         describesClose ? [] : apiRequest?.effects ?? []
+    }
+
+    var ancestryNotice: String? {
+        guard let peer = request.peer, !peer.ancestryComplete else { return nil }
+        return peer.ancestryNote ?? "Earlier ancestors could not be inspected."
     }
 
     var operationTitle: String {
@@ -214,6 +220,9 @@ struct ApprovalDialogView: View {
                         Image(systemName: index == 0 ? "terminal" : "arrow.turn.down.right").foregroundStyle(.secondary)
                         Text(verbatim: process).font(.system(.body, design: .monospaced)).textSelection(.enabled)
                     }.padding(.leading, CGFloat(index) * 14)
+                }
+                if let notice = presentation.ancestryNotice {
+                    Text(verbatim: notice).font(.caption).foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
