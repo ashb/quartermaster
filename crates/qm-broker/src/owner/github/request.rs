@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use qm_api_github::{Analysis, CapturedRequest, EffectKind, PatternSet, RequestLimits};
+use qm_api_github::{Analysis, CapturedRequest, EffectKind, PatternSet, RequestLimits, Resource};
 use ring::digest::{SHA256, digest};
 use serde::{Serialize, Serializer};
 use std::io::{self, Read};
@@ -95,6 +95,26 @@ impl Application {
         &self.analysis
     }
 
+    fn requested_repository(&self) -> Option<String> {
+        if !self.analysis.complete() {
+            return None;
+        }
+        let mut repository = None;
+        for resource in &self.analysis.resources {
+            match resource {
+                Resource::Repository(name) => {
+                    if repository.is_some_and(|previous| previous != name) {
+                        return None;
+                    }
+                    repository = Some(name);
+                }
+                Resource::IssueNumber(_) => {}
+                Resource::RepositoryId(_) | Resource::NodeId(_) => return None,
+            }
+        }
+        repository.map(|name| format!("{}/{}", name.owner, name.name))
+    }
+
     pub(in crate::owner) fn has_mutation(&self) -> bool {
         self.analysis.effects.iter().any(|effect| {
             !matches!(
@@ -168,6 +188,8 @@ impl Serialize for Application {
             original_digest: String,
             complete: bool,
             effects: Vec<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            requested_repository: Option<String>,
         }
         let effects = self
             .analysis
@@ -188,6 +210,7 @@ impl Serialize for Application {
             original_digest: BASE64.encode(digest(&SHA256, self.capture.original())),
             complete: self.analysis.complete(),
             effects,
+            requested_repository: self.requested_repository(),
         }
         .serialize(serializer)
     }
@@ -269,5 +292,20 @@ mod tests {
         )), &PatternSet::default()).unwrap();
         assert!(application.has_mutation());
         assert!(!application.analysis().complete());
+        assert!(application.requested_repository().is_none());
+    }
+
+    #[test]
+    fn requests_with_multiple_or_opaque_repositories_have_no_single_repository_label() {
+        for query in [
+            r#"query { a: repository(owner: "one", name: "repo") { name } b: repository(owner: "two", name: "repo") { name } }"#,
+            r#"query { repository(owner: "one", name: "repo") { name } node(id: "opaque") { id } }"#,
+        ] {
+            let body = serde_json::json!({"query": query}).to_string();
+            let application = Application::read(&mut Cursor::new(format!(
+                "POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+            )), &PatternSet::default()).unwrap();
+            assert!(application.requested_repository().is_none());
+        }
     }
 }

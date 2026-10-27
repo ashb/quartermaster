@@ -92,7 +92,7 @@ the running process through OS identity, including process generation where
 available; a PID, executable name, same-user socket ownership or client-supplied
 field is insufficient. A verified interpreter does not authenticate its script
 or package; interpreted workloads need independently established narrow authority.
-Process ancestry and command arguments are labelled advisory context, never permission.
+Process ancestry and command arguments provide context and never grant permission.
 
 The broker validates, bounds and freezes the complete request. Its binding must
 cover the principal, session, request, destination, credential, effective policy
@@ -103,9 +103,11 @@ with an assertion that a request was already checked.
 
 The UI faithfully presents the immutable request and independently checks its
 digest, challenge binding and supported format. Keep the process tree, exact
-observed command and clearly labelled repository visible without expanding Details; distinguish
-verified scope from advisory or unverified context. GitHub approval uses a verified
-explanation or complete request inspection with effects explicitly unverified.
+observed command and clearly labelled repository name visible without expanding
+Details when the request has one understood named target. A displayed name is
+request context, not proof of confinement or authority. GitHub approval uses a
+verified explanation or complete request inspection with effects explicitly
+unverified.
 If the complete request cannot be presented within supported bounds, refuse
 approval. Classification and policy remain in Rust, without a second UI policy.
 
@@ -176,17 +178,21 @@ failure and cannot create permission.
 
 ### What the user approves
 
-For unfamiliar requests, keep the verified caller, GitHub destination, request
-summary and explicitly unverified effects visible. Details contains the selected
-provider/account/item/field and complete method, target, query, application
-headers and body. Render untrusted content as inert text or explicit bytes without
-hiding control characters, duplicates or omissions. The summary may be shortened;
+For unfamiliar requests, keep the verified caller, GitHub request summary and a
+clear warning that the request is not fully understood visible. Details contains
+the destination, selected provider/account/item/field and complete method,
+target, query, application headers and body. Render untrusted content as inert
+text or explicit bytes without hiding control characters, duplicates or omissions.
+The summary may be shortened;
 the complete request must remain inspectable before approval.
 
-State repository scope only when verified. Otherwise the dialog must say this is
-one use of the selected credential without a verified repository restriction.
-A URL naming a repository cannot borrow that repository's read grant or establish
-confinement. Host requirements to prove resource scope still apply.
+Display repository names independently of numeric identity pins; a missing pin
+alone is not a user-facing warning. Show the action once, avoid repeating it as
+an effect, and retain any additional known actions. Only claim repository
+confinement when verified: a displayed name cannot borrow a read grant or satisfy
+a mandatory scope restriction. Unknown or multiple repository targets must not
+be presented as one understood repository. Reusable grants show their extent and
+expiry; per-request approval creates none.
 
 Approval follows the request binding above and [authority lifecycle](#keep-authority-narrow-and-short-lived).
 It creates no reusable grant, extends none and installs no rule. The UI receives

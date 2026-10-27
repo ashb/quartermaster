@@ -5,6 +5,7 @@ public struct APIRequestReview: Sendable {
     public let complete: Bool
     public let effects: [String]
     public let text: String
+    public let requestedRepository: String?
 
     private struct Envelope: Decodable {
         let method: String
@@ -19,6 +20,7 @@ public struct APIRequestReview: Sendable {
         let originalDigest: Data
         let complete: Bool
         let effects: [String]
+        let requestedRepository: String?
     }
 
     public static func parse(request: Data) throws -> Self? {
@@ -35,7 +37,12 @@ public struct APIRequestReview: Sendable {
             capture.request.starts(with: Data("\(envelope.method) \(envelope.path) HTTP/1.1\r\n".utf8)),
             capture.effects.count <= 4096, capture.effects.allSatisfy({ $0.utf8.count <= 64 })
         else { throw Failure.invalidRequest }
-        return Self(complete: capture.complete, effects: capture.effects, text: escaped(capture.request))
+        if let repository = capture.requestedRepository {
+            guard capture.complete, RepositoryName(fullName: repository) != nil else { throw Failure.invalidRequest }
+        }
+        return Self(
+            complete: capture.complete, effects: capture.effects, text: escaped(capture.request),
+            requestedRepository: capture.requestedRepository)
     }
 
     private static func escaped(_ data: Data) -> String {

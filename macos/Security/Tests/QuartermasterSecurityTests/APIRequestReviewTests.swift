@@ -48,3 +48,14 @@ func apiReviewRejectsUnsupportedOrInconsistentCaptureBindings(_ field: String) t
     #expect(review.text.hasSuffix("\\x00\\xff\\\\\\x1b"))
     #expect(!review.text.contains("\u{1b}"))
 }
+
+@Test(arguments: [("quartermaster/one", false), ("owner/repo/extra", true), ("owner/space name", true)])
+func repositoryDisplayContextRequiresACompleteAnalysisAndAValidName(_ repository: String, _ complete: Bool) throws {
+    var fixture = try apiFixture()
+    var application = try #require(fixture["application"] as? [String: Any])
+    application["requestedRepository"] = repository
+    application["complete"] = complete
+    fixture["application"] = application
+    let bytes = try JSONSerialization.data(withJSONObject: fixture)
+    #expect(throws: APIRequestReview.Failure.self) { try APIRequestReview.parse(request: bytes) }
+}

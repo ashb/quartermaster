@@ -28,6 +28,17 @@ swift_test(
     ],
 )
 
+swift_test(
+    name = "ApprovalTests",
+    srcs = ["ApprovalPresentationTests.swift"],
+    copts = ["-swift-version", "6"],
+    module_name = "ApprovalTests",
+    deps = [
+        "//macos/ApprovalUI:QuartermasterApprovalUI",
+        "//macos/Security/Sources/QuartermasterSecurity",
+    ],
+)
+
 swift_binary(
     name = "QuartermasterIntegrationTests",
     testonly = True,

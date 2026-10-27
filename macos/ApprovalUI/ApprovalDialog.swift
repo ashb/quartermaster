@@ -84,13 +84,24 @@ public struct ApprovalPresentation {
         self.apiRequest = apiRequest
     }
 
+    private var describesClose: Bool {
+        readGrant == nil && apiRequest?.complete == true && apiRequest?.effects == ["Close issue"]
+            && request.issue != nil
+    }
+
+    var repository: String? {
+        request.repository.isEmpty ? apiRequest?.requestedRepository : request.repository
+    }
+
+    var additionalEffects: [String] {
+        describesClose ? [] : apiRequest?.effects ?? []
+    }
+
     var operationTitle: String {
-        if let api = apiRequest, readGrant == nil, api.complete, api.effects == ["Close issue"],
-            let issue = request.issue
-        {
+        if describesClose, let issue = request.issue {
             return "Close issue #\(issue)"
         }
-        return readGrant == nil ? "Approve one GitHub request" : "Allow issue reads"
+        return readGrant == nil ? "Approve GitHub request" : "Allow issue reads"
     }
 
     var authenticationReason: String {
@@ -182,16 +193,15 @@ struct ApprovalDialogView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text(presentation.request.repository.isEmpty ? "Destination" : "Repository")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text(
-                    presentation.request.repository.isEmpty
-                        ? presentation.request.origin ?? "" : presentation.request.repository
-                ).font(.headline)
-                if let grant = presentation.readGrant {
-                    Text("Until \(grant.expires.formatted(date: .omitted, time: .shortened)) or backend restart")
-                        .font(.subheadline).foregroundStyle(.secondary)
+            if let repository = presentation.repository {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Repository")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(verbatim: repository).font(.headline)
+                    if let grant = presentation.readGrant {
+                        Text("Until \(grant.expires.formatted(date: .omitted, time: .shortened)) or backend restart")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -204,24 +214,20 @@ struct ApprovalDialogView: View {
                         Text(verbatim: process).font(.system(.body, design: .monospaced)).textSelection(.enabled)
                     }.padding(.leading, CGFloat(index) * 14)
                 }
-                Text("Observed process ancestry").font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if let api = presentation.apiRequest, presentation.readGrant == nil {
+            if let api = presentation.apiRequest, presentation.readGrant == nil,
+                !api.complete || !presentation.additionalEffects.isEmpty
+            {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("One request · no reusable access")
-                    Text(verbatim: "\(presentation.request.method) \(presentation.request.path)")
-                        .font(.body.monospaced()).lineLimit(2).truncationMode(.middle).textSelection(.enabled)
-                    Text(
-                        "Repository scope is unverified. This request may use the selected credential’s full upstream permissions."
-                    )
-                    .font(.caption)
-                    if !api.effects.isEmpty {
-                        Text("Recognized effects: \(api.effects.joined(separator: ", "))").font(.caption)
+                    if !presentation.additionalEffects.isEmpty {
+                        Text("Requested actions: \(presentation.additionalEffects.joined(separator: ", "))").font(
+                            .caption)
                     }
                     if !api.complete {
-                        Text("Some inputs are unfamiliar; the complete effects are unverified.").font(.caption)
+                        Text("This request isn't fully understood. Review the HTTP details before approving.").font(
+                            .caption)
                     }
                 }
             }

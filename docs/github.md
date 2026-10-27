@@ -29,10 +29,10 @@ Editing the server, email or Login item after verification invalidates it. Verif
 the edited selection before reviewing changes; Discard Changes restores the
 approved selection.
 
-When no vault is selected, **Vault → Retained enrolments** lists caches on this
-Mac. Select the intended account and Login item, review, then save with Touch ID
-instead of signing in again. The approval unlocks and verifies that cache before
-selecting it. **Sync Vault** refreshes the selected cache from Vaultwarden.
+If previous settings need migration, Settings explains the change and offers
+**Review Import…**. Inspect the previous vault selection and access rules, then
+choose **Import and Trust** with Touch ID. Closing the review preserves the
+original data. **Sync Vault** refreshes the selected cache from Vaultwarden.
 
 The development enrolment uses the role label `github-write`. It can hold the
 read-only token above; the label does not give that token write permissions.
@@ -119,12 +119,13 @@ In **Settings → GitHub**, enable **Allow unfamiliar requests**, then review an
 configured issue-read match are rejected. Enabling it does not create a read
 grant or authorize a request by itself.
 
-The dialog shows the complete effective request as inert escaped bytes, the
-selected credential and any recognized effects. Its repository scope remains
-unverified: approval permits one request using the credential's upstream
-permissions. Only authentication and HTTP framing are replaced; application
-headers, query and body are preserved. Redirects need authorization again, and
-uncertain delivery is never retried automatically.
+The dialog shows the action, repository name when understood, command and process
+tree. Additional known actions and unfamiliar inputs remain visible. Details
+contains the selected credential and complete effective HTTP request as inert
+escaped bytes. The displayed name does not create a repository grant: approval
+covers this request only. Only authentication and HTTP framing are replaced;
+application headers, query and body are preserved. Redirects need authorization
+again, and uncertain delivery is never retried automatically.
 
 For example, with this opt-in and the isolated configuration above:
 

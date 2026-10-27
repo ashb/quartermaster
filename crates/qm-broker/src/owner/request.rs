@@ -504,6 +504,23 @@ mod github_tests {
         }
     }
 
+    #[test]
+    fn a_named_close_request_has_display_context_without_reusable_repository_authority() {
+        let body = r#"{"state":"closed"}"#;
+        let request = read_configured(&mut Cursor::new(format!(
+            "PATCH /repos/quartermaster/one/issues/42 HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()
+        )), Some(&config())).unwrap();
+        let review = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            review["application"]["requestedRepository"],
+            "quartermaster/one"
+        );
+        assert!(request.repository().is_empty());
+        assert!(request.github_identity().is_none());
+        assert_eq!(request.action(), Action::Api);
+        assert_eq!(request.path(), "/repos/quartermaster/one/issues/42");
+    }
+
     fn config() -> GitHubConfig {
         GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"quartermaster","name":"one"},{"id":456,"owner":"quartermaster","name":"two"}]}"#).unwrap()
     }
