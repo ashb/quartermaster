@@ -23,6 +23,7 @@ swift_test(
     copts = ["-swift-version", "6"],
     module_name = "PreferencesTests",
     deps = [
+        "//macos/ApprovalUI:QuartermasterApprovalUI",
         "//macos/Quartermaster:Quartermaster",
         "//macos/Security/Sources/QuartermasterSecurity",
     ],

@@ -12,16 +12,27 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private var task: Task<Void, Never>?
     private var active: (any ApprovalWindow)?
     private var presentation: Int32?
+    private var settingsIsOpen = false
     private var operationEnrolled = false
     private var connectionPhase: ConnectionPhase = .disconnected
+    private let setActivationPolicy: (NSApplication.ActivationPolicy) -> Void
     private let controls = ApprovalControlWorkflow()
     lazy var preferences = SettingsEditor { [weak self] command in
         guard let client = self?.client else { throw BrokerFailure.disconnected }
         return try await client.call(command)
     }
 
+    override convenience init() {
+        self.init(setActivationPolicy: { NSApplication.shared.setActivationPolicy($0) })
+    }
+
+    init(setActivationPolicy: @escaping (NSApplication.ActivationPolicy) -> Void) {
+        self.setActivationPolicy = setActivationPolicy
+        super.init()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApplication.shared.setActivationPolicy(.accessory)
+        setActivationPolicy(.accessory)
         reconnect()
     }
 
@@ -125,8 +136,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
 
     private func reviewSettings(importing: Bool) {
         if let active {
-            active.window.makeKeyAndOrderFront(nil)
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            active.show(centred: false)
             return
         }
         guard !controls.busy, !preferences.busy else {
@@ -176,17 +186,21 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func settingsOpened() {
-        if NSApplication.shared.activationPolicy() != .regular {
-            NSApplication.shared.setActivationPolicy(.regular)
-        }
+        settingsIsOpen = true
+        updateActivationPolicy()
         if connectionPhase == .disconnected { reconnect() }
     }
 
     func settingsClosed() {
-        NSApplication.shared.setActivationPolicy(.accessory)
+        settingsIsOpen = false
         (active as? SettingsApprovalDialog)?.cancel()
+        updateActivationPolicy()
         preferences.discardDraft()
         Task { await preferences.cancel() }
+    }
+
+    private func updateActivationPolicy() {
+        setActivationPolicy(settingsIsOpen || active != nil ? .regular : .accessory)
     }
 
     func revokeReads() {
@@ -240,20 +254,20 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         }
     }
 
-    private func present(_ dialog: any ApprovalWindow, settings: Bool = false) {
+    func present(_ dialog: any ApprovalWindow, settings: Bool = false) {
         dialog.onClose = { [weak self] in
             guard let self else { return }
             active = nil
             releasePresentation()
+            updateActivationPolicy()
             if settings {
                 operationEnrolled = false
                 Task { await reloadPreferences() }
             }
         }
         active = dialog
-        dialog.window.center()
-        dialog.window.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        updateActivationPolicy()
+        dialog.show(centred: true)
     }
 
     private func releasePresentation() {

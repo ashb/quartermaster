@@ -82,7 +82,7 @@ final class BrokerConnection: @unchecked Sendable {
                     pending.resume(throwing: BrokerFailure.timeout)
                 }
             }
-            let remote = connection.remoteObjectProxyWithErrorHandler { _ in
+            let remote = connection.remoteObjectProxyWithErrorHandler { @Sendable _ in
                 if let pending = completion.withLock({ value in
                     defer { value = nil }
                     return value

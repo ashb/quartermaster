@@ -33,6 +33,8 @@ struct QuartermasterApp: App {
         Settings {
             PreferencesView(editor: application.preferences, application: application)
         }
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
         MenuBarExtra("Quartermaster", systemImage: "key.horizontal") {
             Text(application.status)
             SettingsMenuItem()

@@ -125,6 +125,12 @@ public final class SettingsApprovalDialog: NSObject, NSWindowDelegate, ApprovalW
                 close: { [weak window] in window?.performClose(nil) }))
     }
 
+    public func show(centred: Bool) {
+        if centred { window.center() }
+        window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
     public func cancel() {
         controller.cancel()
         window.performClose(nil)

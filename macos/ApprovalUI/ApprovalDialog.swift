@@ -332,8 +332,8 @@ struct ApprovalDialogView: View {
 
 @MainActor
 public protocol ApprovalWindow: AnyObject {
-    var window: NSWindow { get }
     var onClose: (() -> Void)? { get set }
+    func show(centred: Bool)
     func cancel()
 }
 
@@ -359,6 +359,12 @@ public final class ApprovalDialog: NSObject, NSWindowDelegate, ApprovalWindow {
             rootView: ApprovalDialogView(
                 presentation: presentation, controller: controller,
                 close: { [weak window] in window?.performClose(nil) }))
+    }
+
+    public func show(centred: Bool) {
+        if centred { window.center() }
+        window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     public func cancel() {

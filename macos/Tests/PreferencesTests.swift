@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import QuartermasterApprovalUI
 import QuartermasterSecurity
 import Testing
 
@@ -30,23 +31,50 @@ import Testing
     #expect(editor.message.contains("disconnected"))
 }
 
-@Test @MainActor func closingTheNativeSettingsWindowDiscardsItsDraft() async throws {
-    _ = NSApplication.shared
-    let application = BrokerApplication()
+@Test @MainActor func closingSettingsDiscardsItsDraft() async throws {
+    var policy: NSApplication.ActivationPolicy?
+    let application = BrokerApplication(setActivationPolicy: { policy = $0 })
     let editor = try preferencesEditor()
     application.preferences = editor
     await editor.load()
     editor.draft.mutations = .requireApproval
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 100, height: 100), styleMask: [.titled], backing: .buffered, defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.contentView = PreferencesWindowObserver(opened: {}, closed: application.settingsClosed)
     #expect(editor.canReview)
-    window.close()
+    application.settingsClosed()
     #expect(editor.draft.mutations == .deny)
     #expect(!editor.canReview)
-    #expect(NSApplication.shared.activationPolicy() == .accessory)
+    #expect(policy == .accessory)
+}
+
+@MainActor private final class InertApprovalWindow: ApprovalWindow {
+    var onClose: (() -> Void)?
+    private(set) var cancelled = false
+    private(set) var isPresented = false
+
+    func show(centred: Bool) { isPresented = true }
+
+    func cancel() {
+        cancelled = true
+        close()
+    }
+
+    func close() {
+        isPresented = false
+        onClose?()
+    }
+}
+
+@Test @MainActor func closingSettingsPreservesAnApprovalAndRequestsRegularActivation() {
+    var policy: NSApplication.ActivationPolicy?
+    let application = BrokerApplication(setActivationPolicy: { policy = $0 })
+    let approval = InertApprovalWindow()
+    application.present(approval)
+    #expect(policy == .regular)
+    application.settingsClosed()
+    #expect(approval.isPresented)
+    #expect(!approval.cancelled)
+    #expect(policy == .regular)
+    approval.close()
+    #expect(policy == .accessory)
 }
 
 @Test @MainActor func completingAnImportRefreshesTheApplicationsMigrationStatus() async throws {
