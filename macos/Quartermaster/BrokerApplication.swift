@@ -8,7 +8,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private enum ConnectionPhase { case disconnected, connecting, connected }
     @Published private(set) var status = "Disconnected"
     @Published private(set) var vaultStatus: BrokerVaultStatus?
-    private var client: BrokerConnection?
+    private var client: (any BrokerClient)?
     private var task: Task<Void, Never>?
     private var active: (any ApprovalWindow)?
     private var presentation: Int32?
@@ -16,6 +16,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private var operationEnrolled = false
     private var connectionPhase: ConnectionPhase = .disconnected
     private let setActivationPolicy: (NSApplication.ActivationPolicy) -> Void
+    private let openConnection: () async throws -> any BrokerClient
+    private let loadApprovalKey: () throws -> Data
     private let controls = ApprovalControlWorkflow()
     lazy var preferences = SettingsEditor { [weak self] command in
         guard let client = self?.client else { throw BrokerFailure.disconnected }
@@ -26,14 +28,35 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         self.init(setActivationPolicy: { NSApplication.shared.setActivationPolicy($0) })
     }
 
-    init(setActivationPolicy: @escaping (NSApplication.ActivationPolicy) -> Void) {
+    init(
+        setActivationPolicy: @escaping (NSApplication.ActivationPolicy) -> Void,
+        openConnection: @escaping () async throws -> any BrokerClient = { try await BrokerConnection.connect() },
+        loadApprovalKey: @escaping () throws -> Data = { try ApprovalKeyStore().loadOrCreate() }
+    ) {
         self.setActivationPolicy = setActivationPolicy
+        self.openConnection = openConnection
+        self.loadApprovalKey = loadApprovalKey
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setActivationPolicy(.accessory)
-        reconnect()
+        connectIfNeeded()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        connectIfNeeded()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        connectIfNeeded()
+        active?.show(centred: false)
+        updateActivationPolicy()
+        return false
+    }
+
+    private func connectIfNeeded() {
+        if connectionPhase == .disconnected || client?.disconnected == true { reconnect() }
     }
 
     func reconnect() {
@@ -48,22 +71,13 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         operationEnrolled = false
         task = Task {
             do {
-                let executable = BrokerConnection.executable
-                try await Task.detached {
-                    let process = Process()
-                    process.executableURL = executable
-                    process.arguments = ["start"]
-                    try process.run()
-                    process.waitUntilExit()
-                    guard process.terminationStatus == 0 else { throw BrokerFailure.disconnected }
-                }.value
+                let connection = try await openConnection()
                 try Task.checkCancellation()
-                let connection = try BrokerConnection()
                 client = connection
                 guard case .hello("development") = try await connection.call(.hello) else {
                     throw BrokerFailure.invalidMessage
                 }
-                let key = try ApprovalKeyStore().loadOrCreate()
+                let key = try loadApprovalKey()
                 guard case .settingsStatus = try await connection.call(.settingsRegister(publicKey: key)) else {
                     throw BrokerFailure.invalidMessage
                 }
@@ -96,7 +110,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         }
     }
 
-    private func poll(_ connection: BrokerConnection, key: Data) async throws {
+    private func poll(_ connection: any BrokerClient, key: Data) async throws {
         if !operationEnrolled {
             guard case .enrolled = try await connection.call(.enroll(publicKey: key)) else {
                 throw BrokerFailure.invalidMessage
@@ -188,7 +202,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     func settingsOpened() {
         settingsIsOpen = true
         updateActivationPolicy()
-        if connectionPhase == .disconnected { reconnect() }
+        connectIfNeeded()
     }
 
     func settingsClosed() {

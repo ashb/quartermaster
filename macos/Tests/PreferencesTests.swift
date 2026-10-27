@@ -45,7 +45,7 @@ import Testing
     #expect(policy == .accessory)
 }
 
-@MainActor private final class InertApprovalWindow: ApprovalWindow {
+@MainActor final class InertApprovalWindow: ApprovalWindow {
     var onClose: (() -> Void)?
     private(set) var cancelled = false
     private(set) var isPresented = false

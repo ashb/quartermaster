@@ -19,7 +19,10 @@ swift_test(
 
 swift_test(
     name = "PreferencesTests",
-    srcs = ["PreferencesTests.swift"],
+    srcs = [
+        "ConnectionRecoveryTests.swift",
+        "PreferencesTests.swift",
+    ],
     copts = ["-swift-version", "6"],
     module_name = "PreferencesTests",
     deps = [
