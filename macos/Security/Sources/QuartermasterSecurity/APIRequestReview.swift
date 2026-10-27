@@ -49,13 +49,16 @@ public struct APIRequestReview: Sendable {
         let hex = Array("0123456789abcdef".utf8)
         var bytes: [UInt8] = []
         bytes.reserveCapacity(data.count)
-        for byte in data {
+        for index in data.indices {
+            let byte = data[index]
             switch byte {
             case 32...126:
                 if byte == 92 { bytes.append(92) }
                 bytes.append(byte)
-            case 10: bytes.append(contentsOf: [92, 110, 10])
-            case 13: bytes.append(contentsOf: [92, 114])
+            case 10: bytes.append(10)
+            case 13:
+                let next = data.index(after: index)
+                if next == data.endIndex || data[next] != 10 { bytes.append(contentsOf: [92, 114]) }
             default: bytes.append(contentsOf: [92, 120, hex[Int(byte >> 4)], hex[Int(byte & 15)]])
             }
         }
