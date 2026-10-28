@@ -7,21 +7,24 @@ import QuartermasterSecurity
 final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject {
     private enum ConnectionPhase { case disconnected, connecting, connected }
     enum VaultActivity: Equatable {
-        case idle, locking, syncing, locked, synced
+        case idle, locking, syncing, unlocking, locked, synced, unlocked
         case failed(String)
 
-        var busy: Bool { self == .locking || self == .syncing }
+        var busy: Bool { self == .locking || self == .syncing || self == .unlocking }
         var message: String? {
             switch self {
             case .idle: nil
             case .locking: "Locking vault…"
             case .syncing: "Syncing vault…"
+            case .unlocking: "Unlocking vault…"
             case .locked: "Vault locked."
             case .synced: "Vault synced."
+            case .unlocked: "Vault unlocked."
             case .failed(let message): message
             }
         }
     }
+    private enum VaultAction { case lock, sync, unlock }
     @Published private(set) var status = "Disconnected"
     @Published private(set) var vaultStatus: BrokerVaultStatus?
     @Published private(set) var vaultActivity = VaultActivity.idle
@@ -37,6 +40,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private let setActivationPolicy: (NSApplication.ActivationPolicy) -> Void
     private let openConnection: () async throws -> any BrokerClient
     private let loadApprovalKey: () throws -> Data
+    private let acquirePresentation: () throws -> Int32
+    private let makeUnlockWindow: (VaultUnlockReview, any VaultUnlockBackend, Bool) -> any VaultUnlockWindow
     private let controls = ApprovalControlWorkflow()
     lazy var preferences = SettingsEditor { [weak self] command in
         guard let client = self?.client else { throw BrokerFailure.disconnected }
@@ -50,11 +55,17 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     init(
         setActivationPolicy: @escaping (NSApplication.ActivationPolicy) -> Void,
         openConnection: @escaping () async throws -> any BrokerClient = { try await BrokerConnection.connect() },
-        loadApprovalKey: @escaping () throws -> Data = { try ApprovalKeyStore().loadOrCreate() }
+        loadApprovalKey: @escaping () throws -> Data = { try ApprovalKeyStore().loadOrCreate() },
+        acquirePresentation: @escaping () throws -> Int32 = { try DialogPresentationLease.acquire() },
+        makeUnlockWindow: @escaping (VaultUnlockReview, any VaultUnlockBackend, Bool) -> any VaultUnlockWindow = {
+            VaultUnlockDialog(review: $0, backend: $1, forSync: $2)
+        }
     ) {
         self.setActivationPolicy = setActivationPolicy
         self.openConnection = openConnection
         self.loadApprovalKey = loadApprovalKey
+        self.acquirePresentation = acquirePresentation
+        self.makeUnlockWindow = makeUnlockWindow
         super.init()
     }
 
@@ -107,7 +118,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 connectionPhase = .connected
                 while !Task.isCancelled {
                     guard !connection.disconnected else { throw BrokerFailure.disconnected }
-                    if active == nil && !controls.busy && !preferences.busy,
+                    if active == nil && !controls.busy && !preferences.busy && !vaultActivity.busy,
                         preferences.snapshot?.provider != nil, preferences.snapshot?.settings?.github != nil
                     {
                         do { try await poll(connection, key: key) } catch let error as BrokerControlError
@@ -145,12 +156,12 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         switch try await connection.call(.next) {
         case .idle: break
         case .review(let review):
-            guard active == nil, !controls.busy, !preferences.busy else {
+            guard active == nil, !controls.busy, !preferences.busy, !vaultActivity.busy else {
                 _ = try await connection.call(.cancel(id: review.id))
                 return
             }
             let pending = try BrokerPending(client: connection, review: review)
-            do { presentation = try DialogPresentationLease.acquire() } catch DialogPresentationLease.Failure
+            do { presentation = try acquirePresentation() } catch DialogPresentationLease.Failure
                 .alreadyPresented
             {
                 pending.cancel()
@@ -178,7 +189,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             active.show(centred: false)
             return
         }
-        guard !controls.busy, !preferences.busy else {
+        guard !controls.busy, !preferences.busy, !vaultActivity.busy else {
             preferences.report(BrokerControlError.busy)
             return
         }
@@ -198,7 +209,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     }
                     reviewID = review.id
                     let pending = try SettingsPending(client: client, review: review)
-                    presentation = try DialogPresentationLease.acquire()
+                    presentation = try acquirePresentation()
                     let dialog = SettingsApprovalDialog(
                         review: review, document: pending.document, backend: pending, migration: migration)
                     present(dialog, settings: true)
@@ -211,7 +222,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func stageEnrollment(password: String) {
-        guard active == nil, !controls.busy else { return }
+        guard active == nil, !controls.busy, !vaultActivity.busy else { return }
         Task {
             await controls.perform {
                 await preferences.enroll(password: password)
@@ -235,7 +246,13 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     func settingsClosed() {
         settingsWindow = nil
         settingsIsOpen = false
+        if vaultActivity == .unlocking || vaultActivity == .syncing {
+            vaultTask?.cancel()
+            vaultActivity = .failed("Vault operation dismissed.")
+            status = vaultActivity.message ?? status
+        }
         (active as? SettingsApprovalDialog)?.cancel()
+        (active as? any VaultUnlockWindow)?.cancel()
         updateActivationPolicy()
         preferences.discardDraft()
         Task { await preferences.cancel() }
@@ -264,32 +281,129 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func vault(_ command: BrokerCommand) {
-        let locking: Bool
-        if case .vaultLock = command {
-            locking = true
+        switch command {
+        case .vaultLock: runVault(.lock)
+        case .vaultSync: runVault(.sync)
+        default: return
+        }
+    }
+
+    func unlockVault() { runVault(.unlock) }
+
+    private func runVault(_ action: VaultAction) {
+        if action == .lock {
             active?.cancel()
             vaultTask?.cancel()
         } else {
             guard !vaultActivity.busy else { return }
-            locking = false
+            guard active == nil, !controls.busy, !preferences.busy else {
+                active?.show(centred: false)
+                vaultActivity = .failed("Finish the current approval before continuing.")
+                return
+            }
         }
-        vaultActivity = locking ? .locking : .syncing
+        vaultActivity =
+            switch action {
+            case .lock: .locking
+            case .sync: .syncing
+            case .unlock: .unlocking
+            }
         status = vaultActivity.message ?? status
         vaultTask = Task {
             do {
-                guard let client, case .vaultStatus(let vault) = try await client.call(command) else {
-                    throw BrokerFailure.disconnected
+                try Task.checkCancellation()
+                guard let client else { throw BrokerFailure.disconnected }
+                let vault: BrokerVaultStatus
+                switch action {
+                case .lock:
+                    guard case .vaultStatus(let reply) = try await client.call(.vaultLock) else {
+                        throw BrokerFailure.invalidMessage
+                    }
+                    vault = reply
+                case .sync: vault = try await syncVault(client)
+                case .unlock: vault = try await requestVaultUnlock(client, forSync: false)
                 }
                 operationEnrolled = false
                 await refreshVaultStatus()
                 try Task.checkCancellation()
-                vaultActivity = vault.error == nil ? (locking ? .locked : .synced) : .failed(vaultFailure(vault))
+                if vault.error != nil {
+                    vaultActivity = .failed(vaultFailure(vault))
+                } else {
+                    vaultActivity =
+                        switch action {
+                        case .lock: .locked
+                        case .sync: .synced
+                        case .unlock: .unlocked
+                        }
+                }
                 status = "Vault: \(vault.state.rawValue)"
             } catch {
                 guard !Task.isCancelled else { return }
-                vaultActivity = .failed("Could not complete the vault operation. Reconnect and try again.")
+                await refreshVaultStatus()
+                guard !Task.isCancelled else { return }
+                let message: String
+                switch error {
+                case is CancellationError: message = "Unlock not completed."
+                case VaultOperationFailure.reported(let vault): message = vaultFailure(vault)
+                case BrokerControlError.expired: message = "The unlock timed out. Try again."
+                case BrokerControlError.providerChanged, BrokerControlError.sessionEnded:
+                    message = "The vault selection or session changed. Try again."
+                case BrokerControlError.busy, DialogPresentationLease.Failure.alreadyPresented:
+                    message = "Another approval is open. Finish it and try again."
+                default: message = "Could not complete the vault operation. Reconnect and try again."
+                }
+                vaultActivity = .failed(message)
                 status = vaultActivity.message ?? status
             }
+        }
+    }
+
+    private func syncVault(_ client: any BrokerClient) async throws -> BrokerVaultStatus {
+        var unlocked = false
+        if vaultStatus?.state == .locked {
+            _ = try await requestVaultUnlock(client, forSync: true)
+            unlocked = true
+        }
+        vaultActivity = .syncing
+        guard case .vaultStatus(let reply) = try await client.call(.vaultSync) else {
+            throw BrokerFailure.invalidMessage
+        }
+        guard reply.state == .locked, reply.error != nil, !unlocked else { return reply }
+        _ = try await requestVaultUnlock(client, forSync: true)
+        vaultActivity = .syncing
+        guard case .vaultStatus(let retry) = try await client.call(.vaultSync) else {
+            throw BrokerFailure.invalidMessage
+        }
+        return retry
+    }
+
+    private func requestVaultUnlock(_ client: any BrokerClient, forSync: Bool) async throws -> BrokerVaultStatus {
+        guard let snapshot = preferences.snapshot else { throw BrokerControlError.denied }
+        vaultActivity = .unlocking
+        guard
+            case .vaultUnlockReview(let review) = try await client.call(
+                .prepareVaultUnlock(revision: snapshot.revision), context: nil)
+        else { throw BrokerFailure.invalidMessage }
+        do {
+            try Task.checkCancellation()
+            let pending = try VaultUnlockPending(client: client, review: review, snapshot: snapshot)
+            presentation = try acquirePresentation()
+            let dialog = makeUnlockWindow(review, pending, forSync)
+            let result: BrokerVaultStatus = try await withCheckedThrowingContinuation { continuation in
+                present(dialog) { [weak dialog] in
+                    if dialog?.approved == true, let result = pending.result {
+                        continuation.resume(returning: result)
+                    } else {
+                        continuation.resume(throwing: pending.failure ?? CancellationError())
+                    }
+                }
+            }
+            try Task.checkCancellation()
+            vaultStatus = result
+            return result
+        } catch {
+            _ = try? await client.call(.vaultUnlockCancel(id: review.id), context: nil)
+            throw error
         }
     }
 
@@ -335,9 +449,10 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         }
     }
 
-    func present(_ dialog: any ApprovalWindow, settings: Bool = false) {
-        dialog.onClose = { [weak self] in
-            guard let self else { return }
+    func present(_ dialog: any ApprovalWindow, settings: Bool = false, completion: (() -> Void)? = nil) {
+        dialog.onClose = { [weak self, weak dialog] in
+            guard let self, let dialog else { return }
+            dialog.onClose = nil
             active = nil
             releasePresentation()
             updateActivationPolicy()
@@ -345,6 +460,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 operationEnrolled = false
                 Task { await reloadPreferences() }
             }
+            completion?()
         }
         active = dialog
         updateActivationPolicy()

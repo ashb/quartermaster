@@ -9,6 +9,7 @@ import Security
 import Synchronization
 
 enum BrokerFailure: Error { case invalidCode, invalidMessage, disconnected, timeout }
+enum VaultOperationFailure: Error { case reported(BrokerVaultStatus) }
 
 protocol BrokerClient: AnyObject, Sendable {
     var disconnected: Bool { get }
@@ -150,6 +151,41 @@ final class BrokerConnection: BrokerClient, @unchecked Sendable {
         }
     }
 
+}
+
+@MainActor
+final class VaultUnlockPending: VaultUnlockBackend {
+    let review: VaultUnlockReview
+    var reviewCreated: MonotonicTimestamp { review.created }
+    private let client: any BrokerClient
+    private(set) var result: BrokerVaultStatus?
+    private(set) var failure: (any Error)?
+
+    init(client: any BrokerClient, review: VaultUnlockReview, snapshot: SettingsSnapshot) throws {
+        try review.validate(snapshot: snapshot, now: .now)
+        self.client = client
+        self.review = review
+    }
+
+    func unlock(authenticated: MonotonicTimestamp, context: LAContext) async throws {
+        do {
+            try Task.checkCancellation()
+            let reply = try await client.call(
+                .vaultUnlockPresence(id: review.id, authenticated: authenticated), context: context)
+            try Task.checkCancellation()
+            guard case .vaultStatus(let status) = reply else { throw BrokerFailure.invalidMessage }
+            if status.error != nil { throw VaultOperationFailure.reported(status) }
+            try review.validate(result: status)
+            result = status
+        } catch {
+            failure = error
+            throw error
+        }
+    }
+
+    func cancel() {
+        Task { _ = try? await client.call(.vaultUnlockCancel(id: review.id)) }
+    }
 }
 
 @MainActor

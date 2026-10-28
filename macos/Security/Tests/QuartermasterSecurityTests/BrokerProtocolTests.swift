@@ -43,6 +43,9 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
             server: "https://vault.example.invalid", email: "dummy@example.invalid", password: "dummy master password",
             itemID: "22222222-2222-4222-8222-222222222222"),
         .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard, .revokeReadGrants,
+        .prepareVaultUnlock(revision: 4),
+        .vaultUnlockPresence(id: id, authenticated: try brokerTimestamp(105_000_000_000)),
+        .vaultUnlockCancel(id: id),
     ]
     let fixtures = try brokerFixtures("commands")
     #expect(commands.count == fixtures.count)
@@ -80,6 +83,10 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
         case .alreadyAdmitted: kind = "alreadyAdmitted"
         case .unknownOperation: kind = "unknownOperation"
         case .readGrantsRevoked: kind = "readGrantsRevoked"
+        case .vaultUnlockReview(let review):
+            kind = "vaultUnlockReview"
+            #expect(review.revision == 4)
+            #expect(review.provider.binding.email == "dummy@example.invalid")
         case .settingsStatus, .settingsReview, .settingsChallenge, .enrollmentStaged, .settingsApplied:
             Issue.record("Unexpected settings reply in the operation fixture")
             kind = "unexpectedSettings"

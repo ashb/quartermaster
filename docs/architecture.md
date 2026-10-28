@@ -147,6 +147,12 @@ The cache is a disposable encrypted snapshot of the selected credential state.
 Rust owns its device-bound Secure Enclave unwrap key; the UI has a separate
 approval key and keychain group.
 
+Settings offers **Unlock**, **Lock Now** and **Sync Vault**, with progress and the
+last successful sync time beside them. Unlock and Sync use the standard macOS
+Touch ID prompt because the user has already chosen the action in Settings.
+Sync unlocks a locked vault before continuing automatically. Unlock alone needs
+no network access and changes neither settings nor request permissions.
+
 Offline use relies on the last synchronized state. The UI must show freshness;
 host policy can require recent synchronization for sensitive operations. An
 offline device cannot discover later upstream revocation. Reboot, provisioning

@@ -54,6 +54,19 @@
     },
     {
       "kind": "revokeReadGrants"
+    },
+    {
+      "kind": "prepareVaultUnlock",
+      "revision": 4
+    },
+    {
+      "kind": "vaultUnlockPresence",
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "authenticated": 105000000000
+    },
+    {
+      "kind": "vaultUnlockCancel",
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   ],
   "replies": [
@@ -178,6 +191,28 @@
     {
       "kind": "error",
       "code": "unavailable"
+    },
+    {
+      "kind": "vaultUnlockReview",
+      "review": {
+        "id": "AgICAgICAgICAgICAgICAg==",
+        "created": 100000000000,
+        "revision": 4,
+        "session": "AQEBAQEBAQEBAQEBAQEBAQ==",
+        "provider": {
+          "slot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "scope": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "deviceKey": [7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],
+          "binding": {
+            "server": "https://vault.example.invalid",
+            "account_id": "11111111-1111-4111-8111-111111111111",
+            "email": "dummy@example.invalid",
+            "item_id": "22222222-2222-4222-8222-222222222222",
+            "field": "LoginPassword",
+            "role": "github-write"
+          }
+        }
+      }
     }
   ]
 }

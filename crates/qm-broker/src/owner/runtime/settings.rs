@@ -19,6 +19,7 @@ use std::{sync::Arc, time::Duration};
 
 mod import;
 mod repositories;
+mod unlock;
 
 struct Enrollment {
     ticket: String,
@@ -51,10 +52,18 @@ pub(super) struct Administration {
     staging: bool,
     registering: bool,
     staged: Option<Enrollment>,
+    unlock: Option<unlock::PendingUnlock>,
 }
 
 impl Administration {
     pub(super) fn expire(&mut self, now: MonotonicTimestamp) {
+        if self
+            .unlock
+            .as_ref()
+            .is_some_and(|pending| pending.expired(now))
+        {
+            self.unlock.take();
+        }
         if self
             .staged
             .as_ref()
@@ -74,6 +83,7 @@ impl Administration {
                 .is_some_and(|manager| manager.stable() && manager.record().provider().is_some())
     }
     pub(super) fn cancel_changes(&mut self) {
+        self.unlock.take();
         if let (Some(manager), Some(session)) = (&mut self.manager, &self.session) {
             manager.cancel_connection(session.peer.id().value());
         }
@@ -166,6 +176,30 @@ pub(super) fn message(
     runtime: &tokio::runtime::Handle,
     work_limit: &Arc<tokio::sync::Semaphore>,
 ) -> Result<ipc::Response> {
+    if let Client::VaultUnlockPresence { id, authenticated } = &request {
+        let result = match context {
+            Some(context) => unlock::presence(id, *authenticated, context, connection, shared),
+            None => Err(Fault::NativeContextRequired.into()),
+        };
+        if result.is_err() {
+            unlock::cancel_matching(id, &connection.handle(), shared);
+        }
+        connection.release_context();
+        shared.1.notify_all();
+        let result = result.or_else(|error| match error {
+            Error::Vault(error) => Ok(Reply::VaultStatus(vault::error_reply(error))),
+            error => Err(error),
+        });
+        return super::control::encode_result(result).map(Into::into);
+    }
+    if let Client::VaultUnlockCancel { id } = &request {
+        if context.is_some() {
+            connection.release_context();
+            return Err(Fault::UnexpectedContext.into());
+        }
+        return super::control::encode_result(unlock::cancel(id, &connection.handle(), shared))
+            .map(Into::into);
+    }
     if let Client::SettingsPresence { id, authenticated } = &request {
         let result = match context {
             Some(context) => presence(id, *authenticated, context, connection, shared),
@@ -243,10 +277,12 @@ pub(super) fn message(
     let paths = paths.clone();
     let cleanup_shared = Arc::clone(&shared);
     let cleanup_peer = peer.clone();
-    // Failed migration preparation installs no pending state and owns no cleanup.
+    // Failed import or unlock preparation must not cancel another pending operation.
     let cancel_on_error = !matches!(
         &request,
-        Client::PrepareSettingsImport { .. } | Client::PrepareSettingsDiscard { .. }
+        Client::PrepareSettingsImport { .. }
+            | Client::PrepareSettingsDiscard { .. }
+            | Client::PrepareVaultUnlock { .. }
     );
     let cleanup_id = match &request {
         Client::SettingsPresence { id, .. } | Client::SettingsProof { id, .. } => Some(id.clone()),
@@ -269,6 +305,9 @@ pub(super) fn message(
                 }
                 Client::PrepareSettingsDiscard { id } => {
                     import::discard(&id, &peer, &shared, &paths)
+                }
+                Client::PrepareVaultUnlock { revision } => {
+                    unlock::prepare(revision, &peer, &shared, &paths)
                 }
                 Client::SettingsRegister { public_key } => {
                     register(&public_key, &peer, &shared, &paths)
@@ -396,7 +435,7 @@ fn prepare(
     let generation = state.provider.generation();
     let admin = &mut state.administration;
     let session = admin.check(peer)?;
-    if admin.staging || admin.registering {
+    if admin.staging || admin.registering || admin.unlock.is_some() {
         return Err(ControlError::Busy.into());
     }
     let manager = admin.manager.as_mut().ok_or(ControlError::Denied)?;
@@ -675,6 +714,7 @@ async fn stage(
         admin.check(peer)?;
         if admin.staging
             || admin.registering
+            || admin.unlock.is_some()
             || admin.manager.as_ref().is_none_or(|manager| !manager.idle())
         {
             return Err(ControlError::Busy.into());
@@ -923,12 +963,97 @@ mod tests {
             self.shared.0.lock().unwrap().administration.manager = Some(manager);
             self.call(json!({"kind":"settingsStatus"}), None)["settings"]["migration"].clone()
         }
+
+        pub(super) fn configured_locked() -> Self {
+            let harness = Self::new();
+            let review = harness.review();
+            let challenge = harness.authenticate(&review);
+            assert_eq!(
+                harness.proof(&review, &challenge)["kind"],
+                "settingsApplied"
+            );
+            assert_eq!(
+                harness.call(json!({"kind":"vaultLock"}), None)["state"],
+                "locked"
+            );
+            harness
+        }
     }
 
     impl Drop for Harness {
         fn drop(&mut self) {
             self.client.invalidate();
         }
+    }
+
+    #[test]
+    fn vault_unlock_preparation_preserves_settings_and_cancel_releases_the_reservation() {
+        let harness = Harness::configured_locked();
+        let before = harness.call(json!({"kind":"settingsStatus"}), None)["settings"].clone();
+        assert_eq!(
+            harness.call(json!({"kind":"prepareVaultUnlock","revision":0}), None)["kind"],
+            "error"
+        );
+        let prepared = harness.call(json!({"kind":"prepareVaultUnlock","revision":1}), None);
+        assert_eq!(prepared["kind"], "vaultUnlockReview", "{prepared}");
+        assert_eq!(prepared["review"]["revision"], 1);
+        assert_eq!(prepared["review"]["provider"], before["provider"]);
+        assert_eq!(prepared["review"]["session"], before["session"]);
+        assert_eq!(
+            harness.call(json!({"kind":"settingsStatus"}), None)["settings"],
+            before
+        );
+        assert_eq!(
+            harness.call(json!({"kind":"prepareVaultUnlock","revision":1}), None)["kind"],
+            "error"
+        );
+        assert_eq!(
+            harness.call(
+                json!({"kind":"vaultUnlockCancel","id":prepared["review"]["id"]}),
+                None
+            )["kind"],
+            "canceled"
+        );
+        let next = harness.call(json!({"kind":"prepareVaultUnlock","revision":1}), None);
+        assert_eq!(next["kind"], "vaultUnlockReview", "{next}");
+        assert_ne!(next["review"]["id"], prepared["review"]["id"]);
+        assert_eq!(
+            harness.call(
+                json!({"kind":"vaultUnlockCancel","id":prepared["review"]["id"]}),
+                None
+            )["kind"],
+            "unknownOperation"
+        );
+        assert_eq!(
+            harness.call(
+                json!({"kind":"vaultUnlockCancel","id":next["review"]["id"]}),
+                None
+            )["kind"],
+            "canceled"
+        );
+    }
+
+    #[test]
+    fn vault_unlock_requires_a_native_context_and_cleans_up_after_failure() {
+        let harness = Harness::configured_locked();
+        let prepared = harness.call(json!({"kind":"prepareVaultUnlock","revision":1}), None);
+        assert_eq!(prepared["kind"], "vaultUnlockReview", "{prepared}");
+        let rejected = harness.call(json!({"kind":"vaultUnlockPresence","id":prepared["review"]["id"],"authenticated":u64::from(now().unwrap())}), None);
+        assert_eq!(rejected["kind"], "error");
+        assert!(
+            harness
+                .shared
+                .0
+                .lock()
+                .unwrap()
+                .provider
+                .snapshot()
+                .is_none()
+        );
+        assert_eq!(
+            harness.call(json!({"kind":"prepareVaultUnlock","revision":1}), None)["kind"],
+            "vaultUnlockReview"
+        );
     }
 
     #[test]

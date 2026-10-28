@@ -8,6 +8,7 @@ swift_library(
         "ApprovalDialog.swift",
         "DisclosureSection.swift",
         "SettingsApprovalDialog.swift",
+        "VaultUnlockDialog.swift",
     ],
     copts = [
         "-swift-version",

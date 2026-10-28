@@ -9,6 +9,12 @@ import LocalAuthentication
     func cancel()
 }
 
+@MainActor public protocol VaultUnlockBackend: AnyObject {
+    var reviewCreated: MonotonicTimestamp { get }
+    func unlock(authenticated: MonotonicTimestamp, context: LAContext) async throws
+    func cancel()
+}
+
 @MainActor protocol ApprovalAuthentication {
     var context: LAContext { get }
     func authenticate(reason: String) async throws -> MonotonicTimestamp
@@ -50,15 +56,60 @@ import LocalAuthentication
 }
 
 @MainActor public final class ApprovalController: ObservableObject {
+    @MainActor private enum Operation {
+        case signed(any ApprovalBackend, ApprovalKeyStore)
+        case unlock(any VaultUnlockBackend)
+
+        var created: MonotonicTimestamp {
+            switch self {
+            case .signed(let backend, _): backend.reviewCreated
+            case .unlock(let backend): backend.reviewCreated
+            }
+        }
+
+        func prepare() throws -> PreparedOperation {
+            switch self {
+            case .signed(let backend, let keys):
+                guard let key = try keys.existingPublicKey() else { throw ApprovalKeyError.missingEnrolledKey }
+                return .signed(backend, keys, key)
+            case .unlock(let backend): return .unlock(backend)
+            }
+        }
+
+        func cancel() {
+            switch self {
+            case .signed(let backend, _): backend.cancel()
+            case .unlock(let backend): backend.cancel()
+            }
+        }
+    }
+
+    @MainActor private enum PreparedOperation {
+        case signed(any ApprovalBackend, ApprovalKeyStore, Data)
+        case unlock(any VaultUnlockBackend)
+
+        func perform(authenticated: MonotonicTimestamp, context: LAContext, validate: () throws -> Void) async throws {
+            switch self {
+            case .signed(let backend, let keys, let publicKey):
+                let message = try await backend.challenge(authenticated: authenticated, context: context)
+                try validate()
+                let signature = try keys.sign(message, expectedPublicKey: publicKey, context: context)
+                try validate()
+                try await backend.submit(signature)
+            case .unlock(let backend):
+                try await backend.unlock(authenticated: authenticated, context: context)
+                try validate()
+            }
+        }
+    }
     public enum Phase: Equatable { case review, authenticating, approved, stopped }
     enum Failure: Error { case invalidAuthentication, reviewExpired }
     @Published public private(set) var phase: Phase = .review
     @Published public private(set) var detail = ""
     public var context: LAContext { authentication.context }
-    private let backend: any ApprovalBackend
+    private let operation: Operation
     private let reason: String
     private let authentication: any ApprovalAuthentication
-    private let keys: ApprovalKeyStore
     private let now: () -> MonotonicTimestamp
     private var timeout: Task<Void, Never>?
 
@@ -68,14 +119,31 @@ import LocalAuthentication
             keys: keys, now: { .now })
     }
 
-    init(
+    convenience init(
         backend: any ApprovalBackend, reason: String, authentication: any ApprovalAuthentication,
         keys: ApprovalKeyStore, now: @escaping () -> MonotonicTimestamp
     ) {
-        self.backend = backend
+        self.init(operation: .signed(backend, keys), reason: reason, authentication: authentication, now: now)
+    }
+
+    public convenience init(unlock: any VaultUnlockBackend, reason: String) {
+        self.init(unlock: unlock, reason: reason, authentication: TouchIDAuthentication(), now: { .now })
+    }
+
+    convenience init(
+        unlock: any VaultUnlockBackend, reason: String, authentication: any ApprovalAuthentication,
+        now: @escaping () -> MonotonicTimestamp
+    ) {
+        self.init(operation: .unlock(unlock), reason: reason, authentication: authentication, now: now)
+    }
+
+    private init(
+        operation: Operation, reason: String, authentication: any ApprovalAuthentication,
+        now: @escaping () -> MonotonicTimestamp
+    ) {
+        self.operation = operation
         self.reason = reason
         self.authentication = authentication
-        self.keys = keys
         self.now = now
     }
 
@@ -91,19 +159,17 @@ import LocalAuthentication
         }
         do {
             try checkReview(at: now())
-            guard let publicKey = try keys.existingPublicKey() else { throw ApprovalKeyError.missingEnrolledKey }
+            let prepared = try operation.prepare()
             let requested = now()
             try checkReview(at: requested)
             let authenticated = try await authentication.authenticate(reason: reason)
             guard phase == .authenticating else { return }
             try checkTiming(requested: requested, authenticated: authenticated)
             context.interactionNotAllowed = true
-            let message = try await backend.challenge(authenticated: authenticated, context: context)
-            guard phase == .authenticating else { return }
-            try checkTiming(requested: requested, authenticated: authenticated)
-            let signature = try keys.sign(message, expectedPublicKey: publicKey, context: context)
-            try checkTiming(requested: requested, authenticated: authenticated)
-            try await backend.submit(signature)
+            try await prepared.perform(authenticated: authenticated, context: context) {
+                guard phase == .authenticating else { throw CancellationError() }
+                try checkTiming(requested: requested, authenticated: authenticated)
+            }
             guard phase == .authenticating else { return }
             finish(.approved, detail: "Approval received.")
         } catch Failure.reviewExpired {
@@ -119,7 +185,7 @@ import LocalAuthentication
         guard self.phase != .approved, self.phase != .stopped else { return }
         timeout?.cancel()
         authentication.invalidate()
-        if phase == .stopped { backend.cancel() }
+        if phase == .stopped { operation.cancel() }
         self.detail = detail
         self.phase = phase
     }
@@ -133,8 +199,8 @@ import LocalAuthentication
     }
 
     private func checkReview(at timestamp: MonotonicTimestamp) throws {
-        guard !backend.reviewCreated.isZero,
-            let age = try? timestamp.duration(since: backend.reviewCreated), age < .seconds(120)
+        guard !operation.created.isZero,
+            let age = try? timestamp.duration(since: operation.created), age < .seconds(120)
         else { throw Failure.reviewExpired }
     }
 }

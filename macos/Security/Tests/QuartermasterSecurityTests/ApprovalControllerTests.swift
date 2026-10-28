@@ -45,6 +45,86 @@ import Testing
     func cancel() { cancellations += 1 }
 }
 
+@MainActor private final class UnlockBackendFixture: VaultUnlockBackend {
+    let reviewCreated: MonotonicTimestamp
+    var unlocks = 0
+    var cancellations = 0
+    var onUnlock: (() -> Void)?
+    var context: LAContext?
+
+    init(created: MonotonicTimestamp) { reviewCreated = created }
+
+    func unlock(authenticated: MonotonicTimestamp, context: LAContext) async throws {
+        unlocks += 1
+        self.context = context
+        onUnlock?()
+    }
+    func cancel() { cancellations += 1 }
+}
+
+@Test @MainActor func vaultUnlockUsesOneAuthenticationWithoutAnApprovalKey() async {
+    let now = MonotonicTimestamp.now
+    let authentication = AuthenticationFixture(timestamp: now)
+    let backend = UnlockBackendFixture(created: now)
+    let controller = ApprovalController(
+        unlock: backend, reason: "Unlock vault", authentication: authentication, now: { now })
+    await controller.approve()
+    await controller.approve()
+    #expect(controller.phase == .approved)
+    #expect(authentication.requests == 1)
+    #expect(authentication.invalidations == 1)
+    #expect(backend.unlocks == 1)
+    #expect(backend.context === authentication.context)
+    #expect(authentication.context.interactionNotAllowed)
+    #expect(backend.cancellations == 0)
+}
+
+@Test @MainActor func cancelingDuringVaultUnlockCannotCompleteTheApproval() async {
+    let now = MonotonicTimestamp.now
+    let authentication = AuthenticationFixture(timestamp: now)
+    let backend = UnlockBackendFixture(created: now)
+    let controller = ApprovalController(
+        unlock: backend, reason: "Unlock vault", authentication: authentication, now: { now })
+    backend.onUnlock = { controller.cancel() }
+    await controller.approve()
+    #expect(controller.phase == .stopped)
+    #expect(backend.cancellations == 1)
+    #expect(authentication.invalidations == 1)
+}
+
+@Test(arguments: [119, 120]) @MainActor func vaultUnlockKeepsTheOriginalAuthenticationWindow(_ reviewAge: Int)
+    async throws
+{
+    let created = MonotonicTimestamp.now
+    let authenticated = try created.advanced(by: .seconds(reviewAge))
+    let completed = try authenticated.advanced(by: .seconds(29))
+    var clock = authenticated
+    let authentication = AuthenticationFixture(timestamp: authenticated)
+    let backend = UnlockBackendFixture(created: created)
+    backend.onUnlock = { clock = completed }
+    let controller = ApprovalController(
+        unlock: backend, reason: "Unlock vault", authentication: authentication, now: { clock })
+    await controller.approve()
+    #expect(controller.phase == (reviewAge == 119 ? .approved : .stopped))
+    #expect(authentication.requests == (reviewAge == 119 ? 1 : 0))
+    #expect(backend.unlocks == (reviewAge == 119 ? 1 : 0))
+}
+
+@Test @MainActor func vaultUnlockDoesNotAcceptACompletionAfterAuthenticationExpires() async throws {
+    let authenticated = MonotonicTimestamp.now
+    let expired = try authenticated.advanced(by: .seconds(30))
+    var clock = authenticated
+    let authentication = AuthenticationFixture(timestamp: authenticated)
+    let backend = UnlockBackendFixture(created: authenticated)
+    backend.onUnlock = { clock = expired }
+    let controller = ApprovalController(
+        unlock: backend, reason: "Unlock vault", authentication: authentication, now: { clock })
+    await controller.approve()
+    #expect(controller.phase == .stopped)
+    #expect(backend.cancellations == 1)
+    #expect(authentication.invalidations == 1)
+}
+
 @Test @MainActor func approvalControllerSignsAndSubmitsOnlyTheBackendChallenge() async throws {
     let storage = MemoryKeyStorage()
     let keys = ApprovalKeyStore(storage: storage)

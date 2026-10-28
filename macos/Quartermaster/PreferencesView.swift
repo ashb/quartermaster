@@ -315,9 +315,14 @@ struct PreferencesView: View {
     private var vaultControls: some View {
         Group {
             HStack {
-                Text("Lock vault")
+                Text("Vault access")
                 Spacer()
-                Button("Lock Now") { application.vault(.vaultLock) }
+                if application.vaultStatus?.state == .onlineUnlocked {
+                    Button("Lock Now") { application.vault(.vaultLock) }
+                } else {
+                    Button("Unlock", action: application.unlockVault)
+                        .disabled(application.vaultActivity.busy)
+                }
             }
             Divider()
             HStack {

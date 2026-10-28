@@ -20,6 +20,7 @@ swift_library(
         "SettingsEditor.swift",
         "SettingsMigration.swift",
         "SettingsWorkflow.swift",
+        "VaultUnlockReview.swift",
     ],
     copts = [
         "-swift-version",

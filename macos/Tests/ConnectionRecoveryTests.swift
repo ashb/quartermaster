@@ -9,7 +9,7 @@ import Testing
 
 private final class RecoveryClient: BrokerClient, Sendable {
     enum Suspension: CaseIterable, Sendable { case enrolment, poll }
-    enum VaultOutcome: CaseIterable, Sendable { case locked, syncLocked, syncFailed, synced }
+    enum VaultOutcome: CaseIterable, Sendable { case locked, syncFailed, synced }
     private let lost = Mutex(false)
     private let snapshot: SettingsSnapshot
     private let vault: BrokerVaultStatus
@@ -22,6 +22,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
     @MainActor private(set) var enrolmentKeys: [Data] = []
     @MainActor private(set) var polls = 0
     @MainActor private(set) var vaultOperations = 0
+    @MainActor private var synchronized = false
     @MainActor private(set) var unexpectedCommands: [BrokerCommand] = []
     @MainActor private(set) var pending: CheckedContinuation<BrokerReply, any Error>?
     @MainActor private(set) var pendingVaults: [CheckedContinuation<BrokerReply, any Error>] = []
@@ -45,7 +46,8 @@ private final class RecoveryClient: BrokerClient, Sendable {
         vault = try decoder.decode(
             BrokerVaultStatus.self,
             from: JSONSerialization.data(withJSONObject: [
-                "state": "locked", "binding": binding, "lastSync": 1_700_000_000,
+                "state": vaultOutcome == .syncFailed || vaultOutcome == .synced ? "online_unlocked" : "locked",
+                "binding": binding, "lastSync": 1_700_000_000,
             ]))
         syncedVault = try decoder.decode(
             BrokerVaultStatus.self,
@@ -68,7 +70,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
             return .settingsStatus(snapshot)
         case .settingsStatus: return .settingsStatus(snapshot)
         case .vaultStatus:
-            return .vaultStatus(vaultOutcome == .synced && vaultOperations > 0 ? syncedVault : vault)
+            return .vaultStatus(synchronized ? syncedVault : vault)
         case .vaultLock, .vaultSync:
             vaultOperations += 1
             if pauseVault { return try await withCheckedThrowingContinuation { pendingVaults.append($0) } }
@@ -81,11 +83,9 @@ private final class RecoveryClient: BrokerClient, Sendable {
                     try JSONDecoder().decode(
                         BrokerVaultStatus.self,
                         from: Data(#"{"state":"server_unavailable","error":"Provider(ServerUnavailable)"}"#.utf8)))
-            case .syncLocked:
-                return .vaultStatus(
-                    try JSONDecoder().decode(
-                        BrokerVaultStatus.self, from: Data(#"{"state":"locked","error":"Lifecycle(Locked)"}"#.utf8)))
-            case .synced: return .vaultStatus(syncedVault)
+            case .synced:
+                synchronized = true
+                return .vaultStatus(syncedVault)
             case nil: throw BrokerFailure.invalidMessage
             }
         case .enroll(let key):
@@ -237,7 +237,7 @@ private func vaultActionsKeepTheLastSuccessfulSyncTime(_ outcome: RecoveryClient
 
     let expectedStatus =
         switch outcome {
-        case .locked, .syncLocked: "Vault: locked"
+        case .locked: "Vault: locked"
         case .syncFailed: "Vault: server_unavailable"
         case .synced: "Vault: online_unlocked"
         }
@@ -246,7 +246,6 @@ private func vaultActionsKeepTheLastSuccessfulSyncTime(_ outcome: RecoveryClient
         switch outcome {
         case .locked: "Vault locked."
         case .synced: "Vault synced."
-        case .syncLocked: "The vault is locked. Unlock it before syncing."
         case .syncFailed: "Could not contact Vaultwarden. Try again when it is available."
         }
     #expect(application.vaultActivity.message == expectedFeedback)

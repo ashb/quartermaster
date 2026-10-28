@@ -22,6 +22,7 @@ swift_test(
     srcs = [
         "ConnectionRecoveryTests.swift",
         "PreferencesTests.swift",
+        "VaultControlTests.swift",
     ],
     copts = ["-swift-version", "6"],
     module_name = "PreferencesTests",
@@ -34,7 +35,10 @@ swift_test(
 
 swift_test(
     name = "ApprovalTests",
-    srcs = ["ApprovalPresentationTests.swift"],
+    srcs = [
+        "ApprovalPresentationTests.swift",
+        "VaultUnlockDialogTests.swift",
+    ],
     copts = ["-swift-version", "6"],
     module_name = "ApprovalTests",
     deps = [

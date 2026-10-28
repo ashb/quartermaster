@@ -35,6 +35,7 @@ swift_test(
         "SettingsEditorTests.swift",
         "SettingsMigrationTests.swift",
         "SettingsWorkflowTests.swift",
+        "VaultUnlockReviewTests.swift",
         ":test_resource_accessor",  # keep
     ],
     copts = [

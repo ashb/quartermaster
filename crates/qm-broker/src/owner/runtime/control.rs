@@ -57,6 +57,9 @@ pub(super) fn handle(
         | Client::SettingsStatus {}
         | Client::PrepareSettingsImport { .. }
         | Client::PrepareSettingsDiscard { .. }
+        | Client::PrepareVaultUnlock { .. }
+        | Client::VaultUnlockPresence { .. }
+        | Client::VaultUnlockCancel { .. }
         | Client::StageEnrollment { .. }
         | Client::PrepareSettings { .. }
         | Client::SettingsPresence { .. }

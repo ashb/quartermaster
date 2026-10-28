@@ -51,6 +51,16 @@ pub(super) enum Client {
     PrepareSettingsDiscard {
         id: String,
     },
+    PrepareVaultUnlock {
+        revision: super::settings::Revision,
+    },
+    VaultUnlockPresence {
+        id: String,
+        authenticated: MonotonicTimestamp,
+    },
+    VaultUnlockCancel {
+        id: String,
+    },
     StageEnrollment {
         server: String,
         email: String,
@@ -86,6 +96,9 @@ impl Client {
                 | Self::SettingsStatus {}
                 | Self::PrepareSettingsImport { .. }
                 | Self::PrepareSettingsDiscard { .. }
+                | Self::PrepareVaultUnlock { .. }
+                | Self::VaultUnlockPresence { .. }
+                | Self::VaultUnlockCancel { .. }
                 | Self::StageEnrollment { .. }
                 | Self::PrepareSettings { .. }
                 | Self::SettingsPresence { .. }
@@ -131,6 +144,16 @@ pub(super) struct ApprovalChallenge {
     pub(super) bytes: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VaultUnlockReview {
+    pub(super) id: String,
+    pub(super) created: MonotonicTimestamp,
+    pub(super) revision: super::settings::Revision,
+    pub(super) session: String,
+    pub(super) provider: super::settings::ProviderPin,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(super) enum Reply {
@@ -155,6 +178,9 @@ pub(super) enum Reply {
     },
     SettingsReview {
         review: super::settings::Review,
+    },
+    VaultUnlockReview {
+        review: VaultUnlockReview,
     },
     SettingsChallenge {
         authorization: super::settings::Challenge,
@@ -341,6 +367,18 @@ mod tests {
                 "alreadyAdmitted" => Reply::AlreadyAdmitted,
                 "unknownOperation" => Reply::UnknownOperation,
                 "readGrantsRevoked" => Reply::ReadGrantsRevoked,
+                "vaultUnlockReview" => {
+                    let review = &fixture["review"];
+                    Reply::VaultUnlockReview {
+                        review: VaultUnlockReview {
+                            id: review["id"].as_str().unwrap().into(),
+                            created: serde_json::from_value(review["created"].clone()).unwrap(),
+                            revision: serde_json::from_value(review["revision"].clone()).unwrap(),
+                            session: review["session"].as_str().unwrap().into(),
+                            provider: serde_json::from_value(review["provider"].clone()).unwrap(),
+                        },
+                    }
+                }
                 "error" => Reply::Error {
                     code: serde_json::from_value(fixture["code"].clone()).unwrap(),
                 },

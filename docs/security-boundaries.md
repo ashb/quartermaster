@@ -127,6 +127,12 @@ context handles remain confined to their owning queue and connection generation.
 The context grants neither Keychain-group access nor application write authority;
 a required write still needs a separate request-bound, single-use signature.
 
+An explicit vault unlock binds the approved settings revision, complete provider
+selection and authenticated UI session before Touch ID. Cancellation, expiry,
+disconnect, host lock or a changed selection prevents later installation of the
+decrypted snapshot. Unlocking creates no API grant or settings authority. Sync
+uses ordinary provider access after the authentication context has been released.
+
 An authenticated context can remain reusable until invalidated; its reuse-duration
 property controls recent device-unlock reuse, not its lifetime. Create a fresh
 context for each approval, enforce the original authentication deadline at use,
