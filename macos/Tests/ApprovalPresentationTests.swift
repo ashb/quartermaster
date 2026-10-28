@@ -149,6 +149,21 @@ private func approvalPresentation(
     #expect(tree(count: 4).fittingSize == tree(count: 32).fittingSize)
 }
 
+@Test func perRequestTreesDoNotDescribeProcessesAsIneligibleForGrants() {
+    let rows = ProcessTreeRow.make(
+        processes: [
+            DialogProcess(pid: 10, name: "login", executable: "/usr/bin/login", limited: true),
+            DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false),
+            DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false),
+        ], peerPID: 30, roots: [], allowsSelection: false)
+    #expect(rows.allSatisfy { !$0.help.contains("cannot receive a read grant") })
+    #expect(rows.allSatisfy { !$0.scopeOffered && $0.choice == nil })
+    #expect(rows[0].dimmed)
+    #expect(rows[0].help.contains("Limited process information."))
+    #expect(!rows[1].dimmed && !rows[2].dimmed)
+    #expect(rows[1].help == "/bin/zsh")
+}
+
 @Test func appBundleLookupUsesTheContainingApplicationAndIgnoresOrdinaryExecutables() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }

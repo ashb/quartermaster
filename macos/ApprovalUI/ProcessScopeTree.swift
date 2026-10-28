@@ -23,7 +23,9 @@ struct ProcessTreeRow: Identifiable {
     let process: DialogProcess
     let choice: ProcessChoice?
     let label: String
+    let scopeOffered: Bool
     var id: UInt32 { process.pid }
+    var dimmed: Bool { process.limited || (scopeOffered && choice == nil) }
 
     static func make(
         processes: [DialogProcess], peerPID: UInt32, roots: [ReadRootChoice], allowsSelection: Bool
@@ -42,14 +44,14 @@ struct ProcessTreeRow: Identifiable {
                 choice = nil
                 label = ""
             }
-            return Self(process: process, choice: choice, label: label)
+            return Self(process: process, choice: choice, label: label, scopeOffered: allowsSelection)
         }
     }
 
     var help: String {
         [
             process.limited ? "Limited process information." : nil,
-            choice == nil ? "This process cannot receive a read grant." : nil, process.executable,
+            scopeOffered && choice == nil ? "This process cannot receive a read grant." : nil, process.executable,
         ]
         .compactMap { $0 }.joined(separator: "\n")
     }
@@ -92,7 +94,7 @@ struct ProcessScopeTree: View {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(rows.enumerated()), id: \.element.id) { depth, row in
                         let indent = CGFloat(min(depth, 6)) * 32
-                        processButton(row, first: depth == 0)
+                        processRow(row, first: depth == 0)
                             .padding(.leading, indent)
                             .overlay(alignment: .topLeading) {
                                 if depth > 0 {
@@ -112,7 +114,7 @@ struct ProcessScopeTree: View {
                 }
             }
             .onAppear {
-                if let selected = rows.first(where: { $0.choice == selection }) { proxy.scrollTo(selected.id) }
+                if let last = rows.last { proxy.scrollTo(last.id, anchor: .bottom) }
             }
             .onMoveCommand { direction in
                 guard enabled else { return }
@@ -138,43 +140,51 @@ struct ProcessScopeTree: View {
         .frame(height: 148, alignment: .top)
     }
 
-    private func processButton(_ row: ProcessTreeRow, first: Bool) -> some View {
+    private func processRow(_ row: ProcessTreeRow, first: Bool) -> some View {
         let selected = row.choice == selection
         let application = ProcessApplication(executable: row.process.executable)
-        return Button {
-            if let choice = row.choice { choose(choice) }
-        } label: {
-            HStack(spacing: 9) {
-                if let application {
-                    Image(nsImage: application.icon).resizable().renderingMode(.original)
-                        .scaledToFit().frame(width: 19, height: 19)
-                } else {
-                    Image(systemName: row.process.name == "login" ? "lock" : "terminal")
-                        .font(.system(size: 15)).frame(width: 19)
-                        .foregroundStyle(selected ? Color.accentColor : .secondary)
-                }
-                Text(verbatim: application?.name ?? row.process.name)
-                    .font(.system(.body, design: .monospaced)).lineLimit(1).truncationMode(.middle)
-                Text(String(row.id)).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                Text(row.label).font(.caption).fixedSize()
+        let content = HStack(spacing: 9) {
+            if let application {
+                Image(nsImage: application.icon).resizable().renderingMode(.original)
+                    .scaledToFit().frame(width: 19, height: 19)
+            } else {
+                Image(systemName: row.process.name == "login" ? "lock" : "terminal")
+                    .font(.system(size: 15)).frame(width: 19)
                     .foregroundStyle(selected ? Color.accentColor : .secondary)
-                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                    .foregroundStyle(selected ? Color.accentColor : .secondary)
-                    .opacity(row.choice == nil ? 0 : 1).frame(width: 15)
             }
-            .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 28)
-            .background(background(for: row), in: RoundedRectangle(cornerRadius: 7))
-            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(selected ? Color.accentColor : .clear))
-            .contentShape(Rectangle())
+            Text(verbatim: application?.name ?? row.process.name)
+                .font(.system(.body, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(.primary)
+            Text(String(row.id)).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            Text(row.label).font(.caption).fixedSize()
+                .foregroundStyle(selected ? Color.accentColor : .secondary)
+            Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                .opacity(row.choice == nil ? 0 : 1).frame(width: 15)
         }
-        .buttonStyle(.plain)
-        .disabled(row.choice == nil || !enabled)
-        .opacity(row.choice == nil ? 0.5 : 1)
+        .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 28)
+        .background(background(for: row), in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(selected ? Color.accentColor : .clear))
+        .contentShape(Rectangle())
+        return Group {
+            if row.scopeOffered {
+                Button {
+                    if let choice = row.choice { choose(choice) }
+                } label: {
+                    content
+                }
+                .buttonStyle(.plain)
+                .disabled(row.choice == nil || !enabled)
+            } else {
+                content.accessibilityElement(children: .combine)
+            }
+        }
+        .opacity(row.dimmed ? 0.5 : 1)
         .help([row.help, first && !row.process.limited ? ancestryNote : nil].compactMap { $0 }.joined(separator: "\n"))
         .focused($focusedRow, equals: row.id)
         .accessibilityLabel("\(application?.name ?? row.process.name), PID \(row.id), \(row.label)")
-        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .accessibilityValue(row.scopeOffered ? (selected ? "Selected" : "Not selected") : "")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
