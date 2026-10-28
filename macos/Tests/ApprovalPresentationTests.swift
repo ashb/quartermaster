@@ -18,7 +18,7 @@ private func approvalPresentation(
     if complete, let repository { application["requestedRepository"] = repository }
     var payload: [String: Any] = [
         "repository": "", "issue": 42, "method": "PATCH", "path": path, "origin": "https://api.github.com",
-        "processChain": ["codex", "gh"], "application": application,
+        "processChain": ["codex", "gh"], "application": application, "readRoots": [],
     ]
     if let ancestryComplete {
         var peer: [String: Any] = [
@@ -36,7 +36,8 @@ private func approvalPresentation(
             #"{"server":"https://vault.example.invalid","account":"dummy","email":"dummy@example.invalid","item":"dummy","field":"LoginPassword","role":"github-write","enrollment":"disposable","generation":1}"#
                 .utf8))
     return ApprovalPresentation(
-        request: request, provider: provider, readGrant: nil, apiRequest: try APIRequestReview.parse(request: bytes))
+        request: request, provider: provider, readGrant: nil, apiRequest: try APIRequestReview.parse(request: bytes),
+        readScope: try ReadScopeReview.parse(request: bytes))
 }
 
 @Test func aRecognisedCloseShowsItsNamedRepositoryAndDoesNotRepeatTheTitleAsAnEffect() throws {

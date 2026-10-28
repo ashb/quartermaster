@@ -40,6 +40,15 @@ pub(super) enum Client {
     VaultSync {},
     VaultDiscard {},
     RevokeReadGrants {},
+    ReadGrants {},
+    RevokeReadGrant {
+        id: String,
+    },
+    SelectReadRoot {
+        id: String,
+        nonce: String,
+        root: Option<String>,
+    },
     SettingsRegister {
         #[serde(rename = "publicKey")]
         public_key: String,
@@ -89,6 +98,17 @@ pub(super) enum Client {
 }
 
 impl Client {
+    pub(super) fn requires_policy(&self) -> bool {
+        matches!(
+            self,
+            Self::Enroll { .. }
+                | Self::Next {}
+                | Self::Proof { .. }
+                | Self::SelectReadRoot { .. }
+                | Self::ReadGrants {}
+        )
+    }
+
     pub(super) fn is_settings(&self) -> bool {
         matches!(
             self,
@@ -173,6 +193,9 @@ pub(super) enum Reply {
     AlreadyAdmitted,
     UnknownOperation,
     ReadGrantsRevoked,
+    ReadGrants {
+        grants: Vec<super::grant::ReadGrantClaims>,
+    },
     SettingsStatus {
         settings: super::settings::Snapshot,
     },
@@ -334,7 +357,7 @@ mod tests {
             let decoded = serde_json::to_value(command).unwrap();
             for (key, expected) in fixture.as_object().unwrap() {
                 assert_eq!(decoded.get(key), Some(expected), "field {key}");
-                if key != "itemId" {
+                if !matches!(key.as_str(), "itemId" | "root") {
                     let mut missing = fixture.clone();
                     missing.as_object_mut().unwrap().remove(key);
                     assert!(matches!(
@@ -367,6 +390,7 @@ mod tests {
                 "alreadyAdmitted" => Reply::AlreadyAdmitted,
                 "unknownOperation" => Reply::UnknownOperation,
                 "readGrantsRevoked" => Reply::ReadGrantsRevoked,
+                "readGrants" => Reply::ReadGrants { grants: Vec::new() },
                 "vaultUnlockReview" => {
                     let review = &fixture["review"];
                     Reply::VaultUnlockReview {

@@ -19,6 +19,9 @@ public enum BrokerCommand: Encodable, Sendable {
     case vaultSync
     case vaultDiscard
     case revokeReadGrants
+    case readGrants
+    case revokeReadGrant(id: String)
+    case selectReadRoot(id: String, nonce: Data, root: String?)
     case settingsRegister(publicKey: Data)
     case settingsStatus
     case prepareSettingsImport(id: String)
@@ -39,7 +42,9 @@ public enum BrokerCommand: Encodable, Sendable {
             .prepareSettingsDiscard:
             .seconds(30)
         case .vaultLogin, .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard, .stageEnrollment: .seconds(120)
-        case .hello, .enroll, .next, .proof, .cancel, .vaultStatus, .revokeReadGrants: .seconds(5)
+        case .hello, .enroll, .next, .proof, .cancel, .vaultStatus, .revokeReadGrants, .readGrants, .revokeReadGrant,
+            .selectReadRoot:
+            .seconds(5)
         case .settingsStatus, .settingsCancel, .vaultUnlockCancel: .seconds(5)
         case .prepareVaultUnlock, .vaultUnlockPresence: .seconds(30)
         }
@@ -53,7 +58,7 @@ public enum BrokerCommand: Encodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case kind, id, publicKey, authenticated, signature, server, email, password, itemId, revision, settings,
-            provider, additions
+            provider, additions, nonce, root
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -88,6 +93,15 @@ public enum BrokerCommand: Encodable, Sendable {
         case .vaultSync: kind = "vaultSync"
         case .vaultDiscard: kind = "vaultDiscard"
         case .revokeReadGrants: kind = "revokeReadGrants"
+        case .readGrants: kind = "readGrants"
+        case .revokeReadGrant(let id):
+            kind = "revokeReadGrant"
+            try fields.encode(id, forKey: .id)
+        case .selectReadRoot(let id, let nonce, let root):
+            kind = "selectReadRoot"
+            try fields.encode(id, forKey: .id)
+            try fields.encode(nonce, forKey: .nonce)
+            try fields.encode(root, forKey: .root)
         case .settingsRegister(let key):
             kind = "settingsRegister"
             try fields.encode(key, forKey: .publicKey)
@@ -194,6 +208,7 @@ public enum BrokerReply: Decodable, Sendable {
     case alreadyAdmitted
     case unknownOperation
     case readGrantsRevoked
+    case readGrants([ActiveReadGrant])
     case error(BrokerControlError)
     case vaultStatus(BrokerVaultStatus)
     case settingsStatus(SettingsSnapshot)
@@ -214,12 +229,12 @@ public enum BrokerReply: Decodable, Sendable {
 
     private enum Kind: String, Decodable {
         case hello, enrolled, idle, review, challenge, accepted, canceled
-        case alreadyAdmitted, unknownOperation, readGrantsRevoked, error, vaultStatus
+        case alreadyAdmitted, unknownOperation, readGrantsRevoked, readGrants, error, vaultStatus
         case settingsStatus, settingsReview, settingsChallenge, enrollmentStaged, settingsApplied, vaultUnlockReview
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, profile, approval, authorization, code, settings, review, ticket, provider, revision
+        case kind, profile, approval, authorization, code, settings, review, ticket, provider, revision, grants
     }
 
     public init(from decoder: any Decoder) throws {
@@ -235,6 +250,10 @@ public enum BrokerReply: Decodable, Sendable {
         case .alreadyAdmitted: self = .alreadyAdmitted
         case .unknownOperation: self = .unknownOperation
         case .readGrantsRevoked: self = .readGrantsRevoked
+        case .readGrants:
+            let grants = try fields.decode([ActiveReadGrant].self, forKey: .grants)
+            guard grants.count <= 64, grants.allSatisfy(\.valid) else { throw BrokerControlError.invalidMessage }
+            self = .readGrants(grants)
         case .error: self = .error(try fields.decode(BrokerControlError.self, forKey: .code))
         case .vaultStatus: self = .vaultStatus(try BrokerVaultStatus(from: decoder))
         case .settingsStatus: self = .settingsStatus(try fields.decode(SettingsSnapshot.self, forKey: .settings))

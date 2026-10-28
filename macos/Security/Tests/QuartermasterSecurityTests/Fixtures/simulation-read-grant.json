@@ -5,17 +5,30 @@
   "repository": "quartermaster/demo",
   "issue": 42,
   "origin": "https://github.example.invalid",
-  "peer": {"cdHash": "1111111111111111111111111111111111111111"},
+  "peer": {
+    "cdHash": "1111111111111111111111111111111111111111"
+  },
   "authorization": {
-    "purpose": "quartermaster.issue-read-grant.v1",
+    "purpose": "quartermaster.read-grant.v2",
     "grant": {
       "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "uid": 501,
       "codeHash": "1111111111111111111111111111111111111111",
-      "action": "issueReads",
       "repository": "quartermaster/demo",
       "role": "github-write",
-      "expiresUnix": 4600
+      "expiresUnix": 4600,
+      "effects": {
+        "version": 1,
+        "effects": [
+          "listIssues",
+          "readIssue"
+        ]
+      },
+      "root": {
+        "id": "fixture-root",
+        "pid": 123,
+        "executable": "/bin/zsh"
+      }
     }
   }
 }

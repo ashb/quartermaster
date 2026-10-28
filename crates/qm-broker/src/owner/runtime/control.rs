@@ -31,14 +31,58 @@ pub(super) fn handle(
     if !matches!(&message, Client::VaultStatus {}) {
         state.ensure_host_session()?;
     }
-    if matches!(
-        &message,
-        Client::Enroll { .. } | Client::Next {} | Client::Presence { .. } | Client::Proof { .. }
-    ) {
+    if message.requires_policy() || matches!(&message, Client::Presence { .. }) {
         state.refresh_policy(policy)?;
         state.ensure_interactive()?;
     }
     match message {
+        Client::SelectReadRoot { id, nonce, root } => {
+            let id = OperationId::parse(&id)?;
+            let nonce: [u8; 32] = BASE64
+                .decode(nonce)?
+                .try_into()
+                .map_err(|_| Error::Protocol(ControlError::Denied))?;
+            let pending = state
+                .pending
+                .as_mut()
+                .filter(|p| p.id == id && p.delivered)
+                .ok_or(Error::State(Fault::PendingMissing))?;
+            let ui = state
+                .ui
+                .as_ref()
+                .ok_or(Error::State(Fault::UiNotEnrolled))?;
+            state
+                .operations
+                .select_root(id, &pending.principal, nonce, root.as_deref())?;
+            let document = crate::owner::review::ReviewDocument::new(
+                state.operations.request(id, &pending.principal)?.clone(),
+                state.operations.grant_claims(id, &pending.principal)?,
+                pending.request.context().clone(),
+            )?;
+            state
+                .operations
+                .bind_review(id, &pending.principal, &document)?;
+            state
+                .operations
+                .begin_approval(id, &pending.principal, &ui.session)?;
+            pending.request = document;
+            Ok(Reply::Review {
+                approval: pending.review(
+                    ui,
+                    state.authorizer.policy_digest()?,
+                    state.operations.approval_nonce(id, &pending.principal)?,
+                ),
+            })
+        }
+        Client::ReadGrants {} => Ok(Reply::ReadGrants {
+            grants: state.authorizer.active_read_grants(),
+        }),
+        Client::RevokeReadGrant { id } => {
+            OperationId::parse(&id)?;
+            state.authorizer.revoke_read_grant(&id);
+            state.cancel_pending();
+            Ok(Reply::ReadGrantsRevoked)
+        }
         Client::RevokeReadGrants {} => {
             state.authorizer.revoke_read_grants()?;
             state.disconnect_ui();
@@ -333,12 +377,7 @@ pub(super) fn handle_event(
         });
         return Ok(ipc::Response::Deferred(receive));
     }
-    if context.is_none()
-        && matches!(
-            &request,
-            Ok(Client::Enroll { .. } | Client::Next {} | Client::Proof { .. })
-        )
-    {
+    if context.is_none() && request.as_ref().is_ok_and(Client::requires_policy) {
         let basis = {
             let mut state = shared
                 .0
@@ -478,6 +517,88 @@ mod tests {
         sync::{Condvar, Mutex, mpsc},
         thread,
     };
+
+    #[test]
+    fn root_selection_and_grant_listing_load_policy_over_native_ipc() {
+        let (_directory, paths, _key, mut state, _receive) = fixture();
+        let mut pending = state.pending.take().unwrap();
+        state.operations.cancel(pending.id, &pending.principal);
+        let requirement = state
+            .authorizer
+            .request_read_grant(
+                &pending.principal,
+                crate::owner::test_support::read_request(),
+                "github-write",
+            )
+            .unwrap();
+        let mut context = pending.request.context().clone();
+        context.read_roots = requirement.root_choices();
+        let claims = requirement.grant_claims();
+        let id = state
+            .operations
+            .register(
+                crate::owner::policy::AuthorizationOutcome::RequireApproval(requirement),
+                Instant::now(),
+            )
+            .unwrap();
+        context.operation_id = id.to_string();
+        let document = crate::owner::review::ReviewDocument::new(
+            crate::owner::test_support::read_request(),
+            claims,
+            context,
+        )
+        .unwrap();
+        state
+            .operations
+            .bind_review(id, &pending.principal, &document)
+            .unwrap();
+        state
+            .operations
+            .begin_approval(id, &pending.principal, &state.ui.as_ref().unwrap().session)
+            .unwrap();
+        pending.id = id;
+        pending.request = document;
+        pending.delivered = false;
+        state.pending = Some(pending);
+        let shared = Arc::new((Mutex::new(state), Condvar::new()));
+        let owner = Arc::clone(&shared);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let work_limit = Arc::new(tokio::sync::Semaphore::new(8));
+        let native = Fixture::new(move |event| {
+            if let Event::Message { connection, .. } = &event
+                && let Some(ui) = owner.0.lock().unwrap().ui.as_mut()
+            {
+                ui.connection = Some(connection.id());
+            }
+            handle_event(event, &owner, &paths, &handle, &work_limit)
+                .or_else(|error| encode_result(Err(error)).map(Into::into))
+                .map_err(io::Error::other)
+        });
+        let client = native.client();
+        let list: serde_json::Value =
+            serde_json::from_slice(&send(&client, br#"{"kind":"readGrants"}"#, None)).unwrap();
+        assert_eq!(list["kind"], "readGrants");
+        let review: serde_json::Value =
+            serde_json::from_slice(&send(&client, br#"{"kind":"next"}"#, None)).unwrap();
+        assert_eq!(review["kind"], "review");
+        let select = serde_json::json!({"kind":"selectReadRoot", "id":id.to_string(), "nonce":review["approval"]["nonce"], "root":null});
+        let changed: serde_json::Value =
+            serde_json::from_slice(&send(&client, &serde_json::to_vec(&select).unwrap(), None))
+                .unwrap();
+        assert_eq!(changed["kind"], "review");
+        assert_ne!(changed["approval"]["nonce"], review["approval"]["nonce"]);
+        let bytes = BASE64
+            .decode(changed["approval"]["request"].as_str().unwrap())
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(document.get("authorization").is_none());
+        assert!(shared.0.lock().unwrap().authorizer.policy_digest().is_ok());
+        client.invalidate();
+    }
 
     #[test]
     fn legacy_vault_login_cannot_bypass_settings_approval_over_native_ipc() {

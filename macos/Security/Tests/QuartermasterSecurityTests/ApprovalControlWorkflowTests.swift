@@ -35,3 +35,17 @@ import Testing
     #expect(calls == ["operation", "cancel", "operation completed", "revoke"])
     #expect(!workflow.busy)
 }
+
+@Test @MainActor func targetedRevocationsAreNotLostWhileAnotherOperationOrRevocationWaits() async {
+    let workflow = ApprovalControlWorkflow()
+    var revoked: [String] = []
+    await workflow.perform {
+        await workflow.revokeReadAccess(cancelApproval: {}) {
+            revoked.append("first")
+            await workflow.revokeReadAccess(cancelApproval: {}) { revoked.append("third") }
+        }
+        await workflow.revokeReadAccess(cancelApproval: {}) { revoked.append("second") }
+    }
+    #expect(revoked == ["first", "second", "third"])
+    #expect(!workflow.busy)
+}

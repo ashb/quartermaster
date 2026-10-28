@@ -179,6 +179,13 @@ import LocalAuthentication
         }
     }
 
+    public func supersedeReview() -> Bool {
+        guard phase == .review else { return false }
+        phase = .stopped
+        authentication.invalidate()
+        return true
+    }
+
     public func cancel() { finish(.stopped, detail: "Request cancelled.") }
 
     private func finish(_ phase: Phase, detail: String) {

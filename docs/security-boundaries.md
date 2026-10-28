@@ -337,8 +337,18 @@ A one-use issuance challenge belongs to the current backend and approval session
 consuming it cannot extend an existing grant. Proof acceptance remains pending
 until the initiating read's final admission atomically installs the grant.
 Cancellation or UI loss before admission prevents issuance; eligible reads then
-survive UI exit. Within the bound session, the grant covers all instances of the
-verified executable running as that OS user. Configuration can revoke grants,
+survive UI exit. Within the bound session, a grant covers the verified executable only under the
+explicitly selected shell execution root. Every admission rechecks that lifetime
+and descendant relationship. Missing evidence leaves per-request approval
+available, subject to policy. The versioned effect set currently covers only
+REST issue listing and issue reads; later effect families require new approval.
+
+The broker offers proven shell ancestors, nearest first, and a one-request
+choice. Changing selection before authentication replaces the frozen review and
+nonce without extending expiry. Selection after authentication is rejected.
+Access controls list active roots, repositories, issue scope and absolute expiry.
+Selected revocation preserves other installed grants and cancels pending approval
+work; revoke-all also invalidates pending issuance. Neither requires Touch ID. Configuration can revoke grants,
 never create them. Expiry or backend restart requires fresh approval on next use,
 without silent renewal or prompting merely because the application launched.
 

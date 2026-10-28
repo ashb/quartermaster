@@ -79,6 +79,50 @@ pub struct PeerPresentation {
     pub command_line: Option<String>,
 }
 
+pub struct SocketPeer {
+    stream: UnixStream,
+    token: [u32; 8],
+    code_hash: String,
+    invalid: std::sync::atomic::AtomicBool,
+}
+
+impl SocketPeer {
+    pub fn revalidate(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let check = || {
+            if self.invalid.load(Ordering::SeqCst)
+                || crate::process_scope::peer_token(&self.stream)? != self.token
+            {
+                return Err(io::Error::other("socket peer changed"));
+            }
+            let data = CFData::from_buffer(unsafe {
+                std::slice::from_raw_parts(self.token.as_ptr().cast(), size_of_val(&self.token))
+            });
+            let mut attributes = GuestAttributes::new();
+            attributes.set_audit_token(data.as_concrete_TypeRef());
+            let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
+                .map_err(io::Error::other)?;
+            let requirement = format!("cdhash H\"{}\"", self.code_hash)
+                .parse::<SecRequirement>()
+                .map_err(io::Error::other)?;
+            code.check_validity(
+                Flags::STRICT_VALIDATE | Flags::NO_NETWORK_ACCESS,
+                &requirement,
+            )
+            .map_err(io::Error::other)?;
+            if crate::process_scope::peer_token(&self.stream)? != self.token {
+                return Err(io::Error::other("socket peer changed"));
+            }
+            Ok(())
+        };
+        let result = check();
+        if result.is_err() {
+            self.invalid.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
 impl PeerIdentity {
     pub fn presentation(&self) -> PeerPresentation {
         PeerPresentation {
@@ -95,6 +139,17 @@ impl PeerIdentity {
     }
     pub fn code_hash(&self) -> &str {
         &self.cd_hash
+    }
+
+    pub fn socket_peer(&self, stream: &UnixStream) -> io::Result<SocketPeer> {
+        let peer = SocketPeer {
+            stream: stream.try_clone()?,
+            token: self.audit_token,
+            code_hash: self.cd_hash.clone(),
+            invalid: std::sync::atomic::AtomicBool::new(false),
+        };
+        peer.revalidate()?;
+        Ok(peer)
     }
 
     pub fn process_peer(

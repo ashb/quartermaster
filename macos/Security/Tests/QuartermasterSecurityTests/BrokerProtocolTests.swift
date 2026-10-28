@@ -46,6 +46,9 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
         .prepareVaultUnlock(revision: 4),
         .vaultUnlockPresence(id: id, authenticated: try brokerTimestamp(105_000_000_000)),
         .vaultUnlockCancel(id: id),
+        .readGrants, .revokeReadGrant(id: id),
+        .selectReadRoot(id: id, nonce: Data(repeating: 0, count: 32), root: nil),
+        .selectReadRoot(id: id, nonce: Data(repeating: 0, count: 32), root: "123:0000000000000001:00000001"),
     ]
     let fixtures = try brokerFixtures("commands")
     #expect(commands.count == fixtures.count)
@@ -83,6 +86,9 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
         case .alreadyAdmitted: kind = "alreadyAdmitted"
         case .unknownOperation: kind = "unknownOperation"
         case .readGrantsRevoked: kind = "readGrantsRevoked"
+        case .readGrants(let grants):
+            kind = "readGrants"
+            #expect(grants.isEmpty)
         case .vaultUnlockReview(let review):
             kind = "vaultUnlockReview"
             #expect(review.revision == 4)

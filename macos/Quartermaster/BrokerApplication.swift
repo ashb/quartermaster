@@ -26,6 +26,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
     private enum VaultAction { case lock, sync, unlock }
     @Published private(set) var status = "Disconnected"
+    @Published private(set) var readGrants: [ActiveReadGrant] = []
+    @Published private(set) var refreshingGrants = false
     @Published private(set) var vaultStatus: BrokerVaultStatus?
     @Published private(set) var vaultActivity = VaultActivity.idle
     private var client: (any BrokerClient)?
@@ -170,7 +172,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             let dialog = ApprovalDialog(
                 presentation: ApprovalPresentation(
                     request: pending.request, provider: pending.provider, readGrant: pending.readGrant,
-                    apiRequest: pending.apiRequest), backend: pending)
+                    apiRequest: pending.apiRequest, readScope: pending.readScope), backend: pending,
+                selectRoot: { root in try await pending.selectRoot(root) })
             present(dialog)
         default: throw BrokerFailure.invalidMessage
         }
@@ -267,6 +270,36 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         setActivationPolicy(settingsIsOpen || active != nil ? .regular : .accessory)
     }
 
+    func refreshReadGrants() async {
+        guard !refreshingGrants else { return }
+        refreshingGrants = true
+        defer { refreshingGrants = false }
+        do {
+            guard let client, case .readGrants(let grants) = try await client.call(.readGrants) else {
+                throw BrokerFailure.disconnected
+            }
+            readGrants = grants
+        } catch {
+            readGrants = []
+            preferences.report(error)
+        }
+    }
+
+    func revokeRead(_ id: String) {
+        Task {
+            await controls.revokeReadAccess(cancelApproval: { self.active?.cancel() }) {
+                do {
+                    guard let client = self.client,
+                        case .readGrantsRevoked = try await client.call(.revokeReadGrant(id: id))
+                    else {
+                        throw BrokerFailure.disconnected
+                    }
+                    await self.refreshReadGrants()
+                } catch { self.preferences.report(error) }
+            }
+        }
+    }
+
     func revokeReads() {
         Task {
             await controls.revokeReadAccess(cancelApproval: { self.active?.cancel() }) {
@@ -274,6 +307,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     guard let client = self.client, case .readGrantsRevoked = try await client.call(.revokeReadGrants)
                     else { throw BrokerFailure.disconnected }
                     self.operationEnrolled = false
+                    self.readGrants = []
                     self.status = "Read access revoked"
                 } catch { self.preferences.report(error) }
             }

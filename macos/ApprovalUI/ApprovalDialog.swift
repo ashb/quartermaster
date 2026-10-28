@@ -74,15 +74,17 @@ public struct ApprovalPresentation {
     let provider: ApprovalProviderIdentity
     let readGrant: ReadGrantReview?
     let apiRequest: APIRequestReview?
+    let readScope: ReadScopeReview?
 
     public init(
         request: DialogRequest, provider: ApprovalProviderIdentity, readGrant: ReadGrantReview?,
-        apiRequest: APIRequestReview? = nil
+        apiRequest: APIRequestReview? = nil, readScope: ReadScopeReview? = nil
     ) {
         self.request = request
         self.provider = provider
         self.readGrant = readGrant
         self.apiRequest = apiRequest
+        self.readScope = readScope
     }
 
     private var describesClose: Bool {
@@ -163,6 +165,9 @@ struct ApprovalDialogView: View {
     let presentation: ApprovalPresentation
     @ObservedObject var controller: ApprovalController
     let close: () -> Void
+    var selectRoot: ((String?) async -> Void)? = nil
+    @State private var selecting = false
+    @State private var ready = false
     @State private var showsVault = false
     @State private var showsHTTP = false
     @State private var showsRawHTTP = false
@@ -206,10 +211,42 @@ struct ApprovalDialogView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Text(verbatim: repository).font(.headline)
                     if let grant = presentation.readGrant {
-                        Text("Until \(grant.expires.formatted(date: .omitted, time: .shortened)) or backend restart")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                        Text(
+                            "Until \(grant.expires.formatted(date: .abbreviated, time: .shortened)) or backend restart"
+                        )
+                        .font(.subheadline).foregroundStyle(.secondary)
                     }
                 }
+            }
+
+            if let scope = presentation.readScope {
+                VStack(alignment: .leading, spacing: 6) {
+                    if !scope.roots.isEmpty, let selectRoot {
+                        Picker(
+                            "Read access",
+                            selection: Binding(
+                                get: { presentation.readGrant?.root.id ?? "" },
+                                set: { id in
+                                    selecting = true
+                                    Task {
+                                        await selectRoot(id.isEmpty ? nil : id)
+                                        selecting = false
+                                    }
+                                })
+                        ) {
+                            Text("This request once").tag("")
+                            ForEach(scope.roots) { root in
+                                Text("\(root.executable) · PID \(String(root.pid))").tag(root.id)
+                            }
+                        }.disabled(selecting || ready || controller.phase != .review)
+                    }
+                    if let grant = presentation.readGrant {
+                        Text("List and read issues from this shell's descendants using the same caller executable.")
+                        Text(verbatim: "\(grant.root.executable) · PID \(grant.root.pid)")
+                    } else {
+                        Text("This issue read only. Later requests need approval.")
+                    }
+                }.font(.caption)
             }
 
             VStack(alignment: .leading, spacing: 10) {
@@ -263,9 +300,15 @@ struct ApprovalDialogView: View {
                     close()
                 }.keyboardShortcut(.cancelAction)
                 Spacer()
-                Text(authenticationTitle).font(.headline)
-                EmbeddedAuthentication(context: controller.context, onVisible: { Task { await controller.approve() } })
+                if presentation.readScope?.roots.isEmpty == false && !ready {
+                    Button("Continue to Touch ID") { ready = true }.disabled(selecting || controller.phase != .review)
+                } else {
+                    Text(authenticationTitle).font(.headline)
+                    EmbeddedAuthentication(
+                        context: controller.context, onVisible: { Task { await controller.approve() } }
+                    )
                     .frame(width: 32, height: 32)
+                }
             }
         }
         .onChange(of: controller.phase) { _, phase in
@@ -359,13 +402,20 @@ public protocol ApprovalWindow: AnyObject {
 
 @MainActor
 public final class ApprovalDialog: NSObject, NSWindowDelegate, ApprovalWindow {
-    public let controller: ApprovalController
+    public private(set) var controller: ApprovalController
     public let window: NSWindow
     public var onClose: (() -> Void)?
+    private let backend: any ApprovalBackend
+    private let keys: ApprovalKeyStore
+    private let selectRoot: ((String?) async throws -> ApprovalPresentation)?
 
     public init(
-        presentation: ApprovalPresentation, backend: any ApprovalBackend, keys: ApprovalKeyStore = ApprovalKeyStore()
+        presentation: ApprovalPresentation, backend: any ApprovalBackend, keys: ApprovalKeyStore = ApprovalKeyStore(),
+        selectRoot: ((String?) async throws -> ApprovalPresentation)? = nil
     ) {
+        self.backend = backend
+        self.keys = keys
+        self.selectRoot = selectRoot
         controller = ApprovalController(backend: backend, reason: presentation.authenticationReason, keys: keys)
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 596, height: 460),
@@ -374,11 +424,32 @@ public final class ApprovalDialog: NSObject, NSWindowDelegate, ApprovalWindow {
         window.title = "Quartermaster approval"
         window.isReleasedWhenClosed = false
         window.delegate = self
+        install(presentation)
+    }
+
+    private func install(_ presentation: ApprovalPresentation) {
         let window = self.window
         window.contentView = NSHostingView(
             rootView: ApprovalDialogView(
                 presentation: presentation, controller: controller,
-                close: { [weak window] in window?.performClose(nil) }))
+                close: { [weak window] in window?.performClose(nil) },
+                selectRoot: selectRoot == nil ? nil : { [weak self] root in await self?.choose(root) }))
+    }
+
+    private func choose(_ root: String?) async {
+        guard let selectRoot, controller.supersedeReview() else { return }
+        do {
+            let presentation = try await selectRoot(root)
+            guard window.isVisible else {
+                backend.cancel()
+                return
+            }
+            controller = ApprovalController(backend: backend, reason: presentation.authenticationReason, keys: keys)
+            install(presentation)
+        } catch {
+            backend.cancel()
+            cancel()
+        }
     }
 
     public func show(centred: Bool) {
@@ -393,6 +464,7 @@ public final class ApprovalDialog: NSObject, NSWindowDelegate, ApprovalWindow {
     }
 
     public func windowWillClose(_ notification: Notification) {
+        if controller.phase == .stopped { backend.cancel() }
         controller.cancel()
         onClose?()
     }

@@ -138,6 +138,7 @@ pub(super) fn handle_verified_http(
         config.as_ref(),
     )?;
     let created = presence_now()?;
+    principal.revalidate()?;
     let cold = {
         let state = shared
             .0

@@ -2,7 +2,7 @@
 public final class ApprovalControlWorkflow {
     public enum Phase { case idle, operation, revocationQueued, revoking }
     public private(set) var phase: Phase = .idle
-    private var pendingRevocation: (@MainActor () async -> Void)?
+    private var pendingRevocations: [@MainActor () async -> Void] = []
     public var busy: Bool { phase != .idle }
 
     public init() {}
@@ -11,12 +11,7 @@ public final class ApprovalControlWorkflow {
         guard !busy else { return }
         phase = .operation
         await operation()
-        if let revoke = pendingRevocation {
-            pendingRevocation = nil
-            phase = .revoking
-            await revoke()
-        }
-        phase = .idle
+        await drainRevocations()
     }
 
     public func revokeReadAccess(
@@ -26,14 +21,24 @@ public final class ApprovalControlWorkflow {
         cancelApproval()
         switch phase {
         case .operation, .revocationQueued:
-            pendingRevocation = revoke
+            pendingRevocations.append(revoke)
             phase = .revocationQueued
         case .revoking:
-            break
+            pendingRevocations.append(revoke)
         case .idle:
             phase = .revoking
             await revoke()
-            phase = .idle
+            await drainRevocations()
         }
     }
+
+    private func drainRevocations() async {
+        while !pendingRevocations.isEmpty {
+            let revoke = pendingRevocations.removeFirst()
+            phase = .revoking
+            await revoke()
+        }
+        phase = .idle
+    }
+
 }

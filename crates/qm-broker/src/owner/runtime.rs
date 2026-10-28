@@ -637,7 +637,7 @@ mod github_tests {
         policy["grants"][0]["repository"] = "example/one".into();
         let mut list = policy["grants"][0].clone();
         list["id"] = "22222222222222222222222222222222".into();
-        list["action"] = "listIssues".into();
+        list["effects"]["effects"] = serde_json::json!(["listIssues"]);
         policy["grants"].as_array_mut().unwrap().push(list);
         paths.policy.set_fixture(crate::owner::policy::Policy::default().with_github(
             crate::owner::github::configuration::GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one","writes":true}]}"#).unwrap()
@@ -646,7 +646,7 @@ mod github_tests {
         state.refresh_policy(&paths.load_policy()).unwrap();
         state
             .authorizer
-            .seed_fixture_grants(&serde_json::to_vec(&policy).unwrap());
+            .seed_native_fixture_grants(&serde_json::to_vec(&policy).unwrap());
         state.github = Connector::fixture(address);
         test_support::vault::install(
             &mut state.provider,
@@ -1089,7 +1089,7 @@ mod tests {
             panic!("ungranted read was allowed");
         };
         let claims = serde_json::to_value(requirement.grant_claims().unwrap()).unwrap();
-        assert_eq!(claims["purpose"], "quartermaster.issue-read-grant.v1");
+        assert_eq!(claims["purpose"], "quartermaster.read-grant.v2");
         assert_eq!(claims["grant"]["codeHash"], "11".repeat(20));
         assert_eq!(claims["grant"]["role"], "github-write");
         assert!(
@@ -1187,6 +1187,7 @@ mod tests {
         }
         let generation = state.provider.generation();
         let context = ReviewContext {
+            read_roots: Vec::new(),
             provider: ProviderPresentation::new(&identity, generation),
             operation_id: id.to_string(),
             created,
@@ -1987,7 +1988,7 @@ mod tests {
         let mut state = OwnerState::new().unwrap();
         state
             .authorizer
-            .seed_fixture_grants(&serde_json::to_vec(&policy).unwrap());
+            .seed_native_fixture_grants(&serde_json::to_vec(&policy).unwrap());
         crate::owner::test_support::vault::install(
             &mut state.provider,
             super::super::test_support::vault::snapshot("github-read"),
@@ -2038,7 +2039,7 @@ mod tests {
         let mut state = OwnerState::new().unwrap();
         state
             .authorizer
-            .seed_fixture_grants(&serde_json::to_vec(&policy).unwrap());
+            .seed_native_fixture_grants(&serde_json::to_vec(&policy).unwrap());
         crate::owner::test_support::vault::install(
             &mut state.provider,
             super::super::test_support::vault::snapshot("github-read"),

@@ -55,7 +55,7 @@ impl ProviderPresentation {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ReviewContext {
     pub(super) provider: ProviderPresentation,
@@ -63,6 +63,7 @@ pub(super) struct ReviewContext {
     pub(super) created: MonotonicTimestamp,
     pub(super) peer: qm_macos::peer_identity::PeerPresentation,
     pub(super) process_chain: Vec<String>,
+    pub(super) read_roots: Vec<crate::owner::identity::RootDescription>,
 }
 
 impl crate::owner::review::CredentialContext for ReviewContext {
@@ -118,7 +119,7 @@ pub(super) fn request_approval(
         .generation();
     let source = paths.vault_source()?;
     let identity = source.identity()?;
-    let (operation, authorization, frozen) = {
+    let (operation, authorization, read_roots, frozen) = {
         let state = shared
             .0
             .lock()
@@ -132,6 +133,7 @@ pub(super) fn request_approval(
         (
             state.operations.request(id, principal)?.clone(),
             state.operations.grant_claims(id, principal)?,
+            state.operations.root_choices(id, principal)?,
             FrozenProvider {
                 source: Some(source),
                 identity,
@@ -144,6 +146,7 @@ pub(super) fn request_approval(
         provider: ProviderPresentation::new(&frozen.identity, frozen.generation),
         operation_id: id.to_string(),
         created,
+        read_roots,
         process_chain: peer.process_chain(),
         peer: peer.presentation(),
     };

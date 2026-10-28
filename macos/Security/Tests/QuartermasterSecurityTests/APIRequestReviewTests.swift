@@ -183,3 +183,13 @@ func repositoryDisplayContextRequiresACompleteAnalysisAndAValidName(_ repository
     let bytes = try JSONSerialization.data(withJSONObject: fixture)
     #expect(throws: APIRequestReview.Failure.self) { try APIRequestReview.parse(request: bytes) }
 }
+
+@Test func applicationBodyApprovalsRemainAvailableWithoutIssueReadScope() throws {
+    var fixture = try apiFixture()
+    fixture["readRoots"] = []
+    fixture["repository"] = ""
+    #expect(fixture["body"] == nil)
+    let bytes = try JSONSerialization.data(withJSONObject: fixture)
+    #expect(try ReadScopeReview.parse(request: bytes) == nil)
+    #expect(try APIRequestReview.parse(request: bytes) != nil)
+}

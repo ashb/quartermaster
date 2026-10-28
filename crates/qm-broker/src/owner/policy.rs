@@ -3,13 +3,16 @@ use super::{
     dispatch::CredentialSelection,
     github::configuration::{GitHubConfig, Mode},
     grant::{GrantTable, GrantUse, ReadGrantClaims, ReadGrantProposal},
-    identity::{PrincipalBinding, VerifiedPrincipal},
+    identity::{PrincipalBinding, RootDescription, VerifiedPrincipal, VerifiedRoot},
     request::{Action, FrozenOperation},
 };
 use qm_providers::{ApprovedRequest, RequestBinding};
 use ring::digest::SHA256;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,7 +137,10 @@ pub(super) struct ApprovalRequirement {
     policy_generation: u64,
     session_generation: u64,
     approval_generation: u64,
-    grant: Option<ReadGrantProposal>,
+    grant: Option<Box<ReadGrantProposal>>,
+    read_role: Option<String>,
+    roots: Vec<Arc<VerifiedRoot>>,
+    grant_template: Option<Box<ReadGrantProposal>>,
     review: Option<BoundReview>,
 }
 
@@ -158,16 +164,56 @@ impl ApprovalRequirement {
     }
 
     pub(super) fn grant_claims(&self) -> Option<ReadGrantClaims> {
-        self.grant.as_ref().map(ReadGrantProposal::claims)
+        self.grant.as_deref().map(ReadGrantProposal::claims)
     }
 
     pub(super) fn role(&self) -> &str {
         if let Some(review) = &self.review {
             return &review.credential_role;
         }
-        self.grant
-            .as_ref()
-            .map_or_else(|| self.request.role(), ReadGrantProposal::role)
+        self.grant.as_deref().map_or_else(
+            || {
+                self.read_role
+                    .as_deref()
+                    .unwrap_or_else(|| self.request.role())
+            },
+            ReadGrantProposal::role,
+        )
+    }
+
+    pub(super) fn root_choices(&self) -> Vec<RootDescription> {
+        self.roots
+            .iter()
+            .map(|root| root.description().clone())
+            .collect()
+    }
+
+    pub(super) fn select_root(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        id: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
+        if self.read_role.is_none() {
+            return Err(AuthorizationError::Denied);
+        }
+        self.grant = if let Some(id) = id {
+            let root = self
+                .roots
+                .iter()
+                .find(|root| root.description().id == id)
+                .ok_or(AuthorizationError::Denied)?;
+            let mut proposal = self
+                .grant_template
+                .clone()
+                .ok_or(AuthorizationError::Denied)?;
+            proposal.select(Arc::clone(root), principal)?;
+            proposal.check(Instant::now())?;
+            Some(proposal)
+        } else {
+            None
+        };
+        self.review = None;
+        Ok(())
     }
 
     pub(super) fn review_digest(&self) -> Option<[u8; 32]> {
@@ -332,6 +378,9 @@ impl Authorizer {
                 session_generation: self.session_generation,
                 approval_generation: self.approval_generation,
                 grant: None,
+                read_role: None,
+                roots: Vec::new(),
+                grant_template: None,
                 review: None,
             }));
         }
@@ -377,7 +426,7 @@ impl Authorizer {
                         proposal,
                         selection,
                     } = *grant;
-                    self.grants.issue(proposal, selection, now)?;
+                    self.grants.issue(proposal, principal, selection, now)?;
                 }
             }
         }
@@ -423,15 +472,14 @@ impl Authorizer {
                     return Err(AuthorizationError::SessionRevoked);
                 }
                 match purpose {
-                    ApprovalPurpose::SingleUse { .. }
-                        if matches!(permit.request.action(), Action::CloseIssue | Action::Api) => {}
+                    ApprovalPurpose::SingleUse { .. } => {}
                     ApprovalPurpose::ReadGrant(grant)
                         if matches!(
                             permit.request.action(),
                             Action::ListIssues | Action::ReadIssue
                         ) =>
                     {
-                        grant.proposal.check(now)?;
+                        grant.proposal.verify(principal, now)?;
                     }
                     _ => return Err(AuthorizationError::Denied),
                 }
@@ -533,7 +581,7 @@ impl Authorizer {
             }
             grant.check(now)?;
             ApprovalPurpose::ReadGrant(Box::new(ApprovedReadGrant {
-                proposal: grant,
+                proposal: *grant,
                 selection,
             }))
         } else {
@@ -567,6 +615,9 @@ impl Authorizer {
     }
 
     fn check_principal(&self, principal: &VerifiedPrincipal) -> Result<(), AuthorizationError> {
+        principal
+            .revalidate()
+            .map_err(|_| AuthorizationError::WrongPrincipal)?;
         if !self.active {
             return Err(AuthorizationError::SessionRevoked);
         }
@@ -601,16 +652,38 @@ impl Authorizer {
         {
             return Err(AuthorizationError::Denied);
         }
-        let grant = ReadGrantProposal::new(principal, &request, role)?;
+        if !matches!(role, "github-read" | "github-write") {
+            return Err(AuthorizationError::Denied);
+        }
+        let roots = principal.roots().unwrap_or_default();
+        let grant = if let Some(root) = roots.first() {
+            let mut grant = ReadGrantProposal::new(principal, &request, role)?;
+            grant.select(Arc::clone(root), principal)?;
+            Some(Box::new(grant))
+        } else {
+            None
+        };
         Ok(ApprovalRequirement {
             request,
             principal: principal.binding(),
             policy_generation: self.policy_generation,
             session_generation: self.session_generation,
             approval_generation: self.approval_generation,
-            grant: Some(grant),
+            grant_template: grant.clone(),
+            grant,
+            read_role: Some(role.into()),
+            roots,
             review: None,
         })
+    }
+
+    pub(super) fn active_read_grants(&self) -> Vec<ReadGrantClaims> {
+        self.grants.active(Instant::now())
+    }
+
+    pub(super) fn revoke_read_grant(&mut self, id: &str) {
+        self.grants.revoke(id);
+        self.revoke_approvals();
     }
 
     pub(super) fn revoke_read_grants(&mut self) -> Result<(), AuthorizationError> {
@@ -949,6 +1022,249 @@ mod read_grant_tests {
         rand::SystemRandom,
         signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair},
     };
+
+    #[test]
+    fn unavailable_roots_allow_one_read_without_creating_reusable_authority() {
+        let mut owner = Authorizer::new([1; 16]);
+        let principal = test_support::principal([1; 16]).without_fixture_root();
+        let snapshot = test_support::vault::snapshot("github-write");
+        let requirement = owner
+            .request_read_grant(&principal, test_support::read_request(), "github-write")
+            .unwrap();
+        assert!(requirement.grant_claims().is_none());
+        assert!(requirement.root_choices().is_empty());
+        assert_eq!(requirement.role(), "github-write");
+        let mut operations = OperationRegistry::default();
+        let (id, _session, _, _) = test_support::approval::sign(
+            &mut operations,
+            &owner,
+            &principal,
+            &snapshot,
+            requirement,
+            Instant::now(),
+            Duration::ZERO,
+        );
+        let prepared = crate::owner::execution::prepare_simulation(
+            &operations,
+            id,
+            &principal,
+            &owner,
+            &snapshot,
+            Instant::now(),
+        )
+        .unwrap();
+        operations.ready(id, &principal, &prepared).unwrap();
+        operations
+            .admit(id, &principal, &mut owner, Instant::now())
+            .unwrap();
+        assert!(owner.active_read_grants().is_empty());
+        assert!(
+            owner
+                .authorize(&principal, test_support::read_request(), Instant::now())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn root_invalidation_before_preparation_or_admission_prevents_issuance() {
+        for prepared_first in [false, true] {
+            let mut owner = Authorizer::new([1; 16]);
+            let principal = test_support::principal([1; 16]);
+            let snapshot = test_support::vault::snapshot("github-read");
+            let requirement = owner
+                .request_read_grant(&principal, test_support::read_request(), "github-read")
+                .unwrap();
+            let root = Arc::clone(&requirement.roots[0]);
+            let mut operations = OperationRegistry::default();
+            let (id, _session, _, _) = test_support::approval::sign(
+                &mut operations,
+                &owner,
+                &principal,
+                &snapshot,
+                requirement,
+                Instant::now(),
+                Duration::ZERO,
+            );
+            if prepared_first {
+                let prepared = crate::owner::execution::prepare_simulation(
+                    &operations,
+                    id,
+                    &principal,
+                    &owner,
+                    &snapshot,
+                    Instant::now(),
+                )
+                .unwrap();
+                operations.ready(id, &principal, &prepared).unwrap();
+                root.invalidate();
+                assert!(
+                    operations
+                        .admit(id, &principal, &mut owner, Instant::now())
+                        .is_err()
+                );
+            } else {
+                root.invalidate();
+                assert!(
+                    crate::owner::execution::prepare_simulation(
+                        &operations,
+                        id,
+                        &principal,
+                        &owner,
+                        &snapshot,
+                        Instant::now()
+                    )
+                    .is_err()
+                );
+            }
+            assert!(owner.active_read_grants().is_empty());
+        }
+    }
+
+    #[test]
+    fn changing_root_replaces_the_nonce_without_extending_expiry() {
+        let owner = Authorizer::new([1; 16]);
+        let principal = test_support::principal([1; 16]);
+        let requirement = owner
+            .request_read_grant(&principal, test_support::read_request(), "github-read")
+            .unwrap();
+        let claims = requirement.grant_claims();
+        let selected = requirement.root_choices()[0].id.clone();
+        let document = test_support::approval::selected_review(
+            requirement.request().clone(),
+            claims.clone(),
+            "github-read",
+        );
+        let mut operations = OperationRegistry::default();
+        let id = operations
+            .register(
+                AuthorizationOutcome::RequireApproval(requirement),
+                Instant::now(),
+            )
+            .unwrap();
+        let (session, _) = test_support::approval::session(&owner);
+        operations.bind_review(id, &principal, &document).unwrap();
+        operations.begin_approval(id, &principal, &session).unwrap();
+        let original = operations.approval_nonce(id, &principal).unwrap();
+        assert!(
+            operations
+                .select_root(id, &principal, original, Some("forged-root"))
+                .is_err()
+        );
+        operations
+            .select_root(id, &principal, original, None)
+            .unwrap();
+        assert!(operations.grant_claims(id, &principal).unwrap().is_none());
+        let once = test_support::approval::selected_review(
+            test_support::read_request(),
+            None,
+            "github-read",
+        );
+        operations.bind_review(id, &principal, &once).unwrap();
+        operations.begin_approval(id, &principal, &session).unwrap();
+        let nonce = operations.approval_nonce(id, &principal).unwrap();
+        assert_ne!(nonce, original);
+        assert!(
+            operations
+                .select_root(id, &principal, original, Some(&selected))
+                .is_err()
+        );
+        operations
+            .select_root(id, &principal, nonce, Some(&selected))
+            .unwrap();
+        assert!(operations.grant_claims(id, &principal).unwrap() == claims);
+        operations.bind_review(id, &principal, &document).unwrap();
+        operations.begin_approval(id, &principal, &session).unwrap();
+        let nonce = operations.approval_nonce(id, &principal).unwrap();
+        let now = Instant::now();
+        operations
+            .authentication(id, &principal, now, now, Duration::ZERO)
+            .unwrap();
+        assert!(operations.select_root(id, &principal, nonce, None).is_err());
+    }
+
+    #[test]
+    fn pending_grant_rechecks_membership_before_credential_acquisition() {
+        let owner = Authorizer::new([1; 16]);
+        let principal = test_support::principal([1; 16]);
+        let snapshot = test_support::vault::snapshot("github-read");
+        let requirement = owner
+            .request_read_grant(&principal, test_support::read_request(), "github-read")
+            .unwrap();
+        let root = Arc::clone(&requirement.roots[0]);
+        let mut operations = OperationRegistry::default();
+        let (id, _session, _, _) = test_support::approval::sign(
+            &mut operations,
+            &owner,
+            &principal,
+            &snapshot,
+            requirement,
+            Instant::now(),
+            Duration::ZERO,
+        );
+        let moved = principal.with_fixture_root("reparented");
+        assert!(root.live().is_ok());
+        assert!(
+            crate::owner::execution::prepare_simulation(
+                &operations,
+                id,
+                &moved,
+                &owner,
+                &snapshot,
+                Instant::now()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn targeted_revocation_preserves_other_roots_and_prevents_pending_issuance() {
+        let mut owner = Authorizer::new([1; 16]);
+        let first = test_support::principal([1; 16]);
+        let second = test_support::principal([1; 16]).with_fixture_root("second-root");
+        let snapshot = test_support::vault::snapshot("github-read");
+        let mut operations = OperationRegistry::default();
+        test_support::approval::read_grant(&mut operations, &mut owner, &first, &snapshot);
+        let claims = serde_json::to_value(&owner.active_read_grants()[0]).unwrap();
+        let revoke = claims["grant"]["id"].as_str().unwrap();
+        test_support::approval::read_grant(&mut operations, &mut owner, &second, &snapshot);
+        let AuthorizationOutcome::Allowed(permit) = owner
+            .authorize(&first, test_support::read_request(), Instant::now())
+            .unwrap()
+        else {
+            panic!()
+        };
+        let (pending, _session, _, _) = test_support::approval::read_grant_at(
+            &mut operations,
+            &owner,
+            &first,
+            &snapshot,
+            Instant::now(),
+        );
+        owner.revoke_read_grant(revoke);
+        assert!(owner.admit(permit, &first, Instant::now()).is_err());
+        assert!(
+            owner
+                .authorize(&first, test_support::read_request(), Instant::now())
+                .is_err()
+        );
+        assert!(
+            owner
+                .authorize(&second, test_support::read_request(), Instant::now())
+                .is_ok()
+        );
+        assert!(
+            crate::owner::execution::prepare_simulation(
+                &operations,
+                pending,
+                &first,
+                &owner,
+                &snapshot,
+                Instant::now()
+            )
+            .is_err()
+        );
+        assert_eq!(owner.active_read_grants().len(), 1);
+    }
 
     #[test]
     fn a_review_cannot_bind_a_different_operation_or_drop_its_grant_scope() {
@@ -1449,7 +1765,8 @@ pub(super) mod fixture {
                         anchor,
                     )?;
                     if changed {
-                        self.grants = GrantTable::new(&fixture.grants, wall_now, now, anchor)?;
+                        self.grants =
+                            GrantTable::new(&fixture.grants, self.session, wall_now, now, anchor)?;
                     }
                     Ok(changed)
                 }
@@ -1457,10 +1774,17 @@ pub(super) mod fixture {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        pub(crate) fn seed_native_fixture_grants(&mut self, bytes: &[u8]) {
+            self.seed_fixture_grants(bytes);
+            self.grants.seed_native_root(self.session);
+        }
+
         pub(crate) fn seed_fixture_grants(&mut self, bytes: &[u8]) {
             let fixture = FixturePolicy::decode(bytes).unwrap();
             self.grants = GrantTable::new(
                 &fixture.grants,
+                self.session,
                 OffsetDateTime::now_utc(),
                 Instant::now(),
                 continuous_now().unwrap(),

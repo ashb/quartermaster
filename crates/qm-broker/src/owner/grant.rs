@@ -1,13 +1,16 @@
 use super::{
     deadline::{Deadline, Sample},
     dispatch::CredentialSelection,
-    identity::VerifiedPrincipal,
+    identity::{RootDescription, VerifiedPrincipal, VerifiedRoot},
     policy::AuthorizationError,
     request::{Action, FrozenOperation},
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use time::OffsetDateTime;
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -16,10 +19,16 @@ struct GrantId(String);
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-enum GrantAction {
+enum ReadEffect {
     ListIssues,
     ReadIssue,
-    IssueReads,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReadEffects {
+    version: u8,
+    effects: Vec<ReadEffect>,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -28,7 +37,8 @@ pub(super) struct GrantRule {
     id: GrantId,
     uid: u32,
     code_hash: String,
-    action: GrantAction,
+    effects: ReadEffects,
+    root: RootDescription,
     repository: String,
     role: String,
     #[serde(with = "time::serde::timestamp")]
@@ -75,15 +85,14 @@ impl GrantRule {
         session: [u8; 16],
     ) -> bool {
         principal.matches(self.uid, &self.code_hash, session)
-            && matches!(
-                (self.action, operation.action()),
-                (GrantAction::ReadIssue, Action::ReadIssue)
-                    | (GrantAction::ListIssues, Action::ListIssues)
-                    | (
-                        GrantAction::IssueReads,
-                        Action::ListIssues | Action::ReadIssue
-                    )
-            )
+            && self.effects.version == 1
+            && self.effects.effects.iter().any(|effect| {
+                matches!(
+                    (effect, operation.action()),
+                    (ReadEffect::ReadIssue, Action::ReadIssue)
+                        | (ReadEffect::ListIssues, Action::ListIssues)
+                )
+            })
             && operation.repository() == self.repository
     }
 }
@@ -93,9 +102,12 @@ struct Grant {
     expires: Instant,
     continuous_expiry: Deadline,
     credential: CredentialSelection,
+    root: Arc<VerifiedRoot>,
 }
 
+#[derive(Clone)]
 pub(super) struct ReadGrantProposal {
+    root: Arc<VerifiedRoot>,
     rule: GrantRule,
     expires: Instant,
     continuous_expiry: Deadline,
@@ -120,16 +132,27 @@ impl ReadGrantProposal {
         SystemRandom::new()
             .fill(&mut id)
             .map_err(|_| AuthorizationError::InvalidPolicy)?;
+        let root = principal
+            .roots()
+            .map_err(|_| AuthorizationError::Denied)?
+            .into_iter()
+            .next()
+            .ok_or(AuthorizationError::Denied)?;
         Ok(Self {
             rule: GrantRule {
                 id: GrantId(id.iter().map(|byte| format!("{byte:02x}")).collect()),
                 uid: principal.uid(),
                 code_hash: principal.code_hash().to_owned(),
-                action: GrantAction::IssueReads,
+                effects: ReadEffects {
+                    version: 1,
+                    effects: vec![ReadEffect::ListIssues, ReadEffect::ReadIssue],
+                },
+                root: root.description().clone(),
                 repository: request.repository().to_owned(),
                 role: role.to_owned(),
                 expires_unix: OffsetDateTime::now_utc() + lifetime,
             },
+            root,
             expires: now
                 .checked_add(lifetime)
                 .ok_or(AuthorizationError::InvalidPolicy)?,
@@ -138,9 +161,32 @@ impl ReadGrantProposal {
         })
     }
 
+    pub(super) fn select(
+        &mut self,
+        root: Arc<VerifiedRoot>,
+        principal: &VerifiedPrincipal,
+    ) -> Result<(), AuthorizationError> {
+        root.verify(principal)
+            .map_err(|_| AuthorizationError::Denied)?;
+        self.rule.root = root.description().clone();
+        self.root = root;
+        Ok(())
+    }
+
+    pub(super) fn verify(
+        &self,
+        principal: &VerifiedPrincipal,
+        now: Instant,
+    ) -> Result<(), AuthorizationError> {
+        self.check(now)?;
+        self.root
+            .verify(principal)
+            .map_err(|_| AuthorizationError::Denied)
+    }
+
     pub(super) fn claims(&self) -> ReadGrantClaims {
         ReadGrantClaims {
-            purpose: "quartermaster.issue-read-grant.v1",
+            purpose: "quartermaster.read-grant.v2",
             grant: self.rule.clone(),
         }
     }
@@ -150,6 +196,9 @@ impl ReadGrantProposal {
     }
 
     pub(super) fn check(&self, now: Instant) -> Result<(), AuthorizationError> {
+        if self.root.live().is_err() {
+            return Err(AuthorizationError::Denied);
+        }
         if now >= self.expires {
             return Err(AuthorizationError::Expired);
         }
@@ -162,6 +211,9 @@ impl ReadGrantProposal {
 
 impl Grant {
     fn check(&self, now: Instant) -> Result<(), AuthorizationError> {
+        if self.root.live().is_err() {
+            return Err(AuthorizationError::Denied);
+        }
         if now >= self.expires {
             return Err(AuthorizationError::Expired);
         }
@@ -189,6 +241,30 @@ pub(super) struct GrantTable {
 }
 
 impl GrantTable {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn seed_native_root(&mut self, session: [u8; 16]) {
+        let root = VerifiedRoot::native_fixture(session);
+        for grant in &mut self.grants {
+            grant.rule.root = root.description().clone();
+            grant.root = Arc::clone(&root);
+        }
+    }
+
+    pub(super) fn active(&self, now: Instant) -> Vec<ReadGrantClaims> {
+        self.grants
+            .iter()
+            .filter(|grant| grant.check(now).is_ok())
+            .map(|grant| ReadGrantClaims {
+                purpose: "quartermaster.read-grant.v2",
+                grant: grant.rule.clone(),
+            })
+            .collect()
+    }
+
+    pub(super) fn revoke(&mut self, id: &str) {
+        self.grants.retain(|grant| grant.rule.id.0 != id);
+    }
+
     pub(super) fn clamp_expiry(&mut self, wall_now: OffsetDateTime, now: Instant, anchor: Sample) {
         for grant in &mut self.grants {
             let remaining =
@@ -208,6 +284,7 @@ impl GrantTable {
     #[cfg(test)]
     pub(super) fn new(
         rules: &[GrantRule],
+        session: [u8; 16],
         wall_now: OffsetDateTime,
         now: Instant,
         anchor: Sample,
@@ -222,6 +299,7 @@ impl GrantTable {
                     .ok_or(AuthorizationError::InvalidPolicy)?;
                 let rule = rule.clone();
                 Ok(Grant {
+                    root: VerifiedRoot::fixture(&rule.root.id, session),
                     credential: crate::owner::test_support::vault::selection(
                         &crate::owner::test_support::vault::snapshot(&rule.role),
                     ),
@@ -238,6 +316,7 @@ impl GrantTable {
     pub(super) fn issue(
         &mut self,
         proposal: ReadGrantProposal,
+        principal: &VerifiedPrincipal,
         selection: CredentialSelection,
         now: Instant,
     ) -> Result<(), AuthorizationError> {
@@ -251,7 +330,9 @@ impl GrantTable {
         {
             return Err(AuthorizationError::Denied);
         }
+        proposal.verify(principal, now)?;
         let grant = Grant {
+            root: proposal.root,
             rule: proposal.rule,
             expires: proposal.expires,
             continuous_expiry: proposal.continuous_expiry,
@@ -273,7 +354,10 @@ impl GrantTable {
             .grants
             .iter()
             .rev()
-            .find(|grant| grant.rule.matches(principal, operation, session))
+            .find(|grant| {
+                grant.rule.matches(principal, operation, session)
+                    && grant.root.verify(principal).is_ok()
+            })
             .ok_or(AuthorizationError::Denied)?;
         grant.check(now)?;
         Ok(GrantUse {
@@ -306,7 +390,11 @@ impl GrantTable {
                     && grant.rule.matches(principal, operation, session)
             })
             .ok_or(AuthorizationError::Denied)?;
-        grant.check(now)
+        grant.check(now)?;
+        grant
+            .root
+            .verify(principal)
+            .map_err(|_| AuthorizationError::Denied)
     }
 
     pub(super) fn consume(
@@ -365,6 +453,15 @@ mod tests {
     }
 
     #[test]
+    fn same_executable_under_another_root_cannot_reuse_a_grant() {
+        let (owner, now) = setup();
+        let principal = crate::owner::test_support::principal([1; 16]);
+        assert!(owner.authorize(&principal, read_request(), now).is_ok());
+        let other = principal.with_fixture_root("other-root");
+        assert!(owner.authorize(&other, read_request(), now).is_err());
+    }
+
+    #[test]
     fn issuance_capacity_counts_only_usable_grants() {
         let principal = crate::owner::test_support::principal([1; 16]);
         let snapshot = crate::owner::test_support::vault::snapshot("github-read");
@@ -377,6 +474,7 @@ mod tests {
                 grants
                     .issue(
                         proposal,
+                        &principal,
                         crate::owner::test_support::vault::selection(&snapshot),
                         Instant::now(),
                     )
@@ -403,6 +501,7 @@ mod tests {
                 .issue(
                     super::ReadGrantProposal::new(&principal, &read_request(), "github-read")
                         .unwrap(),
+                    &principal,
                     crate::owner::test_support::vault::selection(&snapshot),
                     Instant::now(),
                 )
@@ -413,6 +512,7 @@ mod tests {
                 .issue(
                     super::ReadGrantProposal::new(&principal, &read_request(), "github-read")
                         .unwrap(),
+                    &principal,
                     crate::owner::test_support::vault::selection(&snapshot),
                     Instant::now(),
                 )
@@ -563,6 +663,7 @@ mod tests {
         let rule = serde_json::from_value(document["grants"][0].clone()).unwrap();
         let mut grants = super::GrantTable::new(
             &[rule],
+            [1; 16],
             crate::owner::test_support::wall(1000),
             now,
             crate::owner::deadline::continuous_now().unwrap(),
@@ -593,9 +694,14 @@ mod tests {
         let anchor = crate::owner::deadline::continuous_now().unwrap();
         let document: serde_json::Value = serde_json::from_slice(&policy_bytes(1010)).unwrap();
         let rule = serde_json::from_value(document["grants"][0].clone()).unwrap();
-        let mut grants =
-            super::GrantTable::new(&[rule], crate::owner::test_support::wall(1000), now, anchor)
-                .unwrap();
+        let mut grants = super::GrantTable::new(
+            &[rule],
+            [1; 16],
+            crate::owner::test_support::wall(1000),
+            now,
+            anchor,
+        )
+        .unwrap();
         let expected =
             crate::owner::deadline::Deadline::at(anchor, Duration::from_secs(10)).unwrap();
         assert_eq!(grants.grants[0].continuous_expiry, expected);
@@ -679,7 +785,7 @@ mod tests {
         document["grants"][0]["repository"] = "example/one".into();
         let mut list = document["grants"][0].clone();
         list["id"] = "22222222222222222222222222222222".into();
-        list["action"] = "listIssues".into();
+        list["effects"]["effects"] = serde_json::json!(["listIssues"]);
         document["grants"].as_array_mut().unwrap().push(list);
         FixturePolicy::decode(&serde_json::to_vec(&document).unwrap())
             .unwrap()

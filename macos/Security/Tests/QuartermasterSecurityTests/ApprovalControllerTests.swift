@@ -306,3 +306,27 @@ func authenticationMustFinishBeforeTheOriginalReviewExpires(_ elapsed: Int) asyn
     #expect(storage.signatures == 0)
     #expect(backend.signatures.isEmpty)
 }
+
+@Test @MainActor func supersedingAReviewInvalidatesItsContextWithoutCancelingTheOperation() async {
+    let now = MonotonicTimestamp.now
+    let authentication = AuthenticationFixture(timestamp: now)
+    let backend = UnlockBackendFixture(created: now)
+    let controller = ApprovalController(unlock: backend, reason: "test", authentication: authentication, now: { now })
+    #expect(controller.supersedeReview())
+    #expect(!controller.supersedeReview())
+    await controller.approve()
+    #expect(authentication.invalidations == 1)
+    #expect(authentication.requests == 0)
+    #expect(backend.cancellations == 0)
+    #expect(backend.unlocks == 0)
+}
+
+@Test @MainActor func authenticationPreventsChangingTheReviewedScope() async {
+    let now = MonotonicTimestamp.now
+    let authentication = AuthenticationFixture(timestamp: now)
+    let backend = UnlockBackendFixture(created: now)
+    let controller = ApprovalController(unlock: backend, reason: "test", authentication: authentication, now: { now })
+    authentication.onAuthenticate = { #expect(!controller.supersedeReview()) }
+    await controller.approve()
+    #expect(controller.phase == .approved)
+}

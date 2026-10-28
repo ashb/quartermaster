@@ -309,6 +309,41 @@ impl OperationRegistry {
         }
     }
 
+    pub(super) fn root_choices(
+        &self,
+        id: OperationId,
+        principal: &VerifiedPrincipal,
+    ) -> Result<Vec<super::identity::RootDescription>, OperationError> {
+        match &self.get(id, principal)?.phase {
+            Phase::Awaiting(awaiting) => Ok(awaiting.requirement.root_choices()),
+            _ => Err(OperationError::NotReady),
+        }
+    }
+
+    pub(super) fn select_root(
+        &mut self,
+        id: OperationId,
+        principal: &VerifiedPrincipal,
+        nonce: [u8; 32],
+        root: Option<&str>,
+    ) -> Result<(), OperationError> {
+        let Phase::Awaiting(awaiting) = &mut self.owned(id, principal)?.phase else {
+            return Err(OperationError::NotReady);
+        };
+        let SigningPhase::Reviewing(intent) = &awaiting.signing else {
+            return Err(OperationError::NotReady);
+        };
+        if intent.nonce() != nonce {
+            return Err(OperationError::NotReady);
+        }
+        awaiting
+            .requirement
+            .select_root(principal, root)
+            .map_err(OperationError::Authorization)?;
+        awaiting.signing = SigningPhase::Unbound;
+        Ok(())
+    }
+
     pub(super) fn bind_review<C: super::review::CredentialContext>(
         &mut self,
         id: OperationId,

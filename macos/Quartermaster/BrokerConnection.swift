@@ -190,13 +190,15 @@ final class VaultUnlockPending: VaultUnlockBackend {
 
 @MainActor
 final class BrokerPending: ApprovalBackend {
-    let reviewCreated: MonotonicTimestamp
+    private(set) var reviewCreated: MonotonicTimestamp
     let client: any BrokerClient
     let id: String
-    let request: DialogRequest
-    let provider: ApprovalProviderIdentity
-    let readGrant: ReadGrantReview?
-    let apiRequest: APIRequestReview?
+    private(set) var request: DialogRequest
+    private(set) var provider: ApprovalProviderIdentity
+    private(set) var readGrant: ReadGrantReview?
+    private(set) var apiRequest: APIRequestReview?
+    private(set) var readScope: ReadScopeReview?
+    private var nonce: Data
     private var workflow: AuthorizationWorkflow
 
     init(client: any BrokerClient, review: ApprovalReview) throws {
@@ -208,16 +210,38 @@ final class BrokerPending: ApprovalBackend {
         let readGrant = try ReadGrantReview.parse(
             request: bytes, role: review.provider.role, uid: geteuid(), now: Date())
         let apiRequest = try APIRequestReview.parse(request: bytes)
+        let readScope = try ReadScopeReview.parse(request: bytes)
         guard request.peer != nil, !request.processChain.isEmpty, request.processChain.count <= 6 else {
             throw BrokerFailure.invalidMessage
         }
-        guard readGrant != nil || apiRequest != nil else { throw BrokerFailure.invalidMessage }
+        guard readGrant != nil || apiRequest != nil || readScope != nil else { throw BrokerFailure.invalidMessage }
+        self.readScope = readScope
+        nonce = review.nonce
         self.client = client
         self.id = id
         self.request = request
         self.provider = review.provider
         self.readGrant = readGrant
         self.apiRequest = apiRequest
+    }
+
+    func selectRoot(_ root: String?) async throws -> ApprovalPresentation {
+        guard case .review(let review) = try await client.call(.selectReadRoot(id: id, nonce: nonce, root: root)),
+            review.id == id,
+            review.created == reviewCreated
+        else { throw BrokerFailure.invalidMessage }
+        let replacement = try BrokerPending(client: client, review: review)
+        guard replacement.readGrant?.root.id == root else { throw BrokerFailure.invalidMessage }
+        workflow.cancel()
+        workflow = replacement.workflow
+        nonce = replacement.nonce
+        request = replacement.request
+        provider = replacement.provider
+        readGrant = replacement.readGrant
+        apiRequest = replacement.apiRequest
+        readScope = replacement.readScope
+        return ApprovalPresentation(
+            request: request, provider: provider, readGrant: readGrant, apiRequest: apiRequest, readScope: readScope)
     }
 
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {

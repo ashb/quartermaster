@@ -220,7 +220,11 @@ lifetime and a bounded, revalidated descendant relationship. The executable
 restriction remains in force. A readable shell can be the root even when macOS
 denies access to its login parent; children need no PTY. Root exec, including
 same-image exec, and root exit end reuse. Failed proof leaves per-use approval
-available without widening the grant.
+available without widening the grant. Approval offers the nearest proven shell,
+other proven shell ancestors and a one-request choice before authentication.
+Each choice creates a new frozen review; the signed grant binds an explicit,
+versioned read-effect set and its original one-hour expiry. Access preferences
+show installed scopes and support selected or complete revocation.
 
 The native verifier walks at most 32 processes, independently of display limits,
 and rejects results taking longer than 100ms. This is a result-validity budget,

@@ -288,8 +288,25 @@ struct PreferencesView: View {
                     Spacer()
                     Button("Revoke Read Access", action: application.revokeReads)
                 }
+                ForEach(application.readGrants) { grant in
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading) {
+                            Text(verbatim: grant.repository)
+                            Text(verbatim: "\(grant.root.executable) · PID \(grant.root.pid)")
+                            Text("Issue reads until \(grant.expires.formatted(date: .abbreviated, time: .shortened))")
+                        }.font(.caption)
+                        Spacer()
+                        Button("Revoke") { application.revokeRead(grant.id) }
+                    }
+                }
+                if application.readGrants.isEmpty {
+                    Text("No active read grants").font(.caption).foregroundStyle(.secondary)
+                }
+                Button("Refresh") { Task { await application.refreshReadGrants() } }.disabled(
+                    application.refreshingGrants)
                 Text("Restarting the backend also removes read grants.").font(.caption).foregroundStyle(.secondary)
             }
+            .task { await application.refreshReadGrants() }
             PreferencesGroup(title: "Connection") {
                 HStack {
                     Text("Backend")

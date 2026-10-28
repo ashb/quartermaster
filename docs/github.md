@@ -82,9 +82,11 @@ The token in this command is a dummy value for `gh`'s local authentication check
 Quartermaster adds the actual vault token upstream. The isolated configuration
 routes requests through its socket and leaves your usual `gh` configuration alone.
 
-The first request opens the read-access dialog. Review the caller, repository,
-credential and expiry, then approve with Touch ID. Unlocking the
-cache and establishing the grant can use the same fingerprint.
+The first request opens the read-access dialog. Choose a verified shell root or
+**This request once**. Review the caller, repository, credential and absolute
+expiry, then continue to Touch ID. Unlocking the cache and establishing the grant
+can use the same fingerprint. If no shell root can be verified, only one-request
+approval is available.
 
 Read an individual issue by setting its number:
 
@@ -97,12 +99,16 @@ GH_CONFIG_DIR="$QM_GH_CONFIG" GH_TOKEN=quartermaster-local-only GH_PROMPT_DISABL
 
 ## What the grant permits
 
-A grant covers the selected repository and credential for all instances of the
-verified caller executable running as your OS user, for at most one hour.
-Pagination and redirects require the same scope checks. Further reads work
-without another fingerprint or the UI remaining open.
+A grant covers issue listing and issue reads in the selected repository, using
+the selected credential, for at most one hour. Only the verified caller
+executable and its instances beneath the approved shell execution can reuse it.
+Pagination and redirects require the same scope checks. Eligible reads work
+without another fingerprint or the UI remaining open. Shell exit or exec ends
+reuse; unrelated shells do not inherit the grant. A shell grant cannot identify
+an individual conversation inside a shared daemon.
 
-Choose **Revoke read access** to end existing grants. Backend restart or logout
+Access preferences list active roots, repositories and expiry. Choose **Revoke**
+for one grant or **Revoke Read Access** for all grants. Backend restart or logout
 also clears them. Currently, established reads remain allowed through screen lock
 and wake until expiry; time asleep counts against that expiry. Lock, sleep and
 session deactivation cancel pending approvals. These settings are not configurable

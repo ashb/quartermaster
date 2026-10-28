@@ -255,6 +255,17 @@ mod tests {
     }
 
     #[test]
+    fn socket_peer_guard_rejects_exec_without_private_process_queries() {
+        let (mut shell, peer, _directory) = connected_shell(false);
+        let identity = crate::peer_identity::PeerIdentity::capture(&peer.stream).unwrap();
+        let socket = identity.socket_peer(&peer.stream).unwrap();
+        assert!(socket.revalidate().is_ok());
+        shell.command("exec /bin/zsh -f\nprint ready");
+        assert!(socket.revalidate().is_err());
+        assert!(socket.revalidate().is_err());
+    }
+
+    #[test]
     fn native_same_image_exec_changes_generation_before_event_consumption() {
         let mut shell = Shell::new();
         let before = observe(shell.child.id()).unwrap();
