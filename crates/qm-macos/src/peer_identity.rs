@@ -61,6 +61,8 @@ pub struct PeerIdentity {
     command_line: Option<String>,
     #[serde(skip)]
     started: (u64, u64),
+    #[serde(skip)]
+    audit_token: [u32; 8],
 }
 
 #[derive(Clone, Serialize)]
@@ -93,6 +95,13 @@ impl PeerIdentity {
     }
     pub fn code_hash(&self) -> &str {
         &self.cd_hash
+    }
+
+    pub fn process_peer(
+        &self,
+        stream: &UnixStream,
+    ) -> io::Result<crate::process_scope::ProcessPeer> {
+        crate::process_scope::ProcessPeer::capture(stream, self.audit_token)
     }
 
     /// Signature validity identifies the running image; it does not grant authority.
@@ -132,7 +141,7 @@ impl PeerIdentity {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
-        if length as usize != size_of_val(&token) {
+        if length as usize != size_of_val(&token) || token[5] != pid as u32 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unexpected socket peer",
@@ -195,6 +204,12 @@ impl PeerIdentity {
         fresh
             .check_validity(flags, &requirement)
             .map_err(io::Error::other)?;
+        if crate::process_scope::peer_token(stream)? != token {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "socket peer changed",
+            ));
+        }
         Ok(Self {
             pid: pid as u32,
             executable: display_text(&executable.to_string_lossy()),
@@ -205,6 +220,7 @@ impl PeerIdentity {
             ancestry,
             command_line: None,
             started,
+            audit_token: token,
         })
     }
 

@@ -205,7 +205,7 @@ remains independent of the daemon and credential authority.
 ## Caller attribution
 
 The broker verifies the socket peer's running code through its kernel audit
-token. Process ancestry is advisory context, with birth-time checks for observed
+token. Displayed process ancestry is advisory context, with birth-time checks for observed
 PID reuse. It cannot establish a particular script or attached terminal session.
 When an ancestor cannot be fully inspected, the dialog shows its available name
 and PID as limited information and explains where inspection stopped. Partial
@@ -214,6 +214,20 @@ The local approval dialog shows observed arguments independently of CLI syntax
 or API classification. Quoting preserves argument boundaries and makes control
 characters and invisible formatting explicit. Environment values are excluded;
 observed commands are never logged or persisted. Arguments confer no authority.
+
+Root-scoped read authority uses separate native evidence: an approved execution
+lifetime and a bounded, revalidated descendant relationship. The executable
+restriction remains in force. A readable shell can be the root even when macOS
+denies access to its login parent; children need no PTY. Root exec, including
+same-image exec, and root exit end reuse. Failed proof leaves per-use approval
+available without widening the grant.
+
+The native verifier walks at most 32 processes, independently of display limits,
+and rejects results taking longer than 100ms. This is a result-validity budget,
+not a promise that a kernel query cannot block. Retained event watches supplement
+synchronous process-generation queries; neither process names nor notifications
+alone establish membership. The [security boundary](security-boundaries.md#authenticate-facts-before-assigning-authority)
+defines admission and the exclusion of deliberate socket sharing and relaying.
 
 A Nix wrapper using `exec` leaves the actual binary as the socket peer. The UI
 may display `.gh-wrapped` as `gh` while retaining its real path and signature

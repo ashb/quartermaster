@@ -95,7 +95,42 @@ the running process through OS identity, including process generation where
 available; a PID, executable name, same-user socket ownership or client-supplied
 field is insufficient. A verified interpreter does not authenticate its script
 or package; interpreted workloads need independently established narrow authority.
-Process ancestry and command arguments provide context and never grant permission.
+Displayed ancestry and command arguments provide context and never grant permission.
+
+An explicitly approved process root may scope reusable reads to verified
+descendants of that execution. Retain the caller's verified executable restriction;
+root membership cannot approve writes or authenticate an interpreter's script.
+Bind the root to its uid, kernel process unique identity and exec generation in
+the current backend session. Same-image exec ends that root lifetime. PID, start
+time, executable hash, terminal name and working directory cannot substitute.
+
+Use bounded native parent verification independently of the displayed tree. Each
+edge must match the current parent PID, process unique identity and parent exec
+generation recorded at fork. Stop at the approved root; unreadable ancestors
+above it need not be inspected. Reparenting, missing evidence or a changed edge
+prevents reuse. A socket peer's retained audit identity must remain current after
+request capture and at admission; never adopt a replacement as the old caller.
+
+Bracket native watch registration and admission with matching process queries.
+Exec/exit notifications invalidate permanently; synchronous generation checks
+detect replacement before delayed notifications arrive. A failed or lost monitor
+cannot be recreated to revive authority. Unsupported native queries, malformed
+results and late validation fail closed to per-use approval, subject to policy.
+The private macOS process ABI is a capability requirement, not a fallback to PID
+matching on other systems.
+
+Native admission is the common observation point of two matching bounded
+leaf-to-root collections, conditional on completing validation and consuming the
+bound authority under broker serialization. Process facts are not locked until
+network delivery: a transition after that admission may race with an admitted
+send and prevents later reuse. Do not cache successful membership as permission
+for a later dispatch or let provider/UI waits separate validation from consumption.
+
+Deliberate descriptor sharing and request relaying are outside this local scope.
+A Unix stream peer token identifies a sampled socket owner, not the writer of
+each byte. Reject observed peer changes without claiming to prevent cooperation
+by an authorised process. Shared-daemon conversation attribution requires separate
+verified provenance; process ancestry alone cannot supply it.
 
 The broker validates, bounds and freezes the complete request. Its binding must
 cover the principal, session, request, destination, credential, effective policy

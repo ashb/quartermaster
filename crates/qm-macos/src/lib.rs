@@ -10,6 +10,8 @@ pub mod presence_clock;
 #[cfg(any(target_os = "macos", test))]
 mod process_display;
 #[cfg(target_os = "macos")]
+pub mod process_scope;
+#[cfg(target_os = "macos")]
 pub mod protected_record;
 #[cfg(unix)]
 mod unix_file;

@@ -18,6 +18,8 @@ rust_library(
 
 rust_test(
     name = "qm_macos_test",
+    # Spawned process fixtures can inherit concurrent file locks until exec.
+    args = ["--test-threads=1"],
     compile_data = ["Cargo.toml"],
     crate = ":qm_macos",
     edition = "2024",
