@@ -5,6 +5,7 @@
     <key>CFBundleIdentifier</key><string>dev.quartermaster.phase0</string>
     <key>CFBundleExecutable</key><string>Quartermaster</string>
     <key>CFBundleName</key><string>Quartermaster Development</string>
+    <key>CFBundleIconFile</key><string>AppIcon.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>CFBundleShortVersionString</key><string>0.0.0</string>
