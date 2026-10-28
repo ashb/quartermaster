@@ -97,7 +97,13 @@ public struct ApprovalPresentation {
     }
 
     var additionalEffects: [String] {
-        describesClose ? [] : apiRequest?.effects ?? []
+        guard !describesClose, let apiRequest else { return [] }
+        if readScope != nil, apiRequest.complete,
+            apiRequest.effects.allSatisfy({ ["List issues", "Read issue"].contains($0) })
+        {
+            return []
+        }
+        return apiRequest.effects
     }
 
     var ancestryNotice: String? {
@@ -200,7 +206,6 @@ struct ApprovalDialogView: View {
     let close: () -> Void
     var selectRoot: ((String?) async -> Void)? = nil
     @State private var selecting = false
-    @State private var ready = false
     @State private var showsVault = false
     @State private var showsHTTP = false
     @State private var showsRawHTTP = false
@@ -271,7 +276,7 @@ struct ApprovalDialogView: View {
                                     choose(root.id, using: selectRoot)
                                 }
                             }
-                        }.disabled(selecting || ready || controller.phase != .review)
+                        }.disabled(selecting || !controller.canChangeScope)
                         if scope.roots.count < 6 {
                             choices
                         } else {
@@ -332,20 +337,17 @@ struct ApprovalDialogView: View {
             }
 
             HStack(spacing: 12) {
-                Button(controller.phase == .stopped ? "Close" : "Cancel") {
+                Button(cancelTitle) {
                     controller.cancel()
                     close()
                 }.keyboardShortcut(.cancelAction)
                 Spacer()
-                if presentation.readScope?.roots.isEmpty == false && !ready {
-                    Button("Continue to Touch ID") { ready = true }.disabled(selecting || controller.phase != .review)
-                } else {
-                    Text(authenticationTitle).font(.headline)
-                    EmbeddedAuthentication(
-                        context: controller.context, onVisible: { Task { await controller.approve() } }
-                    )
-                    .frame(width: 32, height: 32)
-                }
+                Text(authenticationTitle).font(.headline)
+                EmbeddedAuthentication(
+                    context: controller.context, onVisible: { Task { await controller.approve() } }
+                )
+                .id(ObjectIdentifier(controller.context))
+                .frame(width: 32, height: 32)
             }
         }
         .onChange(of: controller.phase) { _, phase in
@@ -429,10 +431,12 @@ struct ApprovalDialogView: View {
         .padding(.top, 10).frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var authenticationTitle: String {
+    var cancelTitle: String { controller.phase == .stopped ? "Close" : "Cancel" }
+
+    var authenticationTitle: String {
         switch controller.phase {
-        case .review: "Preparing Touch ID"
-        case .authenticating: "Authorize with Touch ID"
+        case .review, .authenticating, .superseded: "Authorize with Touch ID"
+        case .authorizing: "Approving request"
         case .approved: "Request approved"
         case .stopped: "Request stopped"
         }
@@ -473,13 +477,17 @@ public final class ApprovalDialog: NSObject, NSWindowDelegate, ApprovalWindow {
         install(presentation)
     }
 
-    private func install(_ presentation: ApprovalPresentation) {
+    func install(_ presentation: ApprovalPresentation) {
         let window = self.window
-        window.contentView = NSHostingView(
-            rootView: ApprovalDialogView(
-                presentation: presentation, controller: controller,
-                close: { [weak window] in window?.performClose(nil) },
-                selectRoot: selectRoot == nil ? nil : { [weak self] root in await self?.choose(root) }))
+        let view = ApprovalDialogView(
+            presentation: presentation, controller: controller,
+            close: { [weak window] in window?.performClose(nil) },
+            selectRoot: selectRoot == nil ? nil : { [weak self] root in await self?.choose(root) })
+        if let host = window.contentView as? NSHostingView<ApprovalDialogView> {
+            host.rootView = view
+        } else {
+            window.contentView = NSHostingView(rootView: view)
+        }
     }
 
     private func choose(_ root: String?) async {
@@ -510,7 +518,7 @@ public final class ApprovalDialog: NSObject, NSWindowDelegate, ApprovalWindow {
     }
 
     public func windowWillClose(_ notification: Notification) {
-        if controller.phase == .stopped { backend.cancel() }
+        if controller.phase == .stopped || controller.phase == .superseded { backend.cancel() }
         controller.cancel()
         onClose?()
     }

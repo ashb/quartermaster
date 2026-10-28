@@ -102,11 +102,12 @@ import LocalAuthentication
             }
         }
     }
-    public enum Phase: Equatable { case review, authenticating, approved, stopped }
+    public enum Phase: Equatable { case review, authenticating, authorizing, superseded, approved, stopped }
     enum Failure: Error { case invalidAuthentication, reviewExpired }
     @Published public private(set) var phase: Phase = .review
     @Published public private(set) var detail = ""
     public var context: LAContext { authentication.context }
+    public var canChangeScope: Bool { phase == .review || phase == .authenticating }
     private let operation: Operation
     private let reason: String
     private let authentication: any ApprovalAuthentication
@@ -165,12 +166,13 @@ import LocalAuthentication
             let authenticated = try await authentication.authenticate(reason: reason)
             guard phase == .authenticating else { return }
             try checkTiming(requested: requested, authenticated: authenticated)
+            phase = .authorizing
             context.interactionNotAllowed = true
             try await prepared.perform(authenticated: authenticated, context: context) {
-                guard phase == .authenticating else { throw CancellationError() }
+                guard phase == .authorizing else { throw CancellationError() }
                 try checkTiming(requested: requested, authenticated: authenticated)
             }
-            guard phase == .authenticating else { return }
+            guard phase == .authorizing else { return }
             finish(.approved, detail: "Approval received.")
         } catch Failure.reviewExpired {
             finish(.stopped, detail: "This review has expired. Close it and review the request again.")
@@ -180,8 +182,9 @@ import LocalAuthentication
     }
 
     public func supersedeReview() -> Bool {
-        guard phase == .review else { return false }
-        phase = .stopped
+        guard canChangeScope else { return false }
+        phase = .superseded
+        timeout?.cancel()
         authentication.invalidate()
         return true
     }
@@ -189,7 +192,7 @@ import LocalAuthentication
     public func cancel() { finish(.stopped, detail: "Request cancelled.") }
 
     private func finish(_ phase: Phase, detail: String) {
-        guard self.phase != .approved, self.phase != .stopped else { return }
+        guard self.phase != .approved, self.phase != .stopped, self.phase != .superseded else { return }
         timeout?.cancel()
         authentication.invalidate()
         if phase == .stopped { operation.cancel() }

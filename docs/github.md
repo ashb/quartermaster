@@ -84,7 +84,7 @@ routes requests through its socket and leaves your usual `gh` configuration alon
 
 The first request opens the read-access dialog. Under **Authorize for**, choose
 **This shell** or **This request**. Review the caller, repository, credential and absolute
-expiry, then continue to Touch ID. Unlocking the cache and establishing the grant
+expiry, then approve with Touch ID. Unlocking the cache and establishing the grant
 can use the same fingerprint. If no shell root can be verified, only one-request
 approval is available.
 

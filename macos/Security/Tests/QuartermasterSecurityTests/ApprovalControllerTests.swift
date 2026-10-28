@@ -10,14 +10,14 @@ import Testing
     var failure = false
     var requests = 0
     var invalidations = 0
-    var onAuthenticate: (() -> Void)?
+    var onAuthenticate: (() throws -> Void)?
 
     init(timestamp: MonotonicTimestamp) { self.timestamp = timestamp }
 
     func authenticate(reason: String) async throws -> MonotonicTimestamp {
         requests += 1
         if failure { throw CancellationError() }
-        onAuthenticate?()
+        try onAuthenticate?()
         return timestamp
     }
 
@@ -321,12 +321,52 @@ func authenticationMustFinishBeforeTheOriginalReviewExpires(_ elapsed: Int) asyn
     #expect(backend.unlocks == 0)
 }
 
-@Test @MainActor func authenticationPreventsChangingTheReviewedScope() async {
+@Test(arguments: [false, true]) @MainActor
+func changingScopeWhileWaitingForTouchIDRejectsTheOldAuthentication(_ fails: Bool) async throws {
+    let storage = MemoryKeyStorage()
+    let keys = ApprovalKeyStore(storage: storage)
+    _ = try keys.loadOrCreate()
     let now = MonotonicTimestamp.now
     let authentication = AuthenticationFixture(timestamp: now)
-    let backend = UnlockBackendFixture(created: now)
-    let controller = ApprovalController(unlock: backend, reason: "test", authentication: authentication, now: { now })
-    authentication.onAuthenticate = { #expect(!controller.supersedeReview()) }
+    let backend = ApprovalBackendFixture(created: now)
+    let controller = ApprovalController(
+        backend: backend, reason: "Approve request", authentication: authentication, keys: keys, now: { now })
+    authentication.onAuthenticate = {
+        #expect(controller.supersedeReview())
+        if fails { throw CancellationError() }
+    }
     await controller.approve()
+
+    #expect(controller.phase == .superseded)
+    #expect(authentication.invalidations == 1)
+    #expect(backend.challenges == 0)
+    #expect(storage.signatures == 0)
+    #expect(backend.signatures.isEmpty)
+    #expect(backend.cancellations == 0)
+
+    let replacementAuthentication = AuthenticationFixture(timestamp: now)
+    let replacement = ApprovalController(
+        backend: backend, reason: "Approve new scope", authentication: replacementAuthentication,
+        keys: keys, now: { now })
+    await replacement.approve()
+    #expect(replacement.phase == .approved)
+    #expect(replacementAuthentication.requests == 1)
+    #expect(backend.signatures == [Data([1])])
+    #expect(backend.cancellations == 0)
+}
+
+@Test @MainActor func completedAuthenticationPreventsChangingTheReviewedScope() async throws {
+    let storage = MemoryKeyStorage()
+    let keys = ApprovalKeyStore(storage: storage)
+    _ = try keys.loadOrCreate()
+    let now = MonotonicTimestamp.now
+    let authentication = AuthenticationFixture(timestamp: now)
+    let backend = ApprovalBackendFixture(created: now)
+    let controller = ApprovalController(
+        backend: backend, reason: "Approve request", authentication: authentication, keys: keys, now: { now })
+    backend.onChallenge = { #expect(!controller.supersedeReview()) }
+    await controller.approve()
+    #expect(!controller.supersedeReview())
     #expect(controller.phase == .approved)
+    #expect(backend.signatures == [Data([1])])
 }
