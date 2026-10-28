@@ -154,6 +154,7 @@ final class BrokerConnection: BrokerClient, @unchecked Sendable {
 
 @MainActor
 final class BrokerPending: ApprovalBackend {
+    let reviewCreated: MonotonicTimestamp
     let client: any BrokerClient
     let id: String
     let request: DialogRequest
@@ -164,6 +165,7 @@ final class BrokerPending: ApprovalBackend {
 
     init(client: any BrokerClient, review: ApprovalReview) throws {
         workflow = try AuthorizationWorkflow(review: review, now: .now)
+        reviewCreated = review.created
         let id = review.id
         let bytes = review.request
         let request = try JSONDecoder().decode(DialogRequest.self, from: bytes)
@@ -206,6 +208,7 @@ final class BrokerPending: ApprovalBackend {
 
 @MainActor
 final class SettingsPending: ApprovalBackend {
+    let reviewCreated: MonotonicTimestamp
     private let client: any BrokerClient
     private let id: String
     private var workflow: SettingsWorkflow
@@ -214,6 +217,7 @@ final class SettingsPending: ApprovalBackend {
     init(client: any BrokerClient, review: SettingsReview) throws {
         guard let key = try ApprovalKeyStore().existingPublicKey() else { throw ApprovalKeyError.missingEnrolledKey }
         workflow = try SettingsWorkflow(review: review, expectedKey: key, now: .now)
+        reviewCreated = review.created
         self.client = client
         id = review.id
     }

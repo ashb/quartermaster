@@ -3,6 +3,7 @@ import Foundation
 import LocalAuthentication
 
 @MainActor public protocol ApprovalBackend: AnyObject {
+    var reviewCreated: MonotonicTimestamp { get }
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data
     func submit(_ signature: Data) async throws
     func cancel()
@@ -50,7 +51,7 @@ import LocalAuthentication
 
 @MainActor public final class ApprovalController: ObservableObject {
     public enum Phase: Equatable { case review, authenticating, approved, stopped }
-    enum Failure: Error { case invalidAuthentication }
+    enum Failure: Error { case invalidAuthentication, reviewExpired }
     @Published public private(set) var phase: Phase = .review
     @Published public private(set) var detail = ""
     public var context: LAContext { authentication.context }
@@ -89,8 +90,10 @@ import LocalAuthentication
             self?.finish(.stopped, detail: "Authentication timed out.")
         }
         do {
+            try checkReview(at: now())
             guard let publicKey = try keys.existingPublicKey() else { throw ApprovalKeyError.missingEnrolledKey }
             let requested = now()
+            try checkReview(at: requested)
             let authenticated = try await authentication.authenticate(reason: reason)
             guard phase == .authenticating else { return }
             try checkTiming(requested: requested, authenticated: authenticated)
@@ -103,6 +106,8 @@ import LocalAuthentication
             try await backend.submit(signature)
             guard phase == .authenticating else { return }
             finish(.approved, detail: "Approval received.")
+        } catch Failure.reviewExpired {
+            finish(.stopped, detail: "This review has expired. Close it and review the request again.")
         } catch {
             finish(.stopped, detail: "Approval failed. Request denied.")
         }
@@ -120,9 +125,16 @@ import LocalAuthentication
     }
 
     private func checkTiming(requested: MonotonicTimestamp, authenticated: MonotonicTimestamp) throws {
+        try checkReview(at: authenticated)
         guard !requested.isZero, authenticated >= requested,
             try authenticated.duration(since: requested) < .seconds(120),
             try now().duration(since: authenticated) < .seconds(30)
         else { throw Failure.invalidAuthentication }
+    }
+
+    private func checkReview(at timestamp: MonotonicTimestamp) throws {
+        guard !backend.reviewCreated.isZero,
+            let age = try? timestamp.duration(since: backend.reviewCreated), age < .seconds(120)
+        else { throw Failure.reviewExpired }
     }
 }

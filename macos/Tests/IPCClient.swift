@@ -27,6 +27,7 @@ func require(_ condition: Bool, _ message: String) throws {
 
 @MainActor
 final class IPCFixture: ApprovalBackend {
+    let reviewCreated = MonotonicTimestamp.now
     let config: FixtureConfig
     let connection: NSXPCConnection
     let keys: ApprovalKeyStore
