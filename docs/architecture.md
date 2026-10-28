@@ -208,8 +208,10 @@ The broker verifies the socket peer's running code through its kernel audit
 token. Displayed process ancestry is advisory context, with birth-time checks for observed
 PID reuse. It cannot establish a particular script or attached terminal session.
 When an ancestor cannot be fully inspected, the dialog shows its available name
-and PID as limited information and explains where inspection stopped. Partial
-observations never substitute for the socket peer's required identity checks.
+and PID as limited information. A bounded short-metadata walk can display earlier
+ancestors across an unreadable process, such as a root-owned login. Those rows
+remain advisory and cannot become grant choices. Partial observations never
+substitute for the socket peer's required identity checks.
 The local approval dialog shows observed arguments independently of CLI syntax
 or API classification. Quoting preserves argument boundaries and makes control
 characters and invisible formatting explicit. Environment values are excluded;
@@ -221,7 +223,9 @@ restriction remains in force. A readable shell can be the root even when macOS
 denies access to its login parent; children need no PTY. Root exec, including
 same-image exec, and root exit end reuse. Failed proof leaves per-use approval
 available without widening the grant. Approval offers the nearest proven shell,
-other proven shell ancestors and a one-request choice before authentication.
+other proven shell ancestors and a one-request choice in the process tree.
+Other processes remain visible but cannot be selected. App bundle icons and
+names aid recognition; executable paths remain available on hover.
 Each choice creates a new frozen review; the signed grant binds an explicit,
 versioned read-effect set and its original one-hour expiry. Access preferences
 show installed scopes and support selected or complete revocation.

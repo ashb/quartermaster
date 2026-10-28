@@ -211,7 +211,9 @@ final class BrokerPending: ApprovalBackend {
             request: bytes, role: review.provider.role, uid: geteuid(), now: Date())
         let apiRequest = try APIRequestReview.parse(request: bytes)
         let readScope = try ReadScopeReview.parse(request: bytes)
-        guard request.peer != nil, !request.processChain.isEmpty, request.processChain.count <= 6 else {
+        guard request.peer != nil, !request.processChain.isEmpty, request.processChain.count <= 32,
+            request.validProcessTree, readGrant.map({ request.canDisplay(root: $0.root) }) ?? true
+        else {
             throw BrokerFailure.invalidMessage
         }
         guard readGrant != nil || apiRequest != nil || readScope != nil else { throw BrokerFailure.invalidMessage }

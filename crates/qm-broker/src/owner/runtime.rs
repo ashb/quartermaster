@@ -1202,6 +1202,7 @@ mod tests {
                 ancestry_complete: true,
                 ancestry_note: None,
                 command_line: None,
+                processes: Vec::new(),
             },
         };
         let request = super::super::review::ReviewDocument::new(

@@ -55,6 +55,7 @@ public struct DialogPeer: Codable, Equatable {
     let ancestryComplete: Bool
     let ancestryNote: String?
     let commandLine: String?
+    var processes: [DialogProcess]? = nil
 }
 
 public struct DialogRequest: Codable, Equatable {
@@ -67,6 +68,19 @@ public struct DialogRequest: Codable, Equatable {
     public var origin: String? = nil
     public var peer: DialogPeer? = nil
 
+    public func canDisplay(root: ReadRootChoice) -> Bool {
+        peer?.processes?.contains {
+            !$0.limited && $0.pid == root.pid && $0.executable == root.executable
+        } == true
+    }
+
+    public var validProcessTree: Bool {
+        guard let peer, let processes = peer.processes else { return true }
+        return !processes.isEmpty && processes.count <= 32
+            && Set(processes.map(\.pid)).count == processes.count
+            && processes.last?.pid == peer.pid && processes.last?.executable == peer.executable
+            && processes.last?.limited == false
+    }
 }
 
 public struct ApprovalPresentation {
@@ -167,39 +181,6 @@ struct EmbeddedAuthentication: NSViewRepresentable {
     func updateNSView(_ view: EmbeddedAuthenticationHost, context: Context) {}
 }
 
-struct ReadScopeChoice: View {
-    let title: String
-    let root: ReadRootChoice?
-    let selected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                    .font(.title3)
-                    .foregroundStyle(selected ? Color.accentColor : .secondary)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(.body.weight(.medium))
-                    if let root {
-                        Text("\(URL(fileURLWithPath: root.executable).lastPathComponent) · PID \(String(root.pid))")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 16).frame(maxWidth: .infinity, minHeight: 56)
-            .background(selected ? Color.accentColor.opacity(0.1) : Color.clear, in: Capsule())
-            .overlay(Capsule().strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.4)))
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .help(root?.executable ?? "Approve only this request")
-        .accessibilityValue(selected ? "Selected" : "Not selected")
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-}
-
 struct ApprovalDialogView: View {
     let presentation: ApprovalPresentation
     @ObservedObject var controller: ApprovalController
@@ -212,7 +193,7 @@ struct ApprovalDialogView: View {
     @State private var showsPeer = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 14) {
                 Image(systemName: "key.horizontal.fill")
                     .font(.system(size: 23)).foregroundStyle(.white)
@@ -260,48 +241,35 @@ struct ApprovalDialogView: View {
                 }
             }
 
-            if let scope = presentation.readScope {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Authorize for").font(.subheadline.weight(.semibold))
-                    if !scope.roots.isEmpty, let selectRoot {
-                        let choices = LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                            ReadScopeChoice(title: "This request", root: nil, selected: presentation.readGrant == nil) {
-                                choose(nil, using: selectRoot)
-                            }
-                            ForEach(Array(scope.roots.enumerated()), id: \.element.id) { index, root in
-                                ReadScopeChoice(
-                                    title: index == 0 ? "This shell" : "Parent shell", root: root,
-                                    selected: presentation.readGrant?.root.id == root.id
-                                ) {
-                                    choose(root.id, using: selectRoot)
-                                }
-                            }
-                        }.disabled(selecting || !controller.canChangeScope)
-                        if scope.roots.count < 6 {
-                            choices
-                        } else {
-                            ScrollView(.vertical) { choices }.frame(height: 184)
-                        }
+            VStack(alignment: .leading, spacing: 8) {
+                Text(presentation.readScope == nil ? "Process tree" : "Authorize for")
+                    .font(.subheadline.weight(.semibold))
+                if let peer = presentation.request.peer, let processes = peer.processes {
+                    ProcessScopeTree(
+                        rows: ProcessTreeRow.make(
+                            processes: processes, peerPID: peer.pid,
+                            roots: presentation.readScope?.roots ?? [],
+                            allowsSelection: presentation.readScope != nil),
+                        selection: presentation.readGrant.map { .root($0.root.id) } ?? .request,
+                        enabled: selectRoot != nil && !selecting && controller.canChangeScope,
+                        ancestryNote: presentation.ancestryNotice
+                    ) { choice in
+                        if let selectRoot { choose(choice.rootID, using: selectRoot) }
                     }
-                    if presentation.readGrant != nil {
-                        Text("List and read issues from this shell's descendants using the same caller executable.")
-                    } else {
-                        Text("This issue read only. Later requests need approval.")
+                } else {
+                    ForEach(Array(presentation.request.processChain.enumerated()), id: \.offset) { index, process in
+                        Text(verbatim: process).font(.system(.body, design: .monospaced))
+                            .padding(.leading, CGFloat(index) * 14)
+                            .help(index == 0 ? presentation.ancestryNotice ?? "" : "")
                     }
-                }.font(.caption)
-            }
-
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Process tree").font(.subheadline.weight(.semibold))
-                ForEach(Array(presentation.request.processChain.enumerated()), id: \.offset) {
-                    index, process in
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: index == 0 ? "terminal" : "arrow.turn.down.right").foregroundStyle(.secondary)
-                        Text(verbatim: process).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                    }.padding(.leading, CGFloat(index) * 14)
                 }
-                if let notice = presentation.ancestryNotice {
-                    Text(verbatim: notice).font(.caption).foregroundStyle(.secondary)
+                if presentation.readScope != nil {
+                    Text(
+                        presentation.readGrant == nil
+                            ? "This issue read only. Later requests need approval."
+                            : "List and read issues from this shell's descendants using the same caller executable."
+                    )
+                    .font(.caption).frame(height: 28, alignment: .topLeading)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

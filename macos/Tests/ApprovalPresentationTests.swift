@@ -105,6 +105,96 @@ private func approvalPresentation(
     #expect(presentation.ancestryNotice == nil)
 }
 
+@Test func processRowsOnlyOfferMatchingVerifiedRootsAndTheRequestLeaf() throws {
+    let root = try JSONDecoder().decode(
+        ReadRootChoice.self,
+        from: Data(
+            #"{"id":"20:0000000000000001:00000001","pid":20,"executable":"/bin/zsh"}"#.utf8))
+    let processes = [
+        DialogProcess(pid: 10, name: "login", executable: "/usr/bin/login", limited: true),
+        DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false),
+        DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false),
+    ]
+    let rows = ProcessTreeRow.make(processes: processes, peerPID: 30, roots: [root], allowsSelection: true)
+    #expect(rows.map(\.choice) == [nil, .root(root.id), .request])
+    #expect(rows.map(\.label) == ["", "This shell", "This request"])
+    #expect(rows[0].help.contains("Limited process information."))
+    #expect(rows[0].help.contains("/usr/bin/login"))
+    #expect(!rows[1].help.contains("Limited process information."))
+    for process in [
+        DialogProcess(pid: 20, name: "zsh", executable: "/other/zsh", limited: false),
+        DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: true),
+    ] {
+        #expect(
+            ProcessTreeRow.make(processes: [process], peerPID: 30, roots: [root], allowsSelection: true)[0].choice
+                == nil)
+    }
+    #expect(
+        ProcessTreeRow.make(processes: processes, peerPID: 30, roots: [root], allowsSelection: false).allSatisfy {
+            $0.choice == nil
+        })
+}
+
+@Test @MainActor func deepProcessTreesScrollWithoutGrowingTheDialog() {
+    func tree(count: UInt32) -> NSHostingView<some View> {
+        let processes = (1...count).map {
+            DialogProcess(pid: $0, name: "zsh", executable: "/bin/zsh", limited: false)
+        }
+        return NSHostingView(
+            rootView: ProcessScopeTree(
+                rows: ProcessTreeRow.make(processes: processes, peerPID: count, roots: [], allowsSelection: true),
+                selection: .request, enabled: true, choose: { _ in }
+            ).frame(width: 492))
+    }
+    #expect(tree(count: 4).fittingSize == tree(count: 32).fittingSize)
+}
+
+@Test func appBundleLookupUsesTheContainingApplicationAndIgnoresOrdinaryExecutables() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let app = directory.appendingPathComponent("Example.app")
+    let executable = app.appendingPathComponent("Contents/MacOS/helper")
+    try FileManager.default.createDirectory(
+        at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try PropertyListSerialization.data(
+        fromPropertyList: ["CFBundlePackageType": "APPL", "CFBundleName": "Example"], format: .xml, options: 0
+    )
+    .write(to: app.appendingPathComponent("Contents/Info.plist"))
+    #expect(ProcessApplication(executable: executable.path)?.name == "Example")
+    #expect(ProcessApplication(executable: "/bin/zsh") == nil)
+    #expect(ProcessApplication(executable: nil) == nil)
+}
+
+@Test func malformedTreesAndMissingSelectedRootsCannotBePresentedAsValidGrants() throws {
+    let root = try JSONDecoder().decode(
+        ReadRootChoice.self,
+        from: Data(
+            #"{"id":"20:0000000000000001:00000001","pid":20,"executable":"/bin/zsh"}"#.utf8))
+    let shell = DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false)
+    let leaf = DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false)
+    var request = try approvalPresentation(ancestryComplete: true).request
+    request.peer?.processes = [shell, leaf]
+    #expect(request.validProcessTree)
+    #expect(request.canDisplay(root: root))
+    for rows in [
+        [], [shell], [shell, leaf, leaf],
+        [shell, DialogProcess(pid: 30, name: "gh", executable: "/other/gh", limited: false)],
+        [shell, DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: true)],
+        (100...131).map { DialogProcess(pid: $0, name: "ancestor", executable: "/bin/zsh", limited: false) } + [leaf],
+    ] {
+        request.peer?.processes = rows
+        #expect(!request.validProcessTree)
+    }
+    for rows in [
+        [leaf],
+        [DialogProcess(pid: 20, name: "zsh", executable: "/other/zsh", limited: false), leaf],
+        [DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: true), leaf],
+    ] {
+        request.peer?.processes = rows
+        #expect(!request.canDisplay(root: root))
+    }
+}
+
 @MainActor private final class ScopeReviewBackend: ApprovalBackend {
     let reviewCreated = MonotonicTimestamp.now
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {
@@ -163,11 +253,24 @@ private func approvalPresentation(
         "id": "123:0000000000000001:00000001", "pid": 123,
         "executable": "/nix/store/example-zsh/bin/zsh",
     ]
+    let parent: [String: Any] = [
+        "id": "100:0000000000000002:00000001", "pid": 100,
+        "executable": "/bin/bash",
+    ]
     var request: [String: Any] = [
         "repository": "quartermaster/one", "repositoryId": 123,
         "method": "GET", "path": path, "body": "",
         "origin": "https://api.github.com", "processChain": ["zsh", "gh"],
-        "peer": ["cdHash": String(repeating: "1", count: 40)], "readRoots": [root],
+        "peer": [
+            "cdHash": String(repeating: "1", count: 40), "pid": 200, "executable": "/bin/gh",
+            "signingIdentifier": "gh", "adHoc": false, "ancestryComplete": false,
+            "processes": [
+                ["pid": 50, "name": "login", "executable": "/usr/bin/login", "limited": true],
+                ["pid": 100, "name": "bash", "executable": "/bin/bash", "limited": false],
+                ["pid": 123, "name": "zsh", "executable": "/nix/store/example-zsh/bin/zsh", "limited": false],
+                ["pid": 200, "name": "gh", "executable": "/bin/gh", "limited": false],
+            ],
+        ], "readRoots": [root, parent],
         "application": [
             "version": "quartermaster.github-request.v1", "complete": true, "effects": [effect],
             "requestedRepository": "quartermaster/one",
@@ -178,11 +281,8 @@ private func approvalPresentation(
     let provider = try approvalPresentation().provider
     let controller = ApprovalController(backend: ScopeReviewBackend(), reason: "Test scope layout")
     func view(_ bytes: Data) throws -> NSHostingView<ApprovalDialogView> {
-        var display = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
-        display.removeValue(forKey: "peer")
         let presentation = ApprovalPresentation(
-            request: try JSONDecoder().decode(
-                DialogRequest.self, from: JSONSerialization.data(withJSONObject: display)),
+            request: try JSONDecoder().decode(DialogRequest.self, from: bytes),
             provider: provider,
             readGrant: try ReadGrantReview.parse(
                 request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000)),
@@ -193,16 +293,18 @@ private func approvalPresentation(
                 presentation: presentation, controller: controller, close: {}, selectRoot: { _ in }))
     }
     let once = try view(JSONSerialization.data(withJSONObject: request))
-    request["authorization"] = [
-        "purpose": "quartermaster.read-grant.v2",
-        "grant": [
-            "id": String(repeating: "a", count: 32), "uid": 501,
-            "codeHash": String(repeating: "1", count: 40), "root": root,
-            "effects": ["version": 1, "effects": ["listIssues", "readIssue"]],
-            "repository": "quartermaster/one", "role": "github-write", "expiresUnix": 4600,
-        ],
-    ]
-    let shell = try view(JSONSerialization.data(withJSONObject: request))
-    #expect(once.fittingSize.height > 0)
-    #expect(once.fittingSize == shell.fittingSize)
+    for selected in [root, parent] {
+        request["authorization"] = [
+            "purpose": "quartermaster.read-grant.v2",
+            "grant": [
+                "id": String(repeating: "a", count: 32), "uid": 501,
+                "codeHash": String(repeating: "1", count: 40), "root": selected,
+                "effects": ["version": 1, "effects": ["listIssues", "readIssue"]],
+                "repository": "quartermaster/one", "role": "github-write", "expiresUnix": 4600,
+            ],
+        ]
+        let shell = try view(JSONSerialization.data(withJSONObject: request))
+        #expect(once.fittingSize.height > 0)
+        #expect(once.fittingSize == shell.fittingSize)
+    }
 }
