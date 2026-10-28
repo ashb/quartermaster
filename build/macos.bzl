@@ -7,13 +7,14 @@ def _quartermaster_app_impl(ctx):
     archive = frontend[AppleBundleInfo].archive
     app = ctx.actions.declare_directory("Quartermaster.app")
     ctx.actions.run_shell(
-        inputs = [archive, ctx.executable.backend, ctx.file.backend_info],
+        inputs = [archive, ctx.executable.backend, ctx.file.backend_info, ctx.executable.cli],
         outputs = [app],
         arguments = [
             archive.path,
             ctx.executable.backend.path,
             ctx.file.backend_info.path,
             app.path,
+            ctx.executable.cli.path,
         ],
         command = """
 set -eu
@@ -31,6 +32,7 @@ backend="$4/Contents/Helpers/QuartermasterBackend.app"
 mkdir -p "$backend/Contents/MacOS"
 /usr/bin/install -m 755 "$2" "$backend/Contents/MacOS/quartermasterd"
 /usr/bin/install -m 644 "$3" "$backend/Contents/Info.plist"
+/usr/bin/install -m 755 "$5" "$4/Contents/MacOS/qm"
 /usr/bin/codesign --remove-signature "$4"
 rm -rf "$4/Contents/_CodeSignature"
 """,
@@ -64,6 +66,7 @@ quartermaster_app = rule(
         "frontend": attr.label(providers = [AppleBundleInfo], mandatory = True),
         "backend": attr.label(executable = True, cfg = "target", mandatory = True),
         "backend_info": attr.label(allow_single_file = [".plist"], mandatory = True),
+        "cli": attr.label(executable = True, cfg = "target", mandatory = True),
     },
 )
 

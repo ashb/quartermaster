@@ -15,3 +15,6 @@ libc = "0.2.190"
 [[bin]]
 name = "quartermasterd"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

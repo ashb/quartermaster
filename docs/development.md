@@ -29,6 +29,11 @@ flows requires a signed build; see below. `just fmt` applies Rust formatting,
 and `just check` checks Rust formatting, Clippy, Swift formatting and BUILD files.
 To run only Rust tests, use `just test //crates/... //bins/...`.
 
+The app includes `Contents/MacOS/qm`. Add that directory to `PATH`, or symlink
+that executable onto your path, to use `qm run gh -- …`. The CLI finds its bundled
+backend through its resolved executable location; the standalone Bazel binary
+can show help but must be bundled to run commands. See [GitHub usage](github.md#make-a-request).
+
 Bazel is the build and test system. Edit Cargo manifests for Rust dependencies,
 update `Cargo.lock`, then run `bazelisk run //:gazelle` after dependency or source
 changes. Review the generated BUILD changes before committing. `just fetch`

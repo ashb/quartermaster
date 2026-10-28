@@ -1860,6 +1860,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qm"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "qm-api-github"
 version = "0.0.0"
 dependencies = [
@@ -1957,6 +1967,7 @@ dependencies = [
  "libc",
  "qm-broker",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

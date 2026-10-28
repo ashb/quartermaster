@@ -1,0 +1,26 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+rust_binary(
+    name = "qm",
+    srcs = [
+        "src/main.rs",
+        "src/paths.rs",
+    ],
+    compile_data = ["Cargo.toml"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:libc",
+        "@crates//:serde_json",
+        "@crates//:tempfile",
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "qm_test",
+    compile_data = ["Cargo.toml"],
+    crate = ":qm",
+    edition = "2024",
+    deps = ["@crates//:libc"],
+)

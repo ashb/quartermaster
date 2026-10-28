@@ -20,5 +20,8 @@ rust_binary(
 
 rust_test(
     name = "quartermasterd_test",
+    compile_data = ["Cargo.toml"],
     crate = ":quartermasterd",
+    edition = "2024",
+    deps = ["@crates//:tempfile"],
 )

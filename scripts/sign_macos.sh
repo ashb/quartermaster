@@ -104,9 +104,10 @@ for role in frontend backend; do
     /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $team" "$entitlements"
 done
 if [ "$check_profiles" = true ]; then exit 0; fi
+/usr/bin/codesign --force --options runtime --timestamp=none --sign "$certificate_sha1" "$bundle/Contents/MacOS/qm"
 /usr/bin/codesign --force --options runtime --timestamp=none --sign "$certificate_sha1" --entitlements "$temporary/backend.entitlements" "$backend"
 /usr/bin/codesign --force --options runtime --timestamp=none --sign "$certificate_sha1" --entitlements "$temporary/frontend.entitlements" "$bundle"
-uv run --offline --no-project python "$repository/scripts/signing_identity.py" verify "$certificate_sha256" "$backend" "$bundle"
+uv run --offline --no-project python "$repository/scripts/signing_identity.py" verify "$certificate_sha256" "$bundle/Contents/MacOS/qm" "$backend" "$bundle"
 for role in frontend backend; do
     if [ "$role" = frontend ]; then
         app=$bundle

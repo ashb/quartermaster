@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/qm-types", "crates/qm-providers", "crates/qm-macos", "crates/qm-broker", "crates/qm-api-github", "bins/quartermasterd"]
+members = ["crates/qm-types", "crates/qm-providers", "crates/qm-macos", "crates/qm-broker", "crates/qm-api-github", "bins/quartermasterd", "bins/qm"]
 resolver = "3"
 
 [workspace.package]

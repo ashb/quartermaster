@@ -31,6 +31,7 @@ quartermaster_app(
     name = "Quartermaster",
     backend = "//bins/quartermasterd:quartermasterd",
     backend_info = "//macos/Quartermaster:Backend-Info.plist",
+    cli = "//bins/qm:qm",
     frontend = ":frontend",
 )
 

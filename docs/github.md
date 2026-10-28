@@ -43,8 +43,6 @@ Choose the repository by name:
 
 ```sh
 QM_REPOSITORY=owner/repository
-QM_DATA="$HOME/Library/Application Support/Quartermaster/Development"
-QM_GH_CONFIG="$QM_DATA/gh"
 ```
 
 Open **Settings → GitHub**, enable GitHub mediation, and add the repository's
@@ -70,17 +68,31 @@ request reaches whichever repository GitHub serves under that name at dispatch.
 
 ## Make a request
 
-Using the variables above, list issues:
+The app bundles a `qm` command. From the repository root, put the signed build's
+commands on your shell's path:
 
 ```sh
-GH_CONFIG_DIR="$QM_GH_CONFIG" GH_TOKEN=quartermaster-local-only GH_PROMPT_DISABLED=1 \
-  gh api --hostname github.com --method GET -H 'Accept: application/vnd.github+json' \
+export PATH="$PWD/target/macos/signed/Quartermaster.app/Contents/MacOS:$PATH"
+```
+
+Using the repository variable above, list issues:
+
+```sh
+qm run gh -- api --hostname github.com --method GET -H 'Accept: application/vnd.github+json' \
   "repos/$QM_REPOSITORY/issues?state=all&per_page=30" --paginate
 ```
 
-The token in this command is a dummy value for `gh`'s local authentication check.
-Quartermaster adds the actual vault token upstream. The isolated configuration
-routes requests through its socket and leaves your usual `gh` configuration alone.
+`qm run gh --` starts the bundled backend if needed and passes the remaining
+arguments directly to `gh` on your path. It creates a private temporary
+configuration pointing at Quartermaster's socket and supplies a dummy token for
+`gh`'s local authentication check. Quartermaster adds the real vault token upstream.
+Your normal `gh` configuration, shell environment and `GH_HOST` remain unchanged.
+
+The wrapper preserves standard input, output and error, and returns `gh`'s exit
+status. It removes its temporary configuration after exit, failed launch or
+handled interruption; SIGKILL cannot run cleanup. It leaves the shared backend
+running. This configures `gh`'s HTTP client, not Git subprocesses or arbitrary
+extensions with their own network clients.
 
 The first request opens the read-access dialog. Under **Authorize for**, choose
 **This shell** or **This request**. Review the caller, repository, credential and absolute
@@ -92,8 +104,7 @@ Read an individual issue by setting its number:
 
 ```sh
 QM_ISSUE=1
-GH_CONFIG_DIR="$QM_GH_CONFIG" GH_TOKEN=quartermaster-local-only GH_PROMPT_DISABLED=1 \
-  gh api --hostname github.com --method GET -H 'Accept: application/vnd.github+json' \
+qm run gh -- api --hostname github.com --method GET -H 'Accept: application/vnd.github+json' \
   "repos/$QM_REPOSITORY/issues/$QM_ISSUE" --jq '.number, .title, .state'
 ```
 
@@ -135,11 +146,10 @@ covers this request only. Only authentication and HTTP framing are replaced;
 application headers, query and body are preserved. Redirects need authorization
 again, and uncertain delivery is never retried automatically.
 
-For example, with this opt-in and the isolated configuration above:
+For example, with this opt-in:
 
 ```sh
-GH_CONFIG_DIR="$QM_GH_CONFIG" GH_TOKEN=quartermaster-local-only GH_PROMPT_DISABLED=1 \
-  gh api --hostname github.com --method GET rate_limit
+qm run gh -- api --hostname github.com --method GET rate_limit
 ```
 
 This request uses fresh one-use approval even if an issue-read grant exists.

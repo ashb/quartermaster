@@ -1,8 +1,9 @@
 use serde_json::json;
 use std::{
     ffi::CStr,
-    fs::{self, DirBuilder, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Write},
+    os::fd::AsRawFd,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     process::{Command, Stdio},
@@ -69,6 +70,7 @@ impl Paths {
     }
 
     fn stop(&self) -> io::Result<()> {
+        let _lock = exclusive_lock(&self.root.join("startup.lock"))?;
         Command::new("/bin/launchctl")
             .args(["bootout", &self.destination()])
             .stdout(Stdio::null())
@@ -78,6 +80,7 @@ impl Paths {
     }
 
     fn start(&self) -> io::Result<()> {
+        let _lock = exclusive_lock(&self.root.join("startup.lock"))?;
         if Command::new("/bin/launchctl")
             .args(["print", &self.destination()])
             .stdout(Stdio::null())
@@ -132,8 +135,8 @@ impl Paths {
     }
 }
 
-fn private_write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
+fn private_file(path: &std::path::Path) -> io::Result<File> {
+    let file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
@@ -148,6 +151,19 @@ fn private_write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     {
         return Err(failure("unsafe development file"));
     }
+    Ok(file)
+}
+
+fn exclusive_lock(path: &std::path::Path) -> io::Result<File> {
+    let file = private_file(path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+fn private_write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = private_file(path)?;
     file.set_len(0)?;
     file.write_all(bytes)
 }
@@ -174,5 +190,53 @@ pub fn run() -> io::Result<()> {
         _ => Err(failure(
             "usage: quartermasterd start|restart|stop|serve|cache-status",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn concurrent_starters_recheck_state_under_one_exclusive_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup.lock");
+        let starters = Arc::new(Barrier::new(2));
+        let registrations = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let starters = Arc::clone(&starters);
+                let registrations = Arc::clone(&registrations);
+                let path = &path;
+                scope.spawn(move || {
+                    starters.wait();
+                    let _lock = exclusive_lock(path).unwrap();
+                    if registrations.load(Ordering::SeqCst) == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        registrations.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(registrations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn startup_lock_rejects_symlinks_and_public_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lock");
+        let target = directory.path().join("target");
+        fs::write(&target, b"retain").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(exclusive_lock(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(exclusive_lock(&path).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"retain");
     }
 }
