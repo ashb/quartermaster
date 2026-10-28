@@ -107,7 +107,7 @@ public final class SettingsEditor: ObservableObject {
                 snapshot.state == "unavailable"
                 ? "Protected settings are unavailable. Reconnect to retry."
                 : snapshot.migration != nil
-                    ? "Review and approve the import before Quartermaster can use your previous settings."
+                    ? "Import your previous settings or discard them before configuring Quartermaster."
                     : "Changes take effect only after you review and approve them with Touch ID."
         }
     }
@@ -150,12 +150,18 @@ public final class SettingsEditor: ObservableObject {
             ))
     }
 
-    public func reviewMigration() async throws -> SettingsReview {
+    public func reviewMigration(_ action: SettingsMigrationAction = .importSettings) async throws -> SettingsReview {
         guard canImport, let migration = snapshot?.migration else { throw BrokerControlError.unavailable }
-        return try await prepareReview(.prepareSettingsImport(id: migration.source.id), expectedMigration: migration)
+        let command: BrokerCommand =
+            action == .importSettings
+            ? .prepareSettingsImport(id: migration.source.id) : .prepareSettingsDiscard(id: migration.source.id)
+        return try await prepareReview(command, expectedMigration: migration, action: action)
     }
 
-    private func prepareReview(_ command: BrokerCommand, expectedMigration: SettingsMigration? = nil) async throws
+    private func prepareReview(
+        _ command: BrokerCommand, expectedMigration: SettingsMigration? = nil,
+        action: SettingsMigrationAction = .importSettings
+    ) async throws
         -> SettingsReview
     {
         let generation = generation
@@ -171,7 +177,9 @@ public final class SettingsEditor: ObservableObject {
         if let expected = expectedMigration {
             let document = try? JSONDecoder().decode(SettingsDocument.self, from: review.document)
             guard document?.migration == expected.source, document?.previous.revision == expected.revision,
-                document?.proposed.settings == expected.settings, document?.proposed.provider == expected.provider
+                document?.proposed.settings == (action == .importSettings ? expected.settings : BrokerSettings()),
+                document?.proposed.provider == (action == .importSettings ? expected.provider : nil),
+                document?.additions == nil
             else {
                 _ = try? await call(.settingsCancel(id: review.id))
                 throw BrokerControlError.invalidMessage
@@ -212,7 +220,8 @@ public final class SettingsEditor: ObservableObject {
     }
 
     public func canAddRepository(_ value: String) -> Bool {
-        guard !busy, available, let name = RepositoryName(fullName: value), let github = draft.github,
+        guard !busy, available, snapshot?.migration == nil, let name = RepositoryName(fullName: value),
+            let github = draft.github,
             github.repositories.count + pendingRepositories.count < 64,
             !pendingRepositories.contains(where: { $0.id == name.id }),
             !github.repositories.contains(where: { "\($0.owner)/\($0.name)".lowercased() == name.id })

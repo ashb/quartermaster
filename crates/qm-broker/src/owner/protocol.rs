@@ -48,6 +48,9 @@ pub(super) enum Client {
     PrepareSettingsImport {
         id: String,
     },
+    PrepareSettingsDiscard {
+        id: String,
+    },
     StageEnrollment {
         server: String,
         email: String,
@@ -82,6 +85,7 @@ impl Client {
             Self::SettingsRegister { .. }
                 | Self::SettingsStatus {}
                 | Self::PrepareSettingsImport { .. }
+                | Self::PrepareSettingsDiscard { .. }
                 | Self::StageEnrollment { .. }
                 | Self::PrepareSettings { .. }
                 | Self::SettingsPresence { .. }

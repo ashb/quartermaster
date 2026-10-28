@@ -102,3 +102,31 @@ import Testing
     #expect(!application.preferences.canImport)
     #expect(application.status == "Connected")
 }
+
+@MainActor private final class MigrationWindow: NSWindow {
+    private(set) var closeRequests = 0
+    override func performClose(_ sender: Any?) { closeRequests += 1 }
+}
+
+@Test @MainActor func postponingMigrationClosesItsSettingsWindowAndPreservesTheCandidate() async throws {
+    let snapshot = try JSONDecoder().decode(
+        SettingsSnapshot.self,
+        from: Data(
+            #"{"state":"migrationRequired","revision":4,"session":"AQEBAQEBAQEBAQEBAQEBAQ==","settings":null,"provider":null,"migration":{"source":{"id":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","fromFormat":"unsignedV1","toFormat":"signedV1"},"revision":4,"settings":{"github":null,"mutations":"deny"},"provider":null}}"#
+                .utf8))
+    var commands = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { throw CancellationError() })
+    application.preferences = SettingsEditor { _ in
+        commands += 1
+        return .settingsStatus(snapshot)
+    }
+    await application.preferences.load()
+    let window = MigrationWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: true)
+    application.settingsOpened(window)
+    application.postponeMigration()
+    #expect(window.closeRequests == 1)
+    #expect(application.preferences.snapshot?.migration == snapshot.migration)
+    #expect(!application.preferences.canReview)
+    #expect(commands == 1)
+}

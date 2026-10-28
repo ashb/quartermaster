@@ -9,7 +9,7 @@ struct SettingsMigrationView: View {
             Label("Import your previous settings", systemImage: "arrow.down.document")
                 .font(.title2.weight(.semibold))
             Text(
-                "Quartermaster's settings format has changed. Review your previous settings and approve their import with Touch ID before this version can use them."
+                "Quartermaster's settings format has changed. Import your previous settings or discard them and start afresh. Both choices require Touch ID."
             )
             PreferencesGroup(title: "Previous vault") {
                 if let provider = migration.provider {
@@ -38,7 +38,7 @@ struct SettingsMigrationView: View {
                         ? "Recognized mutations: denied" : "Recognized mutations: fingerprint per use")
             }
             Text(
-                "Nothing changes until you choose Import and Trust. You can close Settings and import later; your previous settings and encrypted cache will remain intact."
+                "Choose Later to close Settings without deciding. Your previous settings stay inactive, and editing is blocked until you import or discard them. Discarding keeps the encrypted cache but selects no vault or access rules."
             )
             .font(.callout).foregroundStyle(.secondary)
         }.textSelection(.enabled)

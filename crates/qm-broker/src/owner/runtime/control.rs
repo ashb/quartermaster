@@ -56,6 +56,7 @@ pub(super) fn handle(
         Client::SettingsRegister { .. }
         | Client::SettingsStatus {}
         | Client::PrepareSettingsImport { .. }
+        | Client::PrepareSettingsDiscard { .. }
         | Client::StageEnrollment { .. }
         | Client::PrepareSettings { .. }
         | Client::SettingsPresence { .. }

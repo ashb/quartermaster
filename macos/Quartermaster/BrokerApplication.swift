@@ -13,6 +13,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private var active: (any ApprovalWindow)?
     private var presentation: Int32?
     private var settingsIsOpen = false
+    private weak var settingsWindow: NSWindow?
     private var operationEnrolled = false
     private var connectionPhase: ConnectionPhase = .disconnected
     private let setActivationPolicy: (NSApplication.ActivationPolicy) -> Void
@@ -141,14 +142,14 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func reviewPreferences() {
-        reviewSettings(importing: false)
+        reviewSettings(migration: nil)
     }
 
-    func reviewMigration() {
-        reviewSettings(importing: true)
+    func reviewMigration(_ action: SettingsMigrationAction) {
+        reviewSettings(migration: action)
     }
 
-    private func reviewSettings(importing: Bool) {
+    private func reviewSettings(migration: SettingsMigrationAction?) {
         if let active {
             active.show(centred: false)
             return
@@ -166,15 +167,16 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 var reviewID: String?
                 do {
                     let review: SettingsReview
-                    if importing {
-                        review = try await preferences.reviewMigration()
+                    if let migration {
+                        review = try await preferences.reviewMigration(migration)
                     } else {
                         review = try await preferences.review()
                     }
                     reviewID = review.id
                     let pending = try SettingsPending(client: client, review: review)
                     presentation = try DialogPresentationLease.acquire()
-                    let dialog = SettingsApprovalDialog(review: review, document: pending.document, backend: pending)
+                    let dialog = SettingsApprovalDialog(
+                        review: review, document: pending.document, backend: pending, migration: migration)
                     present(dialog, settings: true)
                 } catch {
                     if let reviewID { _ = try? await client.call(.settingsCancel(id: reviewID)) }
@@ -199,18 +201,25 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         Task { await controls.perform { await preferences.cancel() } }
     }
 
-    func settingsOpened() {
+    func settingsOpened(_ window: NSWindow) {
+        settingsWindow = window
         settingsIsOpen = true
         updateActivationPolicy()
         connectIfNeeded()
     }
 
     func settingsClosed() {
+        settingsWindow = nil
         settingsIsOpen = false
         (active as? SettingsApprovalDialog)?.cancel()
         updateActivationPolicy()
         preferences.discardDraft()
         Task { await preferences.cancel() }
+    }
+
+    func postponeMigration() {
+        guard preferences.snapshot?.migration != nil else { return }
+        settingsWindow?.performClose(nil)
     }
 
     private func updateActivationPolicy() {

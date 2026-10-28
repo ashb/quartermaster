@@ -55,10 +55,13 @@ but grants no settings or provider authority.
 
 Recognised older settings formats produce an inactive migration candidate, never
 an empty configured state. Preserve the source and its revision until the user
-reviews and signs the complete import. Bind the source format and digest into
-that review, and reject publication if the source changes. Cancel, expiry and
-restart preserve the pending import; a successful signed import loads normally
-without another migration. Unknown or damaged formats fail explicitly rather
+reviews and signs either the complete import or a disabled replacement with no
+selected provider. Bind the source format and digest into either review, and
+reject publication if the source changes. Discarding settings retains encrypted
+cache files and keys and must work without opening the old cache. Until either
+choice is published, ordinary settings edits remain blocked. Later, Cancel,
+expiry and restart preserve the pending migration; a signed resolution loads
+normally without another migration. Unknown or damaged formats fail explicitly rather
 than falling back to defaults or discovering authority from cache files.
 
 Saving reviewed repository names may perform fixed GitHub metadata GETs using

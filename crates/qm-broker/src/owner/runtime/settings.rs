@@ -243,8 +243,11 @@ pub(super) fn message(
     let paths = paths.clone();
     let cleanup_shared = Arc::clone(&shared);
     let cleanup_peer = peer.clone();
-    // Failed import preparation installs no pending state and owns no cleanup.
-    let cancel_on_error = !matches!(&request, Client::PrepareSettingsImport { .. });
+    // Failed migration preparation installs no pending state and owns no cleanup.
+    let cancel_on_error = !matches!(
+        &request,
+        Client::PrepareSettingsImport { .. } | Client::PrepareSettingsDiscard { .. }
+    );
     let cleanup_id = match &request {
         Client::SettingsPresence { id, .. } | Client::SettingsProof { id, .. } => Some(id.clone()),
         _ => None,
@@ -263,6 +266,9 @@ pub(super) fn message(
                 Client::SettingsStatus {} => status(&shared, &paths, peer.id()),
                 Client::PrepareSettingsImport { id } => {
                     import::prepare(&id, &peer, &shared, &paths)
+                }
+                Client::PrepareSettingsDiscard { id } => {
+                    import::discard(&id, &peer, &shared, &paths)
                 }
                 Client::SettingsRegister { public_key } => {
                     register(&public_key, &peer, &shared, &paths)

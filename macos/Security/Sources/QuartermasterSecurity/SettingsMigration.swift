@@ -1,5 +1,9 @@
 import Foundation
 
+public enum SettingsMigrationAction: Equatable, Sendable {
+    case importSettings, discard
+}
+
 public struct SettingsMigrationSource: Codable, Equatable, Sendable {
     public enum Format: String, Codable, Sendable { case unsignedV1, signedV1 }
     public let id: String

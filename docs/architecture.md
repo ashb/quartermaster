@@ -42,8 +42,11 @@ for the commit and cancellation boundary.
 
 When a supported settings format needs migration, Settings explains the change
 and offers the previous vault selection and rules for review. **Import and Trust**
-uses the normal Touch ID approval flow; closing the review leaves the source
-intact and inactive. Format decoders produce a versioned import candidate for
+uses the normal Touch ID approval flow. **Discard** requires approval to start
+afresh with no vault selected or GitHub access enabled, keeping encrypted cache
+files and keys. **Later** closes Settings and leaves the source intact and
+inactive. Settings remain locked until import or discard, so an old import cannot
+overwrite newer edits. Format decoders produce a versioned import candidate for
 this common flow. They never publish migrated authority themselves. Existing
 signed records remain usable without a new approval merely because the app restarts.
 

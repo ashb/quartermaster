@@ -439,13 +439,18 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn changing_the_source_during_import_cannot_overwrite_it() {
-        let (store, _, key) = signed_store();
-        use_legacy_format(&store);
+    fn discarding_legacy_settings_preserves_the_key_pin_and_advances_the_signed_revision() {
+        let (store, mut previous, key) = signed_store();
+        previous.revision = Revision(4);
+        store
+            .storage
+            .replace(&serde_json::to_vec(&previous).unwrap())
+            .unwrap();
+        let anchor = store.anchor.load().unwrap();
         let mut manager = store.load::<()>().unwrap().unwrap();
         let source = manager.migration().unwrap().source.clone();
         let review = manager
-            .prepare_import(&source.id, 7, [1; 16], 2000.into(), ())
+            .prepare_discard(&source.id, 7, [1; 16], 2000.into(), ())
             .unwrap();
         let challenge = manager
             .authenticate(&review.id, 7, 2001.into(), 2002.into())
@@ -460,10 +465,57 @@ pub(super) mod tests {
             .approve(&review.id, 7, signature.as_ref(), 2003.into())
             .unwrap();
         let admission = manager.admit(verified, 2004.into()).unwrap();
-        let changed = b"changed source";
-        store.storage.replace(changed).unwrap();
-        assert!(manager.finish(store.publish(admission)).is_err());
-        assert_eq!(store.storage.load().unwrap().unwrap(), changed);
+        manager.finish(store.publish(admission)).unwrap();
+        let loaded = store.load::<()>().unwrap().unwrap();
+        assert!(loaded.migration().is_none());
+        assert_eq!(loaded.record().revision(), Revision(5));
+        assert!(loaded.record().provider().is_none());
+        let disabled =
+            Settings::decode(br#"{"github":null,"mutations":"requireApproval"}"#).unwrap();
+        assert!(loaded.record().settings() == Some(&disabled));
+        assert!(loaded.policy().is_err());
+        assert_eq!(store.anchor.load().unwrap(), anchor);
+        assert_eq!(loaded.record().public_key(), previous.public_key());
+        assert!(
+            manager
+                .prepare_discard(&source.id, 7, [1; 16], 2005.into(), ())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn changing_the_source_during_migration_cannot_overwrite_it() {
+        for discard in [false, true] {
+            let (store, _, key) = signed_store();
+            use_legacy_format(&store);
+            let mut manager = store.load::<()>().unwrap().unwrap();
+            let source = manager.migration().unwrap().source.clone();
+            let review = if discard {
+                manager.prepare_discard(&source.id, 7, [1; 16], 2000.into(), ())
+            } else {
+                manager.prepare_import(&source.id, 7, [1; 16], 2000.into(), ())
+            }
+            .unwrap();
+            let challenge = manager
+                .authenticate(&review.id, 7, 2001.into(), 2002.into())
+                .unwrap();
+            let signature = key
+                .sign(
+                    &SystemRandom::new(),
+                    &BASE64.decode(&challenge.bytes).unwrap(),
+                )
+                .unwrap();
+            let verified = manager
+                .approve(&review.id, 7, signature.as_ref(), 2003.into())
+                .unwrap();
+            let admission = manager.admit(verified, 2004.into()).unwrap();
+            let changed = b"changed source";
+            store.storage.replace(changed).unwrap();
+            assert!(manager.finish(store.publish(admission)).is_err());
+            assert_eq!(store.storage.load().unwrap().unwrap(), changed);
+            assert!(manager.failed());
+            assert!(manager.policy().is_err());
+        }
     }
 
     #[test]

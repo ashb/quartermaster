@@ -28,6 +28,65 @@ private func importFixture() throws -> (SettingsSnapshot, SettingsReview) {
     )
 }
 
+private func discardedReview(_ review: SettingsReview) throws -> SettingsReview {
+    var document = try #require(JSONSerialization.jsonObject(with: review.document) as? [String: Any])
+    var proposed = try #require(document["proposed"] as? [String: Any])
+    proposed["settings"] = ["github": NSNull(), "mutations": "requireApproval"]
+    proposed["provider"] = NSNull()
+    document["proposed"] = proposed
+    let bytes = try JSONSerialization.data(withJSONObject: document)
+    return SettingsReview(
+        id: review.id, created: review.created, session: review.session, nonce: review.nonce,
+        revision: review.revision, document: bytes, digest: Data(SHA256.hash(data: bytes)),
+        approvalKey: review.approvalKey)
+}
+
+@Test @MainActor func discardingRequiresAReviewOfTheEmptyReplacementAndPreservesTheCandidateUntilApproval() async throws
+{
+    let (snapshot, importing) = try importFixture()
+    let discarded = try discardedReview(importing)
+    var requests = 0
+    let editor = SettingsEditor { command in
+        switch command {
+        case .prepareSettingsDiscard(let id):
+            #expect(id == snapshot.migration?.source.id)
+            requests += 1
+            return .settingsReview(discarded)
+        case .settingsCancel: return .canceled
+        default: return .settingsStatus(snapshot)
+        }
+    }
+    await editor.load()
+    #expect(requests == 0)
+    #expect(try await editor.reviewMigration(.discard) == discarded)
+    #expect(requests == 1)
+    await editor.cancel()
+    #expect(editor.snapshot?.migration == snapshot.migration)
+    #expect(!editor.canReview)
+    #expect(editor.canImport)
+}
+
+@Test(arguments: [SettingsMigrationAction.importSettings, .discard]) @MainActor
+func migrationReviewsCannotSubstituteTheOtherChoicesResult(_ action: SettingsMigrationAction) async throws {
+    let (snapshot, importing) = try importFixture()
+    let unexpected = try action == .discard ? importing : discardedReview(importing)
+    var canceled: [String] = []
+    let editor = SettingsEditor { command in
+        switch command {
+        case .prepareSettingsImport, .prepareSettingsDiscard: return .settingsReview(unexpected)
+        case .settingsCancel(let id):
+            canceled.append(try #require(id))
+            return .canceled
+        default: return .settingsStatus(snapshot)
+        }
+    }
+    await editor.load()
+    await #expect(throws: (any Error).self) { try await editor.reviewMigration(action) }
+    #expect(canceled == [unexpected.id])
+    #expect(editor.snapshot?.migration == snapshot.migration)
+    #expect(!editor.canReview)
+}
+
 @Test @MainActor func migrationOffersAnExplicitImportWithoutActivatingOrAutomaticallyPreparingOldSettings() async throws
 {
     let (snapshot, review) = try importFixture()
@@ -56,9 +115,14 @@ private func importFixture() throws -> (SettingsSnapshot, SettingsReview) {
     #expect(editor.snapshot?.settings == nil)
 }
 
-@Test(arguments: ["source", "settings", "missing"])
-@MainActor func importReviewRejectsChangesToTheOfferedMigration(_ field: String) async throws {
-    let (snapshot, review) = try importFixture()
+@Test(
+    arguments: ["source", "settings", "missing", "revision", "additions"],
+    [SettingsMigrationAction.importSettings, .discard])
+@MainActor func migrationReviewRejectsChangesToTheOfferedSourceAndResult(
+    _ field: String, _ action: SettingsMigrationAction
+) async throws {
+    let (snapshot, importing) = try importFixture()
+    let review = try action == .discard ? discardedReview(importing) : importing
     var document = try #require(JSONSerialization.jsonObject(with: review.document) as? [String: Any])
     switch field {
     case "source":
@@ -69,6 +133,11 @@ private func importFixture() throws -> (SettingsSnapshot, SettingsReview) {
         var proposed = try #require(document["proposed"] as? [String: Any])
         proposed["settings"] = ["github": NSNull(), "mutations": "deny"]
         document["proposed"] = proposed
+    case "revision":
+        var previous = try #require(document["previous"] as? [String: Any])
+        previous["revision"] = 99
+        document["previous"] = previous
+    case "additions": document["additions"] = [["owner": "example", "name": "extra"]]
     default: document.removeValue(forKey: "migration")
     }
     let bytes = try JSONSerialization.data(withJSONObject: document)
@@ -77,21 +146,24 @@ private func importFixture() throws -> (SettingsSnapshot, SettingsReview) {
         revision: review.revision, document: bytes, digest: Data(SHA256.hash(data: bytes)),
         approvalKey: review.approvalKey)
     let editor = SettingsEditor { command in
-        if case .prepareSettingsImport = command { return .settingsReview(changed) }
-        return .settingsStatus(snapshot)
+        switch command {
+        case .prepareSettingsImport, .prepareSettingsDiscard: return .settingsReview(changed)
+        default: return .settingsStatus(snapshot)
+        }
     }
     await editor.load()
-    await #expect(throws: (any Error).self) { try await editor.reviewMigration() }
+    await #expect(throws: (any Error).self) { try await editor.reviewMigration(action) }
     #expect(editor.snapshot?.settings == nil)
 }
 
-@Test @MainActor func closingSettingsCancelsALateImportReviewWithoutDismissingTheMigration() async throws {
+@Test(arguments: [SettingsMigrationAction.importSettings, .discard]) @MainActor
+func closingSettingsCancelsALateMigrationReviewWithoutDismissingIt(_ action: SettingsMigrationAction) async throws {
     let (snapshot, review) = try importFixture()
     var prepared: CheckedContinuation<BrokerReply, Never>?
     var canceled: [String] = []
     let editor = SettingsEditor { command in
         switch command {
-        case .prepareSettingsImport: return await withCheckedContinuation { prepared = $0 }
+        case .prepareSettingsImport, .prepareSettingsDiscard: return await withCheckedContinuation { prepared = $0 }
         case .settingsCancel(let id):
             canceled.append(try #require(id))
             return .canceled
@@ -99,7 +171,7 @@ private func importFixture() throws -> (SettingsSnapshot, SettingsReview) {
         }
     }
     await editor.load()
-    let pending = Task { try await editor.reviewMigration() }
+    let pending = Task { try await editor.reviewMigration(action) }
     while prepared == nil { await Task.yield() }
     editor.discardDraft()
     prepared?.resume(returning: .settingsReview(review))

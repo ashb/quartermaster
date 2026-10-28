@@ -311,6 +311,38 @@ impl<C> Manager<C> {
         )
     }
 
+    pub(in crate::owner) fn prepare_discard(
+        &mut self,
+        id: &str,
+        connection: u64,
+        session: [u8; 16],
+        now: MonotonicTimestamp,
+        context: C,
+    ) -> Result<Review, Error> {
+        let source = self
+            .migration
+            .as_ref()
+            .filter(|migration| migration.source.id == id)
+            .ok_or(Error::Stale)?
+            .source
+            .clone();
+        self.prepare_change(
+            connection,
+            session,
+            Proposal {
+                revision: self.record.revision(),
+                settings: super::Settings {
+                    github: None,
+                    mutations: super::MutationRule::RequireApproval,
+                },
+                provider: None,
+            },
+            now,
+            context,
+            Some(source),
+        )
+    }
+
     fn prepare_change(
         &mut self,
         connection: u64,

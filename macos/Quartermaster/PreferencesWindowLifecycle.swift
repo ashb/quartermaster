@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct PreferencesWindowLifecycle: NSViewRepresentable {
-    let opened: @MainActor () -> Void
+    let opened: @MainActor (NSWindow) -> Void
     let closed: @MainActor () -> Void
 
     func makeNSView(context: Context) -> PreferencesWindowObserver {
@@ -13,10 +13,10 @@ struct PreferencesWindowLifecycle: NSViewRepresentable {
 }
 
 final class PreferencesWindowObserver: NSView {
-    private let opened: @MainActor () -> Void
+    private let opened: @MainActor (NSWindow) -> Void
     private let closed: @MainActor () -> Void
 
-    init(opened: @escaping @MainActor () -> Void, closed: @escaping @MainActor () -> Void) {
+    init(opened: @escaping @MainActor (NSWindow) -> Void, closed: @escaping @MainActor () -> Void) {
         self.opened = opened
         self.closed = closed
         super.init(frame: .zero)
@@ -33,9 +33,11 @@ final class PreferencesWindowObserver: NSView {
             self, selector: #selector(becameKey(_:)), name: NSWindow.didBecomeKeyNotification, object: window)
         NotificationCenter.default.addObserver(
             self, selector: #selector(willClose(_:)), name: NSWindow.willCloseNotification, object: window)
-        if window.isKeyWindow { opened() }
+        if window.isKeyWindow { opened(window) }
     }
 
-    @objc private func becameKey(_ notification: Notification) { opened() }
+    @objc private func becameKey(_ notification: Notification) {
+        if let window { opened(window) }
+    }
     @objc private func willClose(_ notification: Notification) { closed() }
 }

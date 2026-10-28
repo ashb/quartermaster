@@ -22,6 +22,7 @@ public enum BrokerCommand: Encodable, Sendable {
     case settingsRegister(publicKey: Data)
     case settingsStatus
     case prepareSettingsImport(id: String)
+    case prepareSettingsDiscard(id: String)
     case stageEnrollment(server: String, email: String, password: String, itemID: String?)
     case prepareSettings(
         revision: UInt64, settings: BrokerSettings, provider: SettingsProviderChoice, additions: [RepositoryName] = [])
@@ -31,7 +32,8 @@ public enum BrokerCommand: Encodable, Sendable {
 
     public var timeout: DispatchTimeInterval {
         switch self {
-        case .presence, .settingsPresence, .settingsProof, .settingsRegister, .prepareSettings, .prepareSettingsImport:
+        case .presence, .settingsPresence, .settingsProof, .settingsRegister, .prepareSettings, .prepareSettingsImport,
+            .prepareSettingsDiscard:
             .seconds(30)
         case .vaultLogin, .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard, .stageEnrollment: .seconds(120)
         case .hello, .enroll, .next, .proof, .cancel, .vaultStatus, .revokeReadGrants: .seconds(5)
@@ -88,6 +90,9 @@ public enum BrokerCommand: Encodable, Sendable {
         case .settingsStatus: kind = "settingsStatus"
         case .prepareSettingsImport(let id):
             kind = "prepareSettingsImport"
+            try fields.encode(id, forKey: .id)
+        case .prepareSettingsDiscard(let id):
+            kind = "prepareSettingsDiscard"
             try fields.encode(id, forKey: .id)
         case .stageEnrollment(let server, let email, let password, let itemID):
             kind = "stageEnrollment"

@@ -67,7 +67,10 @@ struct PreferencesView: View {
                         .lineLimit(3).help(editor.message).textSelection(.enabled)
                     Spacer()
                     if editor.snapshot?.migration != nil {
-                        Button("Review Import…", action: application.reviewMigration).disabled(!editor.canImport)
+                        Button("Later", action: application.postponeMigration).disabled(editor.busy)
+                        Button("Discard…") { application.reviewMigration(.discard) }.disabled(!editor.canImport)
+                        Button("Review Import…") { application.reviewMigration(.importSettings) }.disabled(
+                            !editor.canImport)
                     } else {
                         Button("Review Changes…", action: application.reviewPreferences).disabled(!editor.canReview)
                     }

@@ -5,30 +5,37 @@ import SwiftUI
 private struct SettingsApprovalView: View {
     let review: SettingsReview
     let document: SettingsDocument
+    let migration: SettingsMigrationAction?
     @ObservedObject var controller: ApprovalController
     let close: () -> Void
     @State private var saving = false
-    private var importing: Bool { document.migration != nil }
+    private var importing: Bool { migration == .importSettings }
+    private var discarding: Bool { migration == .discard }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Label(
-                importing ? "Import and trust previous settings" : "Approve preferences", systemImage: "gearshape.fill"
+                importing
+                    ? "Import and trust previous settings"
+                    : discarding ? "Discard previous settings" : "Approve preferences", systemImage: "gearshape.fill"
             ).font(.title2.bold())
             Text(
                 importing
                     ? "Review these settings before importing them."
-                    : "Revision \(document.previous.revision) → \(document.proposed.revision)"
+                    : discarding
+                        ? "Start afresh with no vault selected and GitHub disabled. Your encrypted cache is kept."
+                        : "Revision \(document.previous.revision) → \(document.proposed.revision)"
             )
             .foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if !importing {
+                    if migration == nil {
                         record(document.previous, title: "Currently approved")
                         Divider()
                     }
                     record(
-                        document.proposed, title: importing ? "Settings to import" : "Proposed",
+                        document.proposed,
+                        title: importing ? "Settings to import" : discarding ? "Settings after discarding" : "Proposed",
                         additions: document.additions ?? [])
                     DisclosureSection("Complete proposal · literal byte escapes") {
                         ScrollView(.horizontal) {
@@ -53,9 +60,11 @@ private struct SettingsApprovalView: View {
                     )
                     .frame(width: 32, height: 32)
                 } else {
-                    Button(importing ? "Import and Trust" : "Save Changes") { saving = true }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(controller.phase != .review)
+                    Button(importing ? "Import and Trust" : discarding ? "Discard and Start Afresh" : "Save Changes") {
+                        saving = true
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(controller.phase != .review)
                 }
             }
         }
@@ -105,23 +114,33 @@ public final class SettingsApprovalDialog: NSObject, NSWindowDelegate, ApprovalW
     public let controller: ApprovalController
     public var onClose: (() -> Void)?
 
-    public init(review: SettingsReview, document: SettingsDocument, backend: any ApprovalBackend) {
+    public init(
+        review: SettingsReview, document: SettingsDocument, backend: any ApprovalBackend,
+        migration: SettingsMigrationAction? = nil
+    ) {
         controller = ApprovalController(
             backend: backend,
-            reason: document.migration == nil
-                ? "approve these Quartermaster preferences" : "import and trust these Quartermaster settings")
+            reason: migration == .importSettings
+                ? "import and trust these Quartermaster settings"
+                : migration == .discard
+                    ? "discard these previous Quartermaster settings"
+                    : "approve these Quartermaster preferences")
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 648, height: 530), styleMask: [.titled, .closable],
             backing: .buffered, defer: false)
         super.init()
         window.title =
-            document.migration == nil ? "Quartermaster preferences approval" : "Quartermaster settings import"
+            switch migration {
+            case .importSettings: "Quartermaster settings import"
+            case .discard: "Quartermaster settings reset"
+            case nil: "Quartermaster preferences approval"
+            }
         window.isReleasedWhenClosed = false
         window.delegate = self
         let window = window
         window.contentView = NSHostingView(
             rootView: SettingsApprovalView(
-                review: review, document: document, controller: controller,
+                review: review, document: document, migration: migration, controller: controller,
                 close: { [weak window] in window?.performClose(nil) }))
     }
 
