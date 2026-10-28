@@ -6,10 +6,28 @@ import QuartermasterSecurity
 @MainActor
 final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject {
     private enum ConnectionPhase { case disconnected, connecting, connected }
+    enum VaultActivity: Equatable {
+        case idle, locking, syncing, locked, synced
+        case failed(String)
+
+        var busy: Bool { self == .locking || self == .syncing }
+        var message: String? {
+            switch self {
+            case .idle: nil
+            case .locking: "Locking vault…"
+            case .syncing: "Syncing vault…"
+            case .locked: "Vault locked."
+            case .synced: "Vault synced."
+            case .failed(let message): message
+            }
+        }
+    }
     @Published private(set) var status = "Disconnected"
     @Published private(set) var vaultStatus: BrokerVaultStatus?
+    @Published private(set) var vaultActivity = VaultActivity.idle
     private var client: (any BrokerClient)?
     private var task: Task<Void, Never>?
+    private var vaultTask: Task<Void, Never>?
     private var active: (any ApprovalWindow)?
     private var presentation: Int32?
     private var settingsIsOpen = false
@@ -65,6 +83,8 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         preferences.connecting()
         status = "Starting Quartermaster…"
         vaultStatus = nil
+        vaultTask?.cancel()
+        vaultActivity = .idle
         active?.cancel()
         task?.cancel()
         client?.cancel()
@@ -101,6 +121,10 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             } catch {
                 guard !Task.isCancelled else { return }
                 active?.cancel()
+                vaultTask?.cancel()
+                if vaultActivity.busy {
+                    vaultActivity = .failed("The backend disconnected. Reconnect and try again.")
+                }
                 client?.cancel()
                 client = nil
                 vaultStatus = nil
@@ -240,16 +264,50 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     func vault(_ command: BrokerCommand) {
-        if case .vaultLock = command { active?.cancel() }
-        Task {
+        let locking: Bool
+        if case .vaultLock = command {
+            locking = true
+            active?.cancel()
+            vaultTask?.cancel()
+        } else {
+            guard !vaultActivity.busy else { return }
+            locking = false
+        }
+        vaultActivity = locking ? .locking : .syncing
+        status = vaultActivity.message ?? status
+        vaultTask = Task {
             do {
                 guard let client, case .vaultStatus(let vault) = try await client.call(command) else {
                     throw BrokerFailure.disconnected
                 }
                 operationEnrolled = false
-                vaultStatus = vault
+                await refreshVaultStatus()
+                try Task.checkCancellation()
+                vaultActivity = vault.error == nil ? (locking ? .locked : .synced) : .failed(vaultFailure(vault))
                 status = "Vault: \(vault.state.rawValue)"
-            } catch { preferences.report(error) }
+            } catch {
+                guard !Task.isCancelled else { return }
+                vaultActivity = .failed("Could not complete the vault operation. Reconnect and try again.")
+                status = vaultActivity.message ?? status
+            }
+        }
+    }
+
+    private func vaultFailure(_ reply: BrokerVaultStatus) -> String {
+        switch reply.state {
+        case .locked: "The vault is locked. Unlock it before syncing."
+        case .busy: "Another vault operation is running. Try again shortly."
+        case .serverUnavailable: "Could not contact Vaultwarden. Try again when it is available."
+        case .reauthRequired: "Vaultwarden requires you to sign in again. Verify the vault again in Settings."
+        case .keyInvalidated: "This vault can no longer be unlocked on this Mac. Verify it again in Settings."
+        case .keychainIssue: "macOS could not unlock the vault. Try again."
+        case .ambiguousItem: "More than one vault item matches this enrolment."
+        case .itemNotFound: "The selected vault item could not be found."
+        case .incompatibleCache, .incompleteEnrollment:
+            "The saved vault data could not be read. Verify the vault again in Settings."
+        case .unenrolled: "Configure a vault before syncing."
+        case .settingsImportRequired: "Import or discard your previous settings first."
+        case .onlineUnlocked: "The vault operation failed. Try again."
         }
     }
 
@@ -301,6 +359,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         active?.cancel()
         task?.cancel()
+        vaultTask?.cancel()
         client?.cancel()
         releasePresentation()
         return .terminateNow

@@ -91,14 +91,14 @@ struct PreferencesView: View {
 
     private var vault: some View {
         Group {
-            PreferencesGroup(title: "Selected vault") {
+            PreferencesGroup(title: "Vault") {
                 if let provider = editor.snapshot?.provider {
                     providerIdentity(provider)
                     HStack {
                         Text("Last synced")
                         Spacer()
                         if let vault = application.vaultStatus, vault.binding == provider.binding {
-                            Text(vault.lastSync?.formatted(date: .abbreviated, time: .shortened) ?? "Never")
+                            Text(vault.lastSync?.formatted(date: .abbreviated, time: .standard) ?? "Never")
                                 .foregroundStyle(.secondary)
                         } else {
                             Text("Unavailable").foregroundStyle(.secondary)
@@ -112,8 +112,9 @@ struct PreferencesView: View {
                 } else {
                     Text("No vault selected")
                 }
+                Divider()
+                vaultControls
             }
-            vaultCache
             if let staged = editor.stagedProvider {
                 PreferencesGroup(title: "Verified replacement · awaiting approval") {
                     VStack(alignment: .leading, spacing: 5) {
@@ -311,10 +312,10 @@ struct PreferencesView: View {
         }
     }
 
-    private var vaultCache: some View {
-        PreferencesGroup(title: "Vault cache") {
+    private var vaultControls: some View {
+        Group {
             HStack {
-                Text("Lock the selected vault")
+                Text("Lock vault")
                 Spacer()
                 Button("Lock Now") { application.vault(.vaultLock) }
             }
@@ -323,9 +324,11 @@ struct PreferencesView: View {
                 Text("Refresh from Vaultwarden")
                 Spacer()
                 Button("Sync Vault") { application.vault(.vaultSync) }
+                    .disabled(application.vaultActivity.busy)
             }
-            Text("Credentials and decrypted vault data stay in the Rust backend.")
-                .font(.caption).foregroundStyle(.secondary)
+            if let message = application.vaultActivity.message {
+                Text(message).font(.callout).foregroundStyle(.secondary)
+            }
         }.disabled(editor.busy || editor.snapshot?.provider == nil)
     }
 
