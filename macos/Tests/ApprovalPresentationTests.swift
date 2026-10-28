@@ -1,5 +1,8 @@
+import AppKit
 import Foundation
+import LocalAuthentication
 import QuartermasterSecurity
+import SwiftUI
 import Testing
 
 @testable import QuartermasterApprovalUI
@@ -78,4 +81,55 @@ private func approvalPresentation(
 @Test func completeAncestryDoesNotShowAGap() throws {
     let presentation = try approvalPresentation(ancestryComplete: true)
     #expect(presentation.ancestryNotice == nil)
+}
+
+@MainActor private final class ScopeReviewBackend: ApprovalBackend {
+    let reviewCreated = MonotonicTimestamp.now
+    func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {
+        throw CancellationError()
+    }
+    func submit(_ signature: Data) async throws { throw CancellationError() }
+    func cancel() {}
+}
+
+@Test @MainActor func switchingReadScopeKeepsTheApprovalWindowHeight() throws {
+    let root: [String: Any] = [
+        "id": "123:0000000000000001:00000001", "pid": 123,
+        "executable": "/nix/store/example-zsh/bin/zsh",
+    ]
+    var request: [String: Any] = [
+        "repository": "quartermaster/one", "repositoryId": 123,
+        "method": "GET", "path": "/repos/quartermaster/one/issues/42", "body": "",
+        "origin": "https://api.github.com", "processChain": ["zsh", "gh"],
+        "peer": ["cdHash": String(repeating: "1", count: 40)], "readRoots": [root],
+    ]
+    let provider = try approvalPresentation().provider
+    let controller = ApprovalController(backend: ScopeReviewBackend(), reason: "Test scope layout")
+    func view(_ bytes: Data) throws -> NSHostingView<ApprovalDialogView> {
+        var display = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+        display.removeValue(forKey: "peer")
+        let presentation = ApprovalPresentation(
+            request: try JSONDecoder().decode(
+                DialogRequest.self, from: JSONSerialization.data(withJSONObject: display)),
+            provider: provider,
+            readGrant: try ReadGrantReview.parse(
+                request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000)),
+            readScope: try ReadScopeReview.parse(request: bytes))
+        return NSHostingView(
+            rootView: ApprovalDialogView(
+                presentation: presentation, controller: controller, close: {}, selectRoot: { _ in }))
+    }
+    let once = try view(JSONSerialization.data(withJSONObject: request))
+    request["authorization"] = [
+        "purpose": "quartermaster.read-grant.v2",
+        "grant": [
+            "id": String(repeating: "a", count: 32), "uid": 501,
+            "codeHash": String(repeating: "1", count: 40), "root": root,
+            "effects": ["version": 1, "effects": ["listIssues", "readIssue"]],
+            "repository": "quartermaster/one", "role": "github-write", "expiresUnix": 4600,
+        ],
+    ]
+    let shell = try view(JSONSerialization.data(withJSONObject: request))
+    #expect(once.fittingSize.height > 0)
+    #expect(once.fittingSize == shell.fittingSize)
 }

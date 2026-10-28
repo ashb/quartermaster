@@ -82,8 +82,8 @@ The token in this command is a dummy value for `gh`'s local authentication check
 Quartermaster adds the actual vault token upstream. The isolated configuration
 routes requests through its socket and leaves your usual `gh` configuration alone.
 
-The first request opens the read-access dialog. Choose a verified shell root or
-**This request once**. Review the caller, repository, credential and absolute
+The first request opens the read-access dialog. Under **Authorize for**, choose
+**This shell** or **This request**. Review the caller, repository, credential and absolute
 expiry, then continue to Touch ID. Unlocking the cache and establishing the grant
 can use the same fingerprint. If no shell root can be verified, only one-request
 approval is available.

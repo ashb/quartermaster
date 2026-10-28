@@ -161,6 +161,39 @@ struct EmbeddedAuthentication: NSViewRepresentable {
     func updateNSView(_ view: EmbeddedAuthenticationHost, context: Context) {}
 }
 
+struct ReadScopeChoice: View {
+    let title: String
+    let root: ReadRootChoice?
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.body.weight(.medium))
+                    if let root {
+                        Text("\(URL(fileURLWithPath: root.executable).lastPathComponent) · PID \(String(root.pid))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16).frame(maxWidth: .infinity, minHeight: 56)
+            .background(selected ? Color.accentColor.opacity(0.1) : Color.clear, in: Capsule())
+            .overlay(Capsule().strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.4)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(root?.executable ?? "Approve only this request")
+        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
 struct ApprovalDialogView: View {
     let presentation: ApprovalPresentation
     @ObservedObject var controller: ApprovalController
@@ -215,34 +248,38 @@ struct ApprovalDialogView: View {
                             "Until \(grant.expires.formatted(date: .abbreviated, time: .shortened)) or backend restart"
                         )
                         .font(.subheadline).foregroundStyle(.secondary)
+                    } else if presentation.readScope != nil {
+                        Text("For this request only")
+                            .font(.subheadline).foregroundStyle(.secondary)
                     }
                 }
             }
 
             if let scope = presentation.readScope {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Authorize for").font(.subheadline.weight(.semibold))
                     if !scope.roots.isEmpty, let selectRoot {
-                        Picker(
-                            "Read access",
-                            selection: Binding(
-                                get: { presentation.readGrant?.root.id ?? "" },
-                                set: { id in
-                                    selecting = true
-                                    Task {
-                                        await selectRoot(id.isEmpty ? nil : id)
-                                        selecting = false
-                                    }
-                                })
-                        ) {
-                            Text("This request once").tag("")
-                            ForEach(scope.roots) { root in
-                                Text("\(root.executable) · PID \(String(root.pid))").tag(root.id)
+                        let choices = LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                            ReadScopeChoice(title: "This request", root: nil, selected: presentation.readGrant == nil) {
+                                choose(nil, using: selectRoot)
+                            }
+                            ForEach(Array(scope.roots.enumerated()), id: \.element.id) { index, root in
+                                ReadScopeChoice(
+                                    title: index == 0 ? "This shell" : "Parent shell", root: root,
+                                    selected: presentation.readGrant?.root.id == root.id
+                                ) {
+                                    choose(root.id, using: selectRoot)
+                                }
                             }
                         }.disabled(selecting || ready || controller.phase != .review)
+                        if scope.roots.count < 6 {
+                            choices
+                        } else {
+                            ScrollView(.vertical) { choices }.frame(height: 184)
+                        }
                     }
-                    if let grant = presentation.readGrant {
+                    if presentation.readGrant != nil {
                         Text("List and read issues from this shell's descendants using the same caller executable.")
-                        Text(verbatim: "\(grant.root.executable) · PID \(grant.root.pid)")
                     } else {
                         Text("This issue read only. Later requests need approval.")
                     }
@@ -322,6 +359,15 @@ struct ApprovalDialogView: View {
             transaction.disablesAnimations = true
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func choose(_ root: String?, using selectRoot: @escaping (String?) async -> Void) {
+        guard presentation.readGrant?.root.id != root else { return }
+        selecting = true
+        Task {
+            await selectRoot(root)
+            selecting = false
+        }
     }
 
     private var detailsContent: some View {
