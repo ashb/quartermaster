@@ -1,4 +1,4 @@
-const fs = require('node:fs');
+const { createInterface } = require('node:readline');
 const path = require('node:path');
 const { buildSchema, graphqlSync, responsePathAsArray } = require(
   path.resolve(process.env.QM_REFERENCE_GRAPHQL),
@@ -102,5 +102,7 @@ function execute(request) {
   return { ...observation, errors: (result.errors || []).map(error => error.message) };
 }
 
-const requests = JSON.parse(fs.readFileSync(0, 'utf8'));
-process.stdout.write(JSON.stringify(requests.map(execute)));
+createInterface({ input: process.stdin }).on('line', line => {
+  const requests = JSON.parse(line);
+  process.stdout.write(JSON.stringify(requests.map(execute)) + '\n');
+});

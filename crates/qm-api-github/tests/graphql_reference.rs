@@ -8,9 +8,10 @@ use qm_api_github::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::BTreeSet,
-    io::Write,
-    process::{Command, Stdio},
+    io::{BufRead, BufReader, Write},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
 #[derive(Debug, Deserialize)]
@@ -28,29 +29,57 @@ struct Execution {
     errors: Vec<String>,
 }
 
+struct ReferenceExecutor {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+
+impl ReferenceExecutor {
+    fn new() -> Self {
+        let mut child = Command::new(std::env::var_os("QM_REFERENCE_NODE").unwrap())
+            .arg(std::env::var_os("QM_REFERENCE_EXECUTOR").unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        }
+    }
+
+    fn execute(&mut self, requests: &[Value]) -> Vec<Execution> {
+        self.input
+            .write_all(&serde_json::to_vec(requests).unwrap())
+            .unwrap();
+        self.input.write_all(b"\n").unwrap();
+        let mut line = String::new();
+        assert_ne!(
+            self.output.read_line(&mut line).unwrap(),
+            0,
+            "reference exited before replying"
+        );
+        let results: Vec<Execution> = serde_json::from_str(&line).unwrap();
+        assert_eq!(results.len(), requests.len());
+        results
+    }
+}
+
+impl Drop for ReferenceExecutor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn execute(requests: &[Value]) -> Vec<Execution> {
-    let mut child = Command::new(std::env::var_os("QM_REFERENCE_NODE").unwrap())
-        .arg(std::env::var_os("QM_REFERENCE_EXECUTOR").unwrap())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&serde_json::to_vec(requests).unwrap())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let results: Vec<Execution> = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(results.len(), requests.len());
-    results
+    thread_local! {
+        static EXECUTOR: RefCell<ReferenceExecutor> = RefCell::new(ReferenceExecutor::new());
+    }
+    EXECUTOR.with_borrow_mut(|executor| executor.execute(requests))
 }
 
 fn capture(body: &Value) -> CapturedRequest {
