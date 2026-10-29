@@ -91,12 +91,30 @@ open target/macos/signed/Quartermaster.app
 `just run` builds, signs and starts the backend. Opening the app shows the
 Quartermaster key menu. Starting it creates no read grant and requests no fingerprint;
 enrolment and credential use can require authentication. This is a development
-build, whose protected settings flow still needs attended signing and hardware qualification.
+build; attended checks of selected settings and approval flows do not qualify
+every lifecycle transition or a production release.
 
 Quit the UI through its menu, then use `just stop` to stop the backend. It is
 started for the logged-in user; login startup is not configured.
 
 To use a vault and make real requests, follow [GitHub setup](github.md).
+
+## Documentation screenshots
+
+From a logged-in Mac with Touch ID available, update the images in `docs/images`:
+
+```sh
+just screenshots
+```
+
+Windows briefly appear so capture includes Apple's real fingerprint UI.
+**Do not touch the reader**; authentication cancels automatically within eight
+seconds. Sample backends cannot unlock a vault or approve a request.
+Use `--settings-only` to skip authentication and capture just Vault settings.
+
+Fixtures in `macos/Tests/DocumentationScreenshots.swift` fix sample data,
+appearance, locale and dimensions; native rendering can vary by macOS version.
+If Nix overrides Xcode, prefix the command with `env -u DEVELOPER_DIR -u SDKROOT`.
 
 ## Integration tests
 

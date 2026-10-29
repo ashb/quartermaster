@@ -167,6 +167,10 @@ check:
 build:
     bazelisk build //macos:Quartermaster
 
+# Capture native README views with sample data and auto-cancel authentication.
+screenshots mode="--authentication-ui" output="docs/images":
+    TZ=UTC bazelisk run //macos/Tests:DocumentationScreenshots -- {{quote(absolute_path(output))}} {{quote(mode)}}
+
 # Build with the certificate selected in signing.local.toml.
 build-signed:
     bazelisk run //macos:sign_development
