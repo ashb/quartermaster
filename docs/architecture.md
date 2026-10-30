@@ -107,6 +107,12 @@ defines request preservation, matching and approval. The development gateway
 uses this flow; live-provider and hardware acceptance remain. Repository scope
 follows the [requested repository name](github.md#repository-identity).
 
+Actions log requests return GitHub's presigned download URL unchanged. Because
+`gh` also routes redirected downloads through its Unix socket, the broker provides
+a bounded, credential-free HTTPS relay to GitHub's log storage hosts. `gh` follows
+redirects and handles archives. Issued URLs remain usable until GitHub expires
+them; see the [download contract](security-boundaries.md#actions-log-transfer-contract).
+
 The UI may transfer its fresh authenticated `LAContext` to the backend over
 authenticated XPC, allowing one fingerprint to unlock the cache and approve the
 request. Cache unwrap and request approval remain separate operations: the

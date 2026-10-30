@@ -130,13 +130,41 @@ pub(super) fn handle_verified_http(
         state.refresh_policy(&policy)?;
         state.authorizer.github_configuration().cloned()
     };
-    let request = http_request::read_configured(
-        &mut RequestReader {
-            stream,
-            deadline: Deadline::after(Duration::from_secs(5))?,
-        },
-        config.as_ref(),
-    )?;
+    let mut reader = RequestReader {
+        stream,
+        deadline: Deadline::after(Duration::from_secs(5))?,
+    };
+    let request = if let Some(config) = config
+        .as_ref()
+        .filter(|config| config.mode() == Mode::Github)
+    {
+        let capture = crate::owner::github::request::read_capture(&mut reader)?;
+        if !matches!(
+            capture.authority().to_ascii_lowercase().as_str(),
+            "api.github.com" | "api.github.com:443"
+        ) {
+            principal.revalidate()?;
+            let connector = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?
+                .github
+                .clone();
+            let deadline = Deadline::after(Duration::from_secs(120))?;
+            let result = connector.relay_download(
+                &capture,
+                &mut ResponseWriter { stream, deadline },
+                deadline,
+            );
+            if result.is_err() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+            return result.map_err(Error::from);
+        }
+        http_request::from_capture(capture, config)?
+    } else {
+        http_request::read_configured(&mut reader, config.as_ref())?
+    };
     let created = presence_now()?;
     principal.revalidate()?;
     let cold = {

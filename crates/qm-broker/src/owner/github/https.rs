@@ -93,9 +93,110 @@ pub(in crate::owner) enum Connector {
     Github,
     #[cfg(test)]
     Fixture(SocketAddr),
+    #[cfg(test)]
+    FixtureWithStorage {
+        api: SocketAddr,
+        receiver: SocketAddr,
+        blob: SocketAddr,
+    },
 }
 
 impl Connector {
+    pub(in crate::owner) fn relay_download(
+        &self,
+        request: &qm_api_github::CapturedRequest,
+        output: &mut impl Write,
+        deadline: Deadline,
+    ) -> io::Result<()> {
+        let authority = request.authority().to_ascii_lowercase();
+        let host = authority.strip_suffix(":443").unwrap_or(&authority);
+        let blob = host
+            .strip_prefix("productionresultssa")
+            .and_then(|suffix| suffix.strip_suffix(".blob.core.windows.net"))
+            .is_some_and(|number| {
+                !number.is_empty()
+                    && number.len() <= 3
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+            });
+        if request.method() != "GET"
+            || !request.body().is_empty()
+            || (host != "results-receiver.actions.githubusercontent.com" && !blob)
+        {
+            return Err(io::Error::other(
+                "unsupported download destination or method",
+            ));
+        }
+        let mut ready = self.connect_storage(host, deadline)?;
+        let bytes = Zeroizing::new(format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+            request.path_and_query(), host
+        ).into_bytes());
+        let records = ready.encrypt(&bytes)?;
+        ready.submit(records)?;
+        ready.socket.set_nonblocking(false)?;
+        let mut socket = DeadlineSocket {
+            socket: &mut ready.socket,
+            deadline,
+        };
+        let stream = rustls::Stream::new(&mut ready.tls, &mut socket);
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        if io::copy(&mut stream.take(LIMIT), output)? == LIMIT {
+            return Err(io::Error::other("download response exceeds limit"));
+        }
+        Ok(())
+    }
+
+    fn connect_storage(&self, host: &str, deadline: Deadline) -> io::Result<ReadyGitHub> {
+        let preparation = deadline.cap(Duration::from_secs(5))?;
+        let (config, addresses) = match self {
+            Self::Github => {
+                let certificates = rustls_native_certs::load_native_certs();
+                let mut roots = RootCertStore::empty();
+                let (valid, _) = roots.add_parsable_certificates(certificates.certs);
+                if valid == 0 {
+                    return Err(unavailable());
+                }
+                let host = host.to_owned();
+                let addresses = resolve_with(preparation, move || {
+                    (host.as_str(), 443)
+                        .to_socket_addrs()
+                        .map(|addresses| addresses.take(32).collect())
+                })?;
+                (configuration(roots)?, addresses)
+            }
+            #[cfg(test)]
+            Self::FixtureWithStorage { receiver, blob, .. } => {
+                let mut roots = RootCertStore::empty();
+                roots
+                    .add(CertificateDer::from(
+                        include_bytes!("../../../tests/fixtures/tls/log-storage-ca.der").to_vec(),
+                    ))
+                    .map_err(|_| unavailable())?;
+                (
+                    configuration(roots)?,
+                    vec![
+                        if host == "results-receiver.actions.githubusercontent.com" {
+                            *receiver
+                        } else {
+                            *blob
+                        },
+                    ],
+                )
+            }
+            #[cfg(test)]
+            Self::Fixture(_) => return Err(unavailable()),
+        };
+        for address in addresses {
+            if let Ok(ready) =
+                ReadyGitHub::connect_named(address, Arc::clone(&config), host, preparation)
+            {
+                return Ok(ReadyGitHub { deadline, ..ready });
+            }
+            remaining(preparation)?;
+        }
+        Err(unavailable())
+    }
+
     #[cfg(test)]
     pub(in crate::owner) fn fixture(address: SocketAddr) -> Self {
         assert!(address.ip().is_loopback());
@@ -106,7 +207,7 @@ impl Connector {
         match self {
             Self::Github => ReadyGitHub::connect(deadline),
             #[cfg(test)]
-            Self::Fixture(address) => {
+            Self::Fixture(address) | Self::FixtureWithStorage { api: address, .. } => {
                 let mut roots = RootCertStore::empty();
                 roots
                     .add(CertificateDer::from(
@@ -199,11 +300,20 @@ impl ReadyGitHub {
         config: Arc<ClientConfig>,
         deadline: Deadline,
     ) -> io::Result<Self> {
+        Self::connect_named(address, config, "api.github.com", deadline)
+    }
+
+    fn connect_named(
+        address: SocketAddr,
+        config: Arc<ClientConfig>,
+        host: &str,
+        deadline: Deadline,
+    ) -> io::Result<Self> {
         let mut socket = TcpStream::connect_timeout(&address, remaining(deadline)?)?;
         socket.set_nodelay(true)?;
         let mut tls = ClientConnection::new(
             config,
-            ServerName::try_from("api.github.com").map_err(|_| unavailable())?,
+            ServerName::try_from(host.to_owned()).map_err(|_| unavailable())?,
         )
         .map_err(|_| unavailable())?;
         tls.set_buffer_limit(Some(FRAME_LIMIT));
@@ -346,7 +456,14 @@ impl PreparedMetadataTransport {
 }
 
 impl InFlightMetadata {
-    pub(in crate::owner) fn response(mut self) -> Result<RepositoryBinding, MetadataFailure> {
+    pub(in crate::owner) fn response(self) -> Result<RepositoryBinding, MetadataFailure> {
+        let deadline = self.ready.deadline;
+        let result = RepositoryBinding::from_authenticated(self.authenticated_response()?);
+        remaining(deadline).map_err(|_| MetadataFailure::Invalid)?;
+        result
+    }
+
+    fn authenticated_response(mut self) -> Result<AuthenticatedMetadata, MetadataFailure> {
         self.ready
             .socket
             .set_nonblocking(false)
@@ -358,12 +475,10 @@ impl InFlightMetadata {
         let mut stream = rustls::Stream::new(&mut self.ready.tls, &mut connection);
         let wire = response::read(&mut stream, "GET").map_err(|_| MetadataFailure::Invalid)?;
         remaining(self.ready.deadline).map_err(|_| MetadataFailure::Invalid)?;
-        let result = RepositoryBinding::from_authenticated(AuthenticatedMetadata {
+        Ok(AuthenticatedMetadata {
             request: self.request,
             wire,
-        });
-        remaining(self.ready.deadline).map_err(|_| MetadataFailure::Invalid)?;
-        result
+        })
     }
 }
 
@@ -383,7 +498,19 @@ impl InFlightGitHub {
                 Some(repository) => {
                     wire.issues(&self.request, repository, self.prepared.credential())
                 }
-                None => wire.application(self.prepared.credential()),
+                _ => wire.application(
+                    self.prepared.credential(),
+                    self.request.application().is_some_and(|application| {
+                        let analysis = application.analysis();
+                        analysis.complete()
+                            && analysis.effects.len() == 1
+                            && matches!(
+                                analysis.effects[0].kind,
+                                qm_api_github::EffectKind::ReadRunLogs
+                                    | qm_api_github::EffectKind::ReadJobLogs
+                            )
+                    }),
+                ),
             }
             .map_err(|_| unavailable())?;
             remaining(self.ready.deadline)?;
@@ -498,6 +625,18 @@ mod tests {
         mpsc::Sender<()>,
         thread::JoinHandle<Vec<u8>>,
     ) {
+        peer_reply_with_certificate(stall, response, false)
+    }
+
+    fn peer_reply_with_certificate(
+        stall: bool,
+        response: Vec<u8>,
+        storage: bool,
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::Sender<()>,
+        thread::JoinHandle<Vec<u8>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (resume, receive) = mpsc::channel();
@@ -520,10 +659,21 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(
                 vec![CertificateDer::from(
-                    include_bytes!("../../../tests/fixtures/tls/dummy-cert.der").to_vec(),
+                    if storage {
+                        include_bytes!("../../../tests/fixtures/tls/log-storage-cert.der")
+                            .as_slice()
+                    } else {
+                        include_bytes!("../../../tests/fixtures/tls/dummy-cert.der").as_slice()
+                    }
+                    .to_vec(),
                 )],
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    include_bytes!("../../../tests/fixtures/tls/dummy-key.der").to_vec(),
+                    if storage {
+                        include_bytes!("../../../tests/fixtures/tls/log-storage-key.der").as_slice()
+                    } else {
+                        include_bytes!("../../../tests/fixtures/tls/dummy-key.der").as_slice()
+                    }
+                    .to_vec(),
                 )),
             )
             .unwrap();
@@ -554,7 +704,9 @@ mod tests {
                 let offset = input.len();
                 input.resize(offset + count, 0);
                 stream.read_exact(&mut input[offset..]).unwrap();
-                stream.write_all(&response).unwrap();
+                if stream.write_all(&response).is_err() {
+                    return input;
+                }
             }
             tls.send_close_notify();
             while tls.wants_write() {
@@ -712,6 +864,144 @@ mod tests {
                 session,
                 original: request,
             }
+        }
+    }
+
+    #[test]
+    fn storage_relay_preserves_redirects_and_binary_bodies_without_caller_headers() {
+        for (host, response) in [
+            ("results-receiver.actions.githubusercontent.com", b"HTTP/1.1 302 Found\r\nLocation: https://productionresultssa1.blob.core.windows.net/logs?sig=a%2Fb\r\nContent-Length: 0\r\n\r\n".as_slice()),
+            ("productionresultssa1.blob.core.windows.net:443", b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nPK\x00\xff".as_slice()),
+        ] {
+            let (address, _, worker) = peer_reply_with_certificate(false, response.to_vec(), true);
+            let connector = Connector::FixtureWithStorage { api: address, receiver: address, blob: address };
+            let request = super::super::request::read_capture(&mut format!("GET /logs?sig=a%2Fb&x=1 HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer caller-token\r\nCookie: secret-cookie\r\nReferer: private-location\r\n\r\n").as_bytes()).unwrap();
+            let mut output = Vec::new();
+            connector.relay_download(&request, &mut output, Deadline::after(Duration::from_secs(3)).unwrap()).unwrap();
+            assert_eq!(output, response);
+            assert_eq!(worker.join().unwrap(), format!("GET /logs?sig=a%2Fb&x=1 HTTP/1.1\r\nHost: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n", host.trim_end_matches(":443")).as_bytes());
+        }
+    }
+
+    #[test]
+    fn storage_relay_rejects_other_hosts_ports_methods_and_bodies_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = Connector::FixtureWithStorage {
+            api: address,
+            receiver: address,
+            blob: address,
+        };
+        for (method, host, body) in [
+            ("GET", "api.github.com", ""),
+            ("GET", "evil.example", ""),
+            (
+                "GET",
+                "results-receiver.actions.githubusercontent.com.evil.example",
+                "",
+            ),
+            (
+                "GET",
+                "results-receiver.actions.githubusercontent.com:80",
+                "",
+            ),
+            ("GET", "productionresultssa.blob.core.windows.net", ""),
+            ("GET", "productionresultssa1234.blob.core.windows.net", ""),
+            ("GET", "productionresultssax.blob.core.windows.net", ""),
+            ("POST", "results-receiver.actions.githubusercontent.com", ""),
+            (
+                "GET",
+                "results-receiver.actions.githubusercontent.com",
+                "data",
+            ),
+        ] {
+            let raw = format!(
+                "{method} /logs?sig=test HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let request = super::super::request::read_capture(&mut raw.as_bytes()).unwrap();
+            let mut output = Vec::new();
+            assert!(
+                connector
+                    .relay_download(
+                        &request,
+                        &mut output,
+                        Deadline::after(Duration::from_secs(3)).unwrap()
+                    )
+                    .is_err(),
+                "{method} {host}"
+            );
+            assert!(output.is_empty());
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn storage_relay_rejects_untrusted_tls_before_sending_the_signed_url() {
+        let (address, _, worker) = peer_reply(false, Vec::new());
+        let connector = Connector::FixtureWithStorage {
+            api: address,
+            receiver: address,
+            blob: address,
+        };
+        let request = super::super::request::read_capture(&mut b"GET /logs?sig=secret HTTP/1.1\r\nHost: results-receiver.actions.githubusercontent.com\r\n\r\n".as_slice()).unwrap();
+        assert!(
+            connector
+                .relay_download(
+                    &request,
+                    &mut Vec::new(),
+                    Deadline::after(Duration::from_secs(3)).unwrap()
+                )
+                .is_err()
+        );
+        assert!(worker.join().unwrap().is_empty());
+    }
+
+    #[test]
+    fn log_redirects_return_the_presigned_url_unchanged() {
+        for path in [
+            "/repos/example/one/actions/runs/7/logs",
+            "/repos/example/one/actions/runs/7/attempts/2/logs",
+            "/repos/example/one/actions/jobs/8/logs",
+        ] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
+            );
+            let mut fixture = ApprovedApi::with_role(&raw, "github-read");
+            let request = fixture.prepared;
+            let (address, _, worker) = peer_reply(false, b"HTTP/1.1 302 Found\r\nLocation: https://results-receiver.actions.githubusercontent.com/rest/runs/1/logs?signature=signed-canary\r\nContent-Length: 0\r\n\r\n".to_vec());
+            let ready = ReadyGitHub::connect_to(
+                address,
+                client_config(true),
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+            )
+            .unwrap();
+            let response = PreparedOperation::github(request, ready)
+                .unwrap()
+                .handoff(
+                    &mut fixture.registry,
+                    &mut fixture.authorizer,
+                    &fixture.principal,
+                    &fixture.snapshot,
+                )
+                .unwrap()
+                .response();
+            let OperationResponse::Github(response) = response else {
+                panic!("expected a redirect response")
+            };
+            let mut wire = Vec::new();
+            response.write(&mut wire).unwrap();
+            assert!(String::from_utf8(wire).unwrap().contains("Location: https://results-receiver.actions.githubusercontent.com/rest/runs/1/logs?signature=signed-canary\r\n"));
+            assert!(
+                worker
+                    .join()
+                    .unwrap()
+                    .starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes())
+            );
         }
     }
 

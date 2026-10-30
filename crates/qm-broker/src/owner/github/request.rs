@@ -22,62 +22,70 @@ impl PartialEq for Application {
 }
 impl Eq for Application {}
 
+pub(in crate::owner) fn read_capture(stream: &mut impl Read) -> io::Result<CapturedRequest> {
+    let limits = RequestLimits::default();
+    let mut bytes = Zeroizing::new(Vec::new());
+    while !bytes.ends_with(b"\r\n\r\n") {
+        if bytes.len() >= limits.header_bytes {
+            return Err(io::Error::other("request header limit exceeded"));
+        }
+        let mut byte = [0];
+        stream.read_exact(&mut byte)?;
+        bytes.push(byte[0]);
+    }
+    let mut headers = vec![httparse::EMPTY_HEADER; limits.headers];
+    let mut head = httparse::Request::new(&mut headers);
+    if !head.parse(&bytes).map_err(io::Error::other)?.is_complete() {
+        return Err(io::Error::other("incomplete request head"));
+    }
+    let mut length = None;
+    for header in head.headers.iter() {
+        if matches!(
+            header.name.to_ascii_lowercase().as_str(),
+            "transfer-encoding" | "trailer" | "upgrade" | "proxy-authorization" | "expect"
+        ) {
+            return Err(io::Error::other("unsupported request framing"));
+        }
+        if header.name.eq_ignore_ascii_case("content-length") {
+            if length.is_some()
+                || header.value.is_empty()
+                || !header.value.iter().all(u8::is_ascii_digit)
+            {
+                return Err(io::Error::other("ambiguous request framing"));
+            }
+            length = Some(
+                std::str::from_utf8(header.value)
+                    .map_err(io::Error::other)?
+                    .parse::<usize>()
+                    .map_err(io::Error::other)?,
+            );
+        }
+    }
+    let count = length.unwrap_or(0);
+    if count > limits.body_bytes
+        || bytes
+            .len()
+            .checked_add(count)
+            .is_none_or(|size| size > limits.request_bytes)
+    {
+        return Err(io::Error::other("request body limit exceeded"));
+    }
+    let start = bytes.len();
+    bytes.resize(start + count, 0);
+    stream.read_exact(&mut bytes[start..])?;
+    CapturedRequest::parse(&bytes, limits).map_err(io::Error::other)
+}
+
 impl Application {
-    pub(in crate::owner) fn read(
-        stream: &mut impl Read,
+    #[cfg(test)]
+    fn read(stream: &mut impl Read, patterns: &PatternSet) -> io::Result<Self> {
+        Self::from_capture(read_capture(stream)?, patterns)
+    }
+
+    pub(in crate::owner) fn from_capture(
+        capture: CapturedRequest,
         patterns: &PatternSet,
     ) -> io::Result<Self> {
-        let limits = RequestLimits::default();
-        let mut bytes = Zeroizing::new(Vec::new());
-        while !bytes.ends_with(b"\r\n\r\n") {
-            if bytes.len() >= limits.header_bytes {
-                return Err(io::Error::other("request header limit exceeded"));
-            }
-            let mut byte = [0];
-            stream.read_exact(&mut byte)?;
-            bytes.push(byte[0]);
-        }
-        let mut headers = vec![httparse::EMPTY_HEADER; limits.headers];
-        let mut head = httparse::Request::new(&mut headers);
-        if !head.parse(&bytes).map_err(io::Error::other)?.is_complete() {
-            return Err(io::Error::other("incomplete request head"));
-        }
-        let mut length = None;
-        for header in head.headers.iter() {
-            if matches!(
-                header.name.to_ascii_lowercase().as_str(),
-                "transfer-encoding" | "trailer" | "upgrade" | "proxy-authorization" | "expect"
-            ) {
-                return Err(io::Error::other("unsupported request framing"));
-            }
-            if header.name.eq_ignore_ascii_case("content-length") {
-                if length.is_some()
-                    || header.value.is_empty()
-                    || !header.value.iter().all(u8::is_ascii_digit)
-                {
-                    return Err(io::Error::other("ambiguous request framing"));
-                }
-                length = Some(
-                    std::str::from_utf8(header.value)
-                        .map_err(io::Error::other)?
-                        .parse::<usize>()
-                        .map_err(io::Error::other)?,
-                );
-            }
-        }
-        let count = length.unwrap_or(0);
-        if count > limits.body_bytes
-            || bytes
-                .len()
-                .checked_add(count)
-                .is_none_or(|size| size > limits.request_bytes)
-        {
-            return Err(io::Error::other("request body limit exceeded"));
-        }
-        let start = bytes.len();
-        bytes.resize(start + count, 0);
-        stream.read_exact(&mut bytes[start..])?;
-        let capture = CapturedRequest::parse(&bytes, limits).map_err(io::Error::other)?;
         if !matches!(
             capture.authority().to_ascii_lowercase().as_str(),
             "api.github.com" | "api.github.com:443"

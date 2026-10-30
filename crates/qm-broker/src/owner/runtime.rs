@@ -677,6 +677,36 @@ mod github_tests {
     }
 
     #[test]
+    fn storage_relay_works_with_a_locked_vault_and_no_grants() {
+        let (storage, worker) = github::serve_routes(true, |_| github::text("log contents"));
+        let (_root, paths, shared, mut server, mut client) = setup(storage);
+        {
+            let mut state = shared.0.lock().unwrap();
+            state.provider.lock().unwrap();
+            state.authorizer.revoke_read_grants().unwrap();
+            assert!(state.authorizer.active_read_grants().is_empty());
+            state.github = Connector::FixtureWithStorage {
+                api: storage,
+                receiver: storage,
+                blob: storage,
+            };
+        }
+        client.write_all(b"GET /logs?sig=a%2Fb&x=1 HTTP/1.1\r\nHost: results-receiver.actions.githubusercontent.com\r\nAuthorization: Bearer caller-token\r\nCookie: caller-cookie\r\n\r\n").unwrap();
+        handle_http(&mut server, &shared, &paths).unwrap();
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.ends_with("log contents"));
+        assert_eq!(
+            worker.join().unwrap(),
+            vec![
+                "GET /logs?sig=a%2Fb&x=1 HTTP/1.1\r\nHost: results-receiver.actions.githubusercontent.com\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+            ]
+        );
+        assert!(shared.0.lock().unwrap().provider.snapshot().is_none());
+    }
+
+    #[test]
     fn github_runtime_returns_actual_issue_and_list_json_through_verified_ingress_with_no_ui() {
         for target in [
             "/repos/example/one/issues/987654321",

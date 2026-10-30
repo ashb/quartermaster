@@ -64,7 +64,7 @@ fn checked_target(
     Ok(target)
 }
 
-fn check_header_secret(value: &str, credential: &[u8]) -> Result<(), Error> {
+pub(super) fn check_header_secret(value: &str, credential: &[u8]) -> Result<(), Error> {
     let echoes = |value: &[u8]| {
         !credential.is_empty()
             && value
@@ -259,8 +259,21 @@ pub(super) fn read(stream: &mut impl Read, method: &str) -> Result<WireResponse,
 }
 
 impl WireResponse {
-    pub(super) fn application(self, credential: &[u8]) -> Result<Outcome, Error> {
+    pub(super) fn application(
+        self,
+        credential: &[u8],
+        log_download: bool,
+    ) -> Result<Outcome, Error> {
         self.check_body_secret(credential)?;
+        if self.header("location").is_some_and(|target| {
+            target.contains('\\')
+                || !((log_download && target.starts_with("https://"))
+                    || target.starts_with("https://api.github.com/")
+                    || target.starts_with("https://api.github.com:443/")
+                    || (target.starts_with('/') && !target.starts_with("//")))
+        }) {
+            return Err(Error);
+        }
         let mut headers = self.safe_headers(credential)?;
         for (name, value) in &self.headers {
             if !matches!(
@@ -416,7 +429,7 @@ impl WireResponse {
                 credential,
             )?;
             if target.action() == Action::Api {
-                return self.application(credential);
+                return self.application(credential, false);
             }
             return Ok(Outcome::Redirect(target));
         }
@@ -626,7 +639,43 @@ mod tests {
                 r#"{"ok":true}"#,
             )))
             .unwrap();
-            assert!(response.application(credential).is_err(), "{name}: {value}");
+            assert!(
+                response.application(credential, false).is_err(),
+                "{name}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_redirects_cannot_release_off_origin_bearer_urls() {
+        for target in [
+            "https://results-receiver.actions.githubusercontent.com/rest/runs/1/logs?signature=signed-canary",
+            "https://productionresultssa1.blob.core.windows.net/logs/file?sig=signed-canary",
+            "//storage.invalid/logs?sig=signed-canary",
+            "https://api.github.com@storage.invalid/logs?sig=signed-canary",
+            "https://api.github.com.evil.invalid/logs?sig=signed-canary",
+            "http://api.github.com/logs?sig=signed-canary",
+        ] {
+            let response = read(&mut Cursor::new(wire(
+                302,
+                &format!("Location: {target}\r\n"),
+                "",
+            )))
+            .unwrap();
+            assert!(response.application(TOKEN, false).is_err(), "{target}");
+        }
+        for target in [
+            "/future-api?page=2",
+            "https://api.github.com/future-api?page=2",
+            "https://api.github.com:443/future-api?page=2",
+        ] {
+            let response = read(&mut Cursor::new(wire(
+                302,
+                &format!("Location: {target}\r\n"),
+                "",
+            )))
+            .unwrap();
+            assert!(response.application(TOKEN, false).is_ok(), "{target}");
         }
     }
 
@@ -647,7 +696,7 @@ mod tests {
             assert!(
                 read(&mut Cursor::new(response))
                     .unwrap()
-                    .application(b"secret-token")
+                    .application(b"secret-token", false)
                     .is_err(),
                 "{media}"
             );
@@ -659,7 +708,7 @@ mod tests {
         );
         let Outcome::Response(response) = read(&mut Cursor::new(response))
             .unwrap()
-            .application(b"secret-token")
+            .application(b"secret-token", false)
             .unwrap()
         else {
             panic!()
@@ -682,7 +731,7 @@ mod tests {
         }
         let body = br#"{"data":{"viewer":{"login":"dummy"}}}"#;
         let wire = read(&mut &framed(&gzip(body))[..]).unwrap();
-        let Outcome::Response(response) = wire.application(b"secret-token").unwrap() else {
+        let Outcome::Response(response) = wire.application(b"secret-token", false).unwrap() else {
             panic!()
         };
         assert_eq!(response.public_parts().1, body);
@@ -691,7 +740,7 @@ mod tests {
         assert!(
             read(&mut &framed(&echo)[..])
                 .unwrap()
-                .application(b"secret-token")
+                .application(b"secret-token", false)
                 .is_err()
         );
         let oversized = gzip(&vec![b' '; BODY_LIMIT + 1]);

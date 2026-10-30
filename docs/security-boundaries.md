@@ -291,6 +291,35 @@ the original approval does not cover it. Existing grants can cover recognized
 redirected reads only after checking the new request. Vaultwarden routing is
 governed separately by the redirect decision below.
 
+Generic GitHub responses cannot return an off-origin `Location`, which may carry
+a signed download capability. Recognised Actions log requests are the exception:
+the caller receives GitHub's presigned HTTPS URL unchanged. Same-origin API
+redirects still require fresh request admission.
+
+### Actions log transfer contract
+
+Authorising a log request releases its time-limited download URL. GitHub enforces
+its scope and expiry; Quartermaster does not track URL ownership or retract an
+issued URL when a grant is revoked. This keeps download handling with the client
+instead of maintaining a second authorisation lifecycle for temporary URLs.
+Normal API authorisation and repository identity checks still apply to issuing
+requests.
+
+`gh` routes redirected downloads through its configured Unix socket. The broker
+therefore relays credential-free GETs to HTTPS port 443 at
+`results-receiver.actions.githubusercontent.com` and
+`productionresultssa<1–3 digits>.blob.core.windows.net`. It verifies TLS and
+forwards the path and query, with no GitHub token, caller headers, cookies or
+Referer. Storage access requires no vault unlock or read grant: possession of
+the URL is the upstream authority.
+
+Each relay has a 64 MiB wire-response limit and a 120-second total deadline.
+Connection setup and client writes have five-second limits. It streams without
+extracting archives; `gh` follows redirects, validates HTTP framing and handles
+ZIP contents. These limits do not
+bound the client's expanded data or cache. Signed URLs stay out of broker
+diagnostics and UI IPC, but are intentionally visible to the requesting client.
+
 ### GraphQL and changes to GitHub
 
 GraphQL rules cover the complete selected operation, including variables,

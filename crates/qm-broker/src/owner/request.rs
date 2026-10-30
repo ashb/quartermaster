@@ -343,7 +343,14 @@ pub(super) fn read_configured(
     let Some(config) = config.filter(|config| config.mode() == Mode::Github) else {
         return read(stream);
     };
-    let application = Arc::new(Application::read(stream, &config.read_patterns())?);
+    from_capture(super::github::request::read_capture(stream)?, config)
+}
+
+pub(super) fn from_capture(
+    capture: qm_api_github::CapturedRequest,
+    config: &GitHubConfig,
+) -> io::Result<FrozenOperation> {
+    let application = Arc::new(Application::from_capture(capture, &config.read_patterns())?);
     let capture = application.capture();
     let analysis = application.analysis();
     let resource = config.matched_read_repository(analysis);
