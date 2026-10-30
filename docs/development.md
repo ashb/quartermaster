@@ -24,6 +24,16 @@ just test
 just check
 ```
 
+To exercise an installed `gh` against isolated profiles and local TLS/ZIP fixtures:
+
+```sh
+just test //crates/qm-broker:gh_compatibility \
+  --test_env=QM_GH_EXECUTABLE="$(command -v gh)" --test_output=all
+```
+
+The child process can connect only to the fixture Unix socket. The test uses
+dummy credentials and requires no fingerprint or live GitHub access.
+
 The unsigned app is `bazel-bin/macos/Quartermaster.app`. Running the protected-key
 flows requires a signed build; see below. `just fmt` applies Rust formatting,
 and `just check` checks Rust formatting, Clippy, Swift formatting and BUILD files.

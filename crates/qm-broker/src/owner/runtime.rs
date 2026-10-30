@@ -3,6 +3,8 @@ mod control;
 mod dispatch;
 mod error;
 
+#[cfg(all(test, feature = "gh-compatibility"))]
+mod gh_tests;
 mod http;
 mod policy_source;
 mod settings;

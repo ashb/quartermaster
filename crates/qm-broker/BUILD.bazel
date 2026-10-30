@@ -49,6 +49,20 @@ rust_test(
 )
 
 rust_test(
+    name = "gh_compatibility",
+    args = ["owner::runtime::gh_tests::"],
+    compile_data = ["Cargo.toml"],
+    crate = ":qm_broker",
+    crate_features = ["gh-compatibility"],
+    edition = "2024",
+    tags = [
+        "local",
+        "manual",
+    ],
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
     name = "public_boundary",
     srcs = ["tests/public_boundary.rs"],
     compile_data = ["Cargo.toml"],

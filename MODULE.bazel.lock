@@ -765,7 +765,7 @@
           "FILE:@@//crates/qm-types/Cargo.toml 4cb74a7f84d868488a12c003a9ea8e09ef29810389a30e250e30e0c7cf37708c",
           "FILE:@@//crates/qm-providers/Cargo.toml 5592ca5400a3f21dd7689784eca599b21539a21db3ecd633fab4a704fa381e1b",
           "FILE:@@//crates/qm-macos/Cargo.toml 275f7d36dd090c7708514278ccc4cde94ccce733744582c3d0ef5aeccdcfcd33",
-          "FILE:@@//crates/qm-broker/Cargo.toml 6a8e84f3d3c69ab38e850755e3cf0570256cc27f3b8e110f5d4ce119c40daf26",
+          "FILE:@@//crates/qm-broker/Cargo.toml 1b7f2cedfa69a321c47d4b4b88d5d47454439a81304c9abac9d28ed659a258b7",
           "FILE:@@//crates/qm-api-github/Cargo.toml 328c91138ebcdac98c345fa909a0995a0f83cef3d888d89eb580956e792a2eca",
           "FILE:@@//crates/qm-api-macros/Cargo.toml ccb207bce90df4bc39a6d7df1ed9f8f4e6f5a7ff9c1328ddb4f9b846c7114e6c",
           "FILE:@@//bins/quartermasterd/Cargo.toml 49db2693710b90c38f9c46e9d83da2f16a110f666f8aa259f72b7ce4b58aaff6",

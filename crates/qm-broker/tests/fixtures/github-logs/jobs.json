@@ -1,0 +1,53 @@
+{
+  "total_count": 2,
+  "jobs": [
+    {
+      "id": 301,
+      "run_id": 101,
+      "run_attempt": 2,
+      "name": "build",
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-10-27T12:00:00Z",
+      "completed_at": "2026-10-27T12:01:00Z",
+      "html_url": "https://github.com/example/one/actions/runs/101/job/301",
+      "url": "https://api.github.com/repos/example/one/actions/jobs/301",
+      "check_run_url": "https://api.github.com/repos/example/one/check-runs/301",
+      "steps": [
+        {
+          "name": "Build",
+          "number": 1,
+          "status": "completed",
+          "conclusion": "failure",
+          "started_at": "2026-10-27T12:00:00Z",
+          "completed_at": "2026-10-27T12:01:00Z"
+        }
+      ],
+      "run_url": "https://api.github.com/repos/example/one/actions/runs/101"
+    },
+    {
+      "id": 302,
+      "run_id": 101,
+      "run_attempt": 2,
+      "name": "lint",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-27T12:00:00Z",
+      "completed_at": "2026-10-27T12:01:00Z",
+      "html_url": "https://github.com/example/one/actions/runs/101/job/302",
+      "url": "https://api.github.com/repos/example/one/actions/jobs/302",
+      "check_run_url": "https://api.github.com/repos/example/one/check-runs/302",
+      "steps": [
+        {
+          "name": "Build",
+          "number": 1,
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-10-27T12:00:00Z",
+          "completed_at": "2026-10-27T12:01:00Z"
+        }
+      ],
+      "run_url": "https://api.github.com/repos/example/one/actions/runs/101"
+    }
+  ]
+}

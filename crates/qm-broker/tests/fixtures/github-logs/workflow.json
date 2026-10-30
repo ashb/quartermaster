@@ -1,0 +1,6 @@
+{
+  "id": 201,
+  "name": "CI",
+  "path": ".github/workflows/ci.yml",
+  "state": "active"
+}
