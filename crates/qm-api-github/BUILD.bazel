@@ -1,11 +1,66 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 # gazelle:resolve rust hegel @crates//:hegeltest
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(["Cargo.toml"])
+
+SCHEMA_DATA = [
+    "tests/schema_drift.cjs",
+    "@github_graphql_schema//file",
+    "@github_rest_schema//file",
+    "@graphql_reference//:index.js",
+    "@graphql_reference//:sources",
+    "@graphql_reference_node//:bin/node",
+]
+
+SCHEMA_ENV = {
+    "QM_GITHUB_GRAPHQL_SCHEMA": "$(rootpath @github_graphql_schema//file)",
+    "QM_GITHUB_REST_SCHEMA": "$(rootpath @github_rest_schema//file)",
+    "QM_REFERENCE_GRAPHQL": "$(rootpath @graphql_reference//:index.js)",
+    "QM_REFERENCE_NODE": "$(rootpath @graphql_reference_node//:bin/node)",
+    "QM_SCHEMA_READER": "$(rootpath tests/schema_drift.cjs)",
+}
+
+rust_test(
+    name = "schema_drift",
+    args = [
+        "--exact",
+        "api_review::tests::upstream_matches_parser_reviews",
+    ],
+    compile_data = ["Cargo.toml"],
+    crate = ":qm_api_github",
+    crate_features = ["live-api-schema"],
+    data = SCHEMA_DATA,
+    edition = "2024",
+    env = SCHEMA_ENV,
+    tags = [
+        "external",
+        "manual",
+    ],
+    deps = all_crate_deps(normal_dev = True),  # keep
+)
+
+sh_test(
+    name = "schema_drift_test",
+    srcs = ["@graphql_reference_node//:bin/node"],
+    args = [
+        "--test",
+        "$(rootpath tests/schema_drift_test.cjs)",
+    ],
+    data = [
+        "tests/schema_drift.cjs",
+        "tests/schema_drift_test.cjs",
+        "@graphql_reference//:index.js",
+        "@graphql_reference//:sources",
+    ],
+    env = {
+        "QM_REFERENCE_GRAPHQL": "$(rootpath @graphql_reference//:index.js)",
+    },
+)
 
 rust_library(
     name = "qm_api_github",
@@ -16,7 +71,7 @@ rust_library(
         "README.md",
     ] + glob(["tests/fixtures/**"]),  # keep
     edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True),  # keep
+    proc_macro_deps = ["//crates/qm-api-macros:qm_api_macros"] + all_crate_deps(proc_macro = True),  # keep
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True),  # keep
 )
@@ -25,7 +80,9 @@ rust_test(
     name = "qm_api_github_test",
     compile_data = ["Cargo.toml"],
     crate = ":qm_api_github",
+    data = SCHEMA_DATA,
     edition = "2024",
+    env = SCHEMA_ENV,
     tags = ["external"],
     deps = all_crate_deps(normal_dev = True),  # keep
 )

@@ -1874,13 +1874,25 @@ name = "qm-api-github"
 version = "0.0.0"
 dependencies = [
  "apollo-parser",
+ "base64 0.22.1",
  "form_urlencoded",
  "hegeltest",
  "http",
  "httparse",
+ "qm-api-macros",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "qm-api-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

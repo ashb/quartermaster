@@ -7,6 +7,7 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
+#[qm_api_macros::reviewed]
 pub(crate) fn inspect(
     request: &CapturedRequest,
     analysis: &mut Analysis,
@@ -47,12 +48,20 @@ pub(crate) fn inspect(
         analysis.resource(Resource::IssueNumber(number));
     }
     let kind = match (request.method(), &parts[4..]) {
+        #[api("REST GET /repos/{owner}/{repo}", "5oRtEjt_vvA")]
         ("GET", []) => Some(EffectKind::ReadRepository),
+        #[api("REST DELETE /repos/{owner}/{repo}", "lV8OND053e8")]
         ("DELETE", []) => Some(EffectKind::DeleteRepository),
+        #[api("REST GET /repos/{owner}/{repo}/issues", "_QySwn1sNTM")]
         ("GET", ["issues"]) => Some(EffectKind::ListIssues),
+        #[api("REST GET /repos/{owner}/{repo}/issues/{issue_number}", "gVssCz9GLCc")]
         ("GET", ["issues", number]) if positive_integer(number).is_some() => {
             Some(EffectKind::ReadIssue)
         }
+        #[api(
+            "REST PATCH /repos/{owner}/{repo}/issues/{issue_number}",
+            "KcqMdMcr0w4"
+        )]
         ("PATCH", ["issues", number]) if positive_integer(number).is_some() => {
             inspect_close(request, analysis, json_depth)?;
             None
@@ -69,6 +78,16 @@ pub(crate) fn inspect(
                 None
             }
         },
+        #[api_unrecognised(
+            "REST POST /repos/{owner}/{repo}/merges",
+            "4serHaXvH4Y",
+            "Merge semantics are not modelled"
+        )]
+        #[api_remainder(
+            "REST",
+            "OUSIhTaShFY",
+            "Remaining REST operations and shared schemas require review when they change"
+        )]
         _ => {
             analysis.unknown(Location::Target, UncoveredReason::Endpoint);
             None
@@ -142,11 +161,15 @@ pub(crate) fn inspect(
     Ok(())
 }
 
+#[qm_api_macros::reviewed]
 fn read_endpoint(parts: &[&str]) -> Option<(EffectKind, Vec<Resource>)> {
     let id = |value: &str| positive_integer(value).and_then(std::num::NonZeroU64::new);
     let (kind, resources) = match parts {
+        #[api("REST GET /repos/{owner}/{repo}/readme", "REexC1UfjUs")]
         ["readme"] => (EffectKind::ReadReadme, vec![]),
+        #[api("REST GET /repos/{owner}/{repo}/pulls", "qcomvcmkmLQ")]
         ["pulls"] => (EffectKind::ListPullRequests, vec![]),
+        #[api("REST GET /repos/{owner}/{repo}/pulls/{pull_number}", "0Oa4sHxxRpQ")]
         ["pulls", number] => (
             EffectKind::ReadPullRequest,
             vec![Resource::PullRequestNumber(id(number)?)],

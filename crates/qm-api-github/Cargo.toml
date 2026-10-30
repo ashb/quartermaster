@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+live-api-schema = []
+
 [dependencies]
+qm-api-macros = { path = "../qm-api-macros" }
 form_urlencoded = "=1.2.2"
 apollo-parser = "=0.8.7"
 http = "1"
@@ -15,4 +19,6 @@ serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
+base64 = "=0.22.1"
+sha2 = "=0.10.9"
 hegel = { package = "hegeltest", version = "=0.50.3", features = ["static-engine"] }

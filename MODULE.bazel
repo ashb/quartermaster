@@ -49,6 +49,23 @@ use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+http_file(
+    name = "github_rest_schema",
+    dev_dependency = True,
+    downloaded_file_path = "schema.json",
+    sha256 = "b81f098026e98084a83f0a33db43502213919f68449b028543c373757766a758",
+    urls = ["https://raw.githubusercontent.com/github/rest-api-description/c66e298030d4070b70a569dcd4268b3a041b5380/descriptions/api.github.com/api.github.com.json"],
+)
+
+http_file(
+    name = "github_graphql_schema",
+    dev_dependency = True,
+    downloaded_file_path = "schema.graphql",
+    sha256 = "0d71ca68a4e951599b2ea541a81cc259a843608fc22b8eb1713a1d03551b149e",
+    urls = ["https://raw.githubusercontent.com/github/docs/6cbe6413ac7177bb692a78c171a74ae8be50d721/src/graphql/data/fpt/schema.docs.graphql"],
+)
 
 http_archive(
     name = "graphql_reference_node",

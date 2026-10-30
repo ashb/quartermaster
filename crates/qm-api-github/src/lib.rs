@@ -2,6 +2,8 @@
 #![doc = include_str!("../README.md")]
 
 mod analysis;
+#[cfg(test)]
+mod api_review;
 mod graphql;
 mod json;
 mod request;

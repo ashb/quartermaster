@@ -63,6 +63,7 @@ fn object(name: &'static str) -> Context {
     }
 }
 
+#[qm_api_macros::reviewed]
 pub(super) fn inspect(
     analysis: &mut Analysis,
     context: Context,
@@ -74,11 +75,14 @@ pub(super) fn inspect(
     let mut valid = empty;
     let mut related = None;
     let child = match (context, name) {
+        #[api("GraphQL Repository.hasIssuesEnabled", "GUWUxdniRlM")]
         (Context::Repository, "hasIssuesEnabled") => None,
         (Context::Repository, "owner") => {
             related = Some(EffectKind::ReadRelatedSummaries);
             Some(Object("RepositoryOwner"))
         }
+        #[api("GraphQL Repository.issueOrPullRequest", "H9ijbKI5gO4")]
+        #[api("GraphQL Repository.pullRequest", "f-U45W-ttxU")]
         (Context::Repository, "issueOrPullRequest" | "pullRequest") => {
             let number = args.unique("number").and_then(|value| match value {
                 Json::Number(value) => value
@@ -102,6 +106,7 @@ pub(super) fn inspect(
                 Some(Object("PullRequest"))
             }
         }
+        #[api("GraphQL Repository.pullRequests", "94RRSA_n2IE")]
         (Context::Repository, "pullRequests") => {
             analysis.effect_graphql(EffectKind::ListPullRequests, path);
             valid = args.object().is_some_and(|fields| {

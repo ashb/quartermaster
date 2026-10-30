@@ -1,5 +1,7 @@
 mod schema;
 use schema::Context;
+#[cfg(test)]
+pub(crate) use schema::{DETAIL_API_REVIEWS, INSPECT_API_REVIEWS as SCHEMA_API_REVIEWS};
 
 use crate::{
     CapturedRequest,

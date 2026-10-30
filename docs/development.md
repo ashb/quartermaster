@@ -39,6 +39,34 @@ update `Cargo.lock`, then run `bazelisk run //:gazelle` after dependency or sour
 changes. Review the generated BUILD changes before committing. `just fetch`
 downloads dependencies and toolchains ahead of a build.
 
+### GitHub API drift
+
+`just test` checks the parser's API review annotations against the GitHub schemas
+pinned in `MODULE.bazel` and cached by Bazel. The live check has Bazel's `manual`
+tag; run it explicitly in CI or locally:
+
+```sh
+just test-github-schema
+```
+
+This fetches the latest public schemas. Added or removed API entries, changed
+REST operations/shared schemas and GraphQL signatures fail the Rust review test.
+Download failures also fail it; documentation-only edits are ignored.
+
+Review records sit on parser match arms: `#[api(...)]` for recognised operations,
+`#[api_unrecognised(...)]` for explicit omissions, and `#[api_remainder(...)]` for
+the remaining schema. The remainder fingerprints the exact IDs and signatures;
+new entries change it. Fingerprints use the first 64 bits of SHA-256, encoded as
+11 URL-safe base64 characters without padding. The macro preserves the handler
+and emits metadata only under `cfg(test)`.
+
+When the check fails, review the reported changes, then update the affected
+annotation fingerprints. Add recognition if needed, or acknowledge the change in
+an unrecognised/remainder annotation. Update the schema revision URLs and SHA-256
+hashes in `MODULE.bazel` so local tests use the reviewed version. Do not commit
+downloaded specs. These records cannot grant or reject runtime requests;
+unfamiliar requests retain their existing per-request approval path.
+
 ## Sign and run
 
 Use an Apple development certificate with its private key available in Keychain.

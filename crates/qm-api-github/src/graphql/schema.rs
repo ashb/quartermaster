@@ -4,6 +4,8 @@ use crate::{
 };
 
 mod details;
+#[cfg(test)]
+pub(crate) use details::INSPECT_API_REVIEWS as DETAIL_API_REVIEWS;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Context {
@@ -119,6 +121,7 @@ pub(super) fn input_type_matches(name: &str, value: &Json) -> Option<bool> {
     })
 }
 
+#[qm_api_macros::reviewed]
 pub(super) fn inspect(
     analysis: &mut Analysis,
     context: Context,
@@ -134,6 +137,7 @@ pub(super) fn inspect(
         return None;
     }
     let (child, allowed): (Option<Context>, &[&str]) = match (context, name) {
+        #[api("GraphQL Query.repository", "Cp_-9h7Fx9s")]
         (Context::Query, "repository") => {
             match (
                 args.unique("owner").and_then(Json::string),
@@ -209,6 +213,9 @@ pub(super) fn inspect(
             };
             (Some(Context::Issue), &["number"])
         }
+        #[api("GraphQL Mutation.closeIssue", "5WEeyQese5A")]
+        #[api("GraphQL Mutation.reopenIssue", "9N9jFfJiS1I")]
+        #[api("GraphQL Mutation.deleteIssue", "lo_KTeZ5N9o")]
         (Context::Mutation, "closeIssue" | "reopenIssue" | "deleteIssue") => {
             analysis.effect_graphql(
                 if name == "closeIssue" {
@@ -247,6 +254,7 @@ pub(super) fn inspect(
                 &["input"],
             )
         }
+        #[api("GraphQL Repository.name", "Y--GLPUUapU")]
         (
             Context::Repository,
             "id" | "name" | "nameWithOwner" | "url" | "description" | "isPrivate",
@@ -264,6 +272,16 @@ pub(super) fn inspect(
         (Context::Issues, "edges") => (Some(Context::Edge), &[]),
         (Context::Issues, "pageInfo") => (Some(Context::PageInfo), &[]),
         (Context::Edge, "node") | (Context::ClosePayload, "issue") => (Some(Context::Issue), &[]),
+        #[api_unrecognised(
+            "GraphQL Mutation.mergePullRequest",
+            "9ac9sTiJy94",
+            "Merge mutation semantics are not modelled"
+        )]
+        #[api_remainder(
+            "GraphQL",
+            "r7eysSNpr_c",
+            "Remaining GraphQL fields, inputs and types require review when they change"
+        )]
         _ => {
             if let Some(child) = details::inspect(analysis, context, name, args, path) {
                 return child;

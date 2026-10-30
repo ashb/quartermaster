@@ -10,6 +10,10 @@ fetch:
 test *targets="//...":
     bazelisk test "$@"
 
+# Compare fresh public GitHub schemas with the reviewed baseline.
+test-github-schema:
+    bazelisk test //crates/qm-api-github:schema_drift --test_output=all
+
 # Integration tests; hardware cases require an attended fingerprint.
 test-integration *args:
     #!/bin/sh
