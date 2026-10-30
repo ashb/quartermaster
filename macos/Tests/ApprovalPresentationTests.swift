@@ -79,11 +79,26 @@ private func approvalPresentation(
     #expect(presentation.ancestryNotice == nil)
 }
 
+@Test func processRootIsSelectableWithoutReplacingItWithSingleRequestApproval() throws {
+    let roots = try JSONDecoder().decode(
+        [ReadRootChoice].self,
+        from: Data(
+            #"[{"id":"process","pid":30,"executable":"/bin/gh","scope":"process"},{"id":"shell","pid":20,"executable":"/bin/zsh","scope":"descendants"}]"#
+                .utf8))
+    let rows = ProcessTreeRow.make(
+        processes: [
+            DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false),
+            DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false),
+        ], peerPID: 30, roots: roots, allowsSelection: true)
+    #expect(rows.map(\.choice) == [.root("shell"), .root("process")])
+    #expect(rows.map(\.label) == ["This shell", "This process"])
+}
+
 @Test func processRowsOnlyOfferMatchingVerifiedRootsAndTheRequestLeaf() throws {
     let root = try JSONDecoder().decode(
         ReadRootChoice.self,
         from: Data(
-            #"{"id":"20:0000000000000001:00000001","pid":20,"executable":"/bin/zsh"}"#.utf8))
+            #"{"id":"20:0000000000000001:00000001","pid":20,"executable":"/bin/zsh","scope":"descendants"}"#.utf8))
     let processes = [
         DialogProcess(pid: 10, name: "login", executable: "/usr/bin/login", limited: true),
         DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false),
@@ -210,11 +225,11 @@ private func approvalPresentation(
 @MainActor func switchingReadScopeKeepsTheApprovalWindowHeight(_ effect: String, _ path: String) throws {
     let root: [String: Any] = [
         "id": "123:0000000000000001:00000001", "pid": 123,
-        "executable": "/nix/store/example-zsh/bin/zsh",
+        "executable": "/nix/store/example-zsh/bin/zsh", "scope": "descendants",
     ]
     let parent: [String: Any] = [
         "id": "100:0000000000000002:00000001", "pid": 100,
-        "executable": "/bin/bash",
+        "executable": "/bin/bash", "scope": "descendants",
     ]
     var request: [String: Any] = [
         "repository": "quartermaster/one", "repositoryId": 123,
@@ -281,4 +296,51 @@ func suppliedResourceTitlesPreserveUnicode(_ title: String) throws {
     let presentation = try approvalPresentation(intent: ["kind": "issue", "action": "closeIssue", "number": 42])
     #expect(presentation.operationTitle == "Close issue #42")
     #expect(presentation.additionalEffects.isEmpty)
+}
+
+@Test(arguments: [
+    (["repository"], "Allow repository reads", "README", "Repository"),
+    (["issues"], "Allow issue and PR reads", "pull requests", "Issues and PRs"),
+    (["actions"], "Allow Actions metadata reads", "artifact lists", "Actions metadata"),
+    (["output"], "Allow build output reads", "sensitive", "Build output"),
+    (["repository", "issues"], "Allow selected GitHub reads", "across repositories", "Repository, Issues and PRs"),
+    (
+        ["repository", "issues", "actions", "output"], "Allow GitHub reads", "logs",
+        "Repository, Issues and PRs, Actions metadata, Build output"
+    ),
+])
+func typedReadScopesRenderOnlyTheirSelectedDescriptions(
+    categories: [String], title: String, summary: String, name: String
+) throws {
+    let presentation = try approvalPresentation(intent: [
+        "kind": "readGrant",
+        "grant": [
+            "id": "grant", "repository": "example/project", "expiresUnix": 4600,
+            "root": ["id": "root", "pid": 123, "executable": "/bin/zsh", "scope": "descendants"],
+            "permission": ["kind": "githubCategories", "categories": categories],
+        ],
+    ])
+    let grant = try #require(presentation.readGrant)
+    #expect(presentation.operationTitle == title)
+    #expect(grant.summary.contains(summary))
+    #expect(grant.summary.contains("logs") == categories.contains("output"))
+    #expect(grant.scopeName == name)
+    #expect(presentation.authenticationReason == "\(title) in example/project")
+}
+
+@Test(arguments: ["process", "descendants"])
+func grantDescriptionDistinguishesProcessFromShellLifetime(_ scope: String) throws {
+    let presentation = try approvalPresentation(intent: [
+        "kind": "readGrant",
+        "grant": [
+            "id": "grant", "repository": "example/project", "expiresUnix": 4600,
+            "root": ["id": "root", "pid": 123, "executable": "/bin/gh", "scope": scope],
+            "permission": ["kind": "githubCategories", "categories": ["repository", "issues", "actions", "output"]],
+        ],
+    ])
+    let grant = try #require(presentation.readGrant)
+    #expect(grant.summary.contains("Only this running process") == (scope == "process"))
+    #expect(grant.summary.contains("shell's descendants") == (scope == "descendants"))
+    #expect(grant.summary.contains("Writes need separate approval"))
+    #expect(grant.lifetimeDescription.contains(scope == "process" ? "process exits" : "shell exits"))
 }

@@ -676,6 +676,50 @@ mod github_tests {
         Ok(response)
     }
 
+    fn enable_github_read_scope(shared: &Shared) {
+        let mut state = shared.0.lock().unwrap();
+        let active = serde_json::to_value(state.authorizer.active_read_grants()).unwrap();
+        let mut policy: Value = serde_json::from_slice(&test_support::policy_bytes(1)).unwrap();
+        policy["grants"] = active
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|claim| {
+                let mut grant = claim["grant"].clone();
+                grant["effects"] =
+                    json!({"kind":"categories","categories":["repository","issues","actions","output"]});
+                grant
+            })
+            .collect::<Vec<_>>()
+            .into();
+        state
+            .authorizer
+            .seed_native_fixture_grants(&serde_json::to_vec(&policy).unwrap());
+    }
+
+    #[test]
+    fn github_log_redirect_needs_only_repository_binding_and_the_log_request() {
+        for target in [
+            "/repos/example/one/actions/runs/101/logs",
+            "/repos/example/one/actions/runs/101/attempts/2/logs",
+            "/repos/example/one/actions/jobs/301/logs",
+        ] {
+            let location =
+                "https://results-receiver.actions.githubusercontent.com/logs?sig=a%2Fb&x=1";
+            let (address, worker) =
+                github::serve(vec![github::repository(123), github::redirect(location)]);
+            let (_root, paths, shared, mut server, mut client) = setup(address);
+            enable_github_read_scope(&shared);
+            let response = request(&mut server, &mut client, &shared, &paths, target).unwrap();
+            assert!(response.starts_with("HTTP/1.1 307"));
+            assert!(response.contains(&format!("Location: {location}\r\n")));
+            let requests = worker.join().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].starts_with("GET /repos/example/one HTTP/1.1"));
+            assert!(requests[1].starts_with(&format!("GET {target} HTTP/1.1")));
+        }
+    }
+
     #[test]
     fn storage_relay_works_with_a_locked_vault_and_no_grants() {
         let (storage, worker) = github::serve_routes(true, |_| github::text("log contents"));

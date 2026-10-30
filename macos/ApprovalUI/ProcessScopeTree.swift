@@ -31,15 +31,20 @@ struct ProcessTreeRow: Identifiable {
         processes: [DialogProcess], peerPID: UInt32, roots: [ReadRootChoice], allowsSelection: Bool
     ) -> [Self] {
         processes.map { process in
-            let root = roots.firstIndex { $0.pid == process.pid && $0.executable == process.executable }
+            let root = roots.first { $0.pid == process.pid && $0.executable == process.executable }
             let choice: ProcessChoice?
             let label: String
-            if allowsSelection, process.pid == peerPID, !process.limited {
+            if allowsSelection, !process.limited, let root {
+                choice = .root(root.id)
+                switch root.scope {
+                case .process: label = "This process"
+                case .descendants:
+                    label =
+                        root.id == roots.first(where: { $0.scope == .descendants })?.id ? "This shell" : "Parent shell"
+                }
+            } else if allowsSelection, process.pid == peerPID, !process.limited {
                 choice = .request
                 label = "This request"
-            } else if allowsSelection, !process.limited, let root {
-                choice = .root(roots[root].id)
-                label = root == 0 ? "This shell" : "Parent shell"
             } else {
                 choice = nil
                 label = ""

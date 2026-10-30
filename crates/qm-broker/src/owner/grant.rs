@@ -1,10 +1,12 @@
 use super::{
     deadline::{Deadline, Sample},
     dispatch::CredentialSelection,
+    github::read_scope::ReadCategory,
     identity::{RootDescription, VerifiedPrincipal, VerifiedRoot},
     policy::AuthorizationError,
     request::{Action, FrozenOperation},
 };
+use qm_api_github::EffectKind as ReadEffect;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,17 +19,59 @@ use time::OffsetDateTime;
 #[serde(transparent)]
 struct GrantId(String);
 
-#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-enum ReadEffect {
-    ListIssues,
-    ReadIssue,
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum ReadEffects {
+    IssueReads { effects: Vec<ReadEffect> },
+    Categories { categories: Vec<ReadCategory> },
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct ReadEffects {
-    effects: Vec<ReadEffect>,
+impl ReadEffects {
+    fn for_request(request: &FrozenOperation) -> Result<Self, AuthorizationError> {
+        if let Some(application) = request.application() {
+            ReadCategory::for_effects(
+                application
+                    .analysis()
+                    .effects
+                    .iter()
+                    .map(|effect| effect.kind),
+            )
+            .ok_or(AuthorizationError::Denied)?;
+            Ok(Self::Categories {
+                categories: ReadCategory::ALL.to_vec(),
+            })
+        } else {
+            Ok(Self::IssueReads {
+                effects: vec![ReadEffect::ListIssues, ReadEffect::ReadIssue],
+            })
+        }
+    }
+
+    fn covers(&self, operation: &FrozenOperation) -> bool {
+        match self {
+            Self::IssueReads { effects } => effects.iter().any(|effect| {
+                matches!(
+                    (effect, operation.action()),
+                    (ReadEffect::ReadIssue, Action::ReadIssue)
+                        | (ReadEffect::ListIssues, Action::ListIssues)
+                )
+            }),
+            Self::Categories { categories } => {
+                operation.is_reusable_read()
+                    && !categories.is_empty()
+                    && operation.application().is_some_and(|application| {
+                        let analysis = application.analysis();
+                        analysis.complete()
+                            && !analysis.effects.is_empty()
+                            && analysis.effects.iter().all(|effect| {
+                                categories
+                                    .iter()
+                                    .any(|category| category.covers(effect.kind))
+                            })
+                    })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,16 +114,23 @@ pub(super) struct ReadGrantDisplay {
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum ReadPermission {
     IssueReads,
+    GithubCategories { categories: Vec<ReadCategory> },
 }
 
 impl ReadGrantClaims {
     pub(super) fn display(&self) -> ReadGrantDisplay {
+        let permission = match &self.grant.effects {
+            ReadEffects::IssueReads { .. } => ReadPermission::IssueReads,
+            ReadEffects::Categories { categories } => ReadPermission::GithubCategories {
+                categories: categories.clone(),
+            },
+        };
         ReadGrantDisplay {
             id: self.grant.id.0.clone(),
             repository: self.grant.repository.clone(),
             root: self.grant.root.clone(),
             expires_unix: self.grant.expires_unix.unix_timestamp(),
-            permission: ReadPermission::IssueReads,
+            permission,
         }
     }
 
@@ -116,13 +167,7 @@ impl GrantRule {
         session: [u8; 16],
     ) -> bool {
         principal.matches(self.uid, &self.code_hash, session)
-            && self.effects.effects.iter().any(|effect| {
-                matches!(
-                    (effect, operation.action()),
-                    (ReadEffect::ReadIssue, Action::ReadIssue)
-                        | (ReadEffect::ListIssues, Action::ListIssues)
-                )
-            })
+            && self.effects.covers(operation)
             && operation.repository() == self.repository
     }
 }
@@ -149,9 +194,7 @@ impl ReadGrantProposal {
         request: &FrozenOperation,
         role: &str,
     ) -> Result<Self, AuthorizationError> {
-        if !matches!(request.action(), Action::ListIssues | Action::ReadIssue)
-            || !matches!(role, "github-read" | "github-write")
-        {
+        if !request.is_reusable_read() || !matches!(role, "github-read" | "github-write") {
             return Err(AuthorizationError::Denied);
         }
         let anchor =
@@ -173,9 +216,7 @@ impl ReadGrantProposal {
                 id: GrantId(id.iter().map(|byte| format!("{byte:02x}")).collect()),
                 uid: principal.uid(),
                 code_hash: principal.code_hash().to_owned(),
-                effects: ReadEffects {
-                    effects: vec![ReadEffect::ListIssues, ReadEffect::ReadIssue],
-                },
+                effects: ReadEffects::for_request(request)?,
                 root: root.description().clone(),
                 repository: request.repository().to_owned(),
                 role: role.to_owned(),
@@ -253,6 +294,7 @@ impl Grant {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct GrantUse {
     id: GrantId,
     role: String,
@@ -889,6 +931,278 @@ mod tests {
             ),
             Err(AuthorizationError::Denied)
         ));
+    }
+
+    #[test]
+    fn default_read_grant_covers_all_recognised_categories_across_connections() {
+        let config = github_config(123);
+        let principal = crate::owner::test_support::principal([1; 16]);
+        let now = Instant::now();
+        let selection = crate::owner::test_support::vault::selection(
+            &crate::owner::test_support::vault::snapshot("github-read"),
+        );
+        for first in [
+            "/repos/example/one/issues/42",
+            "/repos/example/one/actions/runs/101",
+        ] {
+            let proposal = super::ReadGrantProposal::new(
+                &principal,
+                &github_read(&config, first),
+                "github-read",
+            )
+            .unwrap();
+            let mut grants = super::GrantTable::default();
+            grants
+                .issue(proposal, &principal, selection.clone(), now)
+                .unwrap();
+            let next_connection = VerifiedPrincipal::fixture_with_connection(
+                501,
+                principal.code_hash().into(),
+                [1; 16],
+                [99; 16],
+            );
+            for path in [
+                "/repos/example/one/readme",
+                "/repos/example/one/pulls/42",
+                "/repos/example/one/actions/jobs/301",
+                "/repos/example/one/actions/jobs/301/logs",
+            ] {
+                assert!(
+                    grants
+                        .authorize(&next_connection, &github_read(&config, path), [1; 16], now)
+                        .is_ok(),
+                    "{first} -> {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_grants_exclude_other_executions_while_explicit_shell_grants_admit_them() {
+        let config = github_config(123);
+        let principal = crate::owner::test_support::principal([1; 16]);
+        let other =
+            crate::owner::test_support::principal([1; 16]).with_fixture_root("other-process");
+        let request = github_read(&config, "/repos/example/one/actions/runs/101");
+        let selection = crate::owner::test_support::vault::selection(
+            &crate::owner::test_support::vault::snapshot("github-read"),
+        );
+        let now = Instant::now();
+        for shell in [false, true] {
+            let mut proposal =
+                super::ReadGrantProposal::new(&principal, &request, "github-read").unwrap();
+            if shell {
+                let root = principal.roots().unwrap().remove(1);
+                proposal.select(root, &principal).unwrap();
+            }
+            let root = proposal.root.clone();
+            let mut grants = super::GrantTable::default();
+            grants
+                .issue(proposal, &principal, selection.clone(), now)
+                .unwrap();
+            assert_eq!(
+                grants.authorize(&other, &request, [1; 16], now).is_ok(),
+                shell
+            );
+            assert!(grants.authorize(&principal, &request, [1; 16], now).is_ok());
+            root.invalidate();
+            assert!(
+                grants
+                    .authorize(&principal, &request, [1; 16], now)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn actions_metadata_grants_cover_only_their_category_and_every_observed_effect() {
+        let now = Instant::now();
+        let mut owner = Authorizer::new([1; 16]);
+        owner
+            .install(
+                Ok(github_policy(123)),
+                crate::owner::test_support::wall(1000),
+                now,
+            )
+            .unwrap();
+        let principal = crate::owner::test_support::principal([1; 16]);
+        let config = github_config(123);
+        let request = github_read(&config, "/repos/example/one/actions/runs/101");
+        assert!(owner.authorize(&principal, request.clone(), now).is_err());
+        let mut proposal =
+            super::ReadGrantProposal::new(&principal, &request, "github-read").unwrap();
+        proposal.rule.effects = super::ReadEffects::Categories {
+            categories: vec![super::ReadCategory::Actions],
+        };
+        let claims = serde_json::to_value(proposal.claims()).unwrap();
+        assert_eq!(claims["purpose"], "quartermaster.read-grant");
+        assert_eq!(claims["grant"]["effects"]["kind"], "categories");
+        assert_eq!(
+            claims["grant"]["effects"]["categories"],
+            serde_json::json!(["actions"])
+        );
+        assert!(claims["grant"]["effects"].get("effects").is_none());
+
+        let snapshot = crate::owner::test_support::vault::snapshot("github-read");
+        let selection = crate::owner::test_support::vault::selection(&snapshot);
+        let mut grants = super::GrantTable::default();
+        grants
+            .issue(proposal, &principal, selection.clone(), now)
+            .unwrap();
+        for path in [
+            "/repos/example/one/actions/runs/101",
+            "/repos/example/one/actions/jobs/301",
+            "/repos/example/one/actions/workflows",
+        ] {
+            let read = github_read(&config, path);
+            let allowed = grants.authorize(&principal, &read, [1; 16], now).unwrap();
+            assert!(grants.accepts(&allowed, &selection));
+            let unrelated =
+                crate::owner::test_support::principal([1; 16]).with_fixture_root("unrelated");
+            assert!(grants.authorize(&unrelated, &read, [1; 16], now).is_err());
+            assert!(grants.authorize(&principal, &read, [2; 16], now).is_err());
+            assert!(
+                grants
+                    .authorize(&principal, &read, [1; 16], now + Duration::from_secs(3601))
+                    .is_err()
+            );
+        }
+        for path in [
+            "/repos/example/one/actions/jobs/301/logs",
+            "/repos/example/one/check-runs/301/annotations",
+            "/repos/example/one/readme",
+            "/repos/example/one/issues/42",
+            "/repos/example/one/pulls/42",
+        ] {
+            assert!(
+                grants
+                    .authorize(&principal, &github_read(&config, path), [1; 16], now)
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            grants
+                .authorize(
+                    &principal,
+                    &github_read(&config, "/repos/example/two/actions/runs/101"),
+                    [1; 16],
+                    now
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn read_category_grants_cannot_authorise_other_categories() {
+        let config = github_config(123);
+        let principal = crate::owner::test_support::principal([1; 16]);
+        let now = Instant::now();
+        let selection = crate::owner::test_support::vault::selection(
+            &crate::owner::test_support::vault::snapshot("github-read"),
+        );
+        let paths = [
+            ["/repos/example/one", "/repos/example/one/readme"],
+            ["/repos/example/one/pulls", "/repos/example/one/issues/42"],
+            [
+                "/repos/example/one/actions/runs",
+                "/repos/example/one/actions/jobs/301",
+            ],
+            [
+                "/repos/example/one/actions/runs/101/logs",
+                "/repos/example/one/check-runs/301/annotations",
+            ],
+        ];
+        for (approved, [first, _]) in paths.iter().enumerate() {
+            let request = github_read(&config, first);
+            let mut proposal =
+                super::ReadGrantProposal::new(&principal, &request, "github-read").unwrap();
+            proposal.rule.effects = super::ReadEffects::Categories {
+                categories: vec![super::ReadCategory::ALL[approved]],
+            };
+            let display = proposal.claims().display();
+            assert_eq!(display.repository, "example/one");
+            assert_eq!(
+                display.permission,
+                super::ReadPermission::GithubCategories {
+                    categories: vec![
+                        [
+                            super::ReadCategory::Repository,
+                            super::ReadCategory::Issues,
+                            super::ReadCategory::Actions,
+                            super::ReadCategory::Output
+                        ][approved]
+                    ],
+                }
+            );
+            let mut grants = super::GrantTable::default();
+            grants
+                .issue(proposal, &principal, selection.clone(), now)
+                .unwrap();
+            for (category, endpoints) in paths.iter().enumerate() {
+                for endpoint in endpoints {
+                    let read = github_read(&config, endpoint);
+                    assert_eq!(
+                        grants.authorize(&principal, &read, [1; 16], now).is_ok(),
+                        category == approved,
+                        "{first} -> {endpoint}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_reads_require_every_category_in_one_grant() {
+        let body = r#"{"query":"{repository(owner:\"example\",name:\"one\"){name issue(number:42){title}}}"}"#;
+        let raw = format!(
+            "POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let request = crate::owner::request::read_configured(
+            &mut std::io::Cursor::new(raw),
+            Some(&github_config(123)),
+        )
+        .unwrap();
+        let permission = super::ReadEffects::for_request(&request).unwrap();
+        let wire = serde_json::to_value(&permission).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"kind":"categories","categories":["repository","issues","actions","output"]})
+        );
+        let decoded: super::ReadEffects = serde_json::from_value(wire).unwrap();
+        assert!(decoded.covers(&request));
+        for category in ["repository", "issues"] {
+            let narrow: super::ReadEffects = serde_json::from_value(
+                serde_json::json!({"kind":"categories","categories":[category]}),
+            )
+            .unwrap();
+            assert!(!narrow.covers(&request));
+        }
+    }
+
+    #[test]
+    fn category_claims_reject_unknown_or_competing_permission_fields() {
+        for value in [
+            serde_json::json!({"kind":"future","categories":["issues"]}),
+            serde_json::json!({"kind":"categories","categories":["future"]}),
+            serde_json::json!({"kind":"categories","categories":["issues"],"effects":["readRunLogs"]}),
+            serde_json::json!({"kind":"issueReads","effects":["readIssue"],"categories":["output"]}),
+        ] {
+            assert!(serde_json::from_value::<super::ReadEffects>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn issue_read_permissions_do_not_cover_actions_output() {
+        let request = github_read(
+            &github_config(123),
+            "/repos/example/one/actions/runs/101/logs",
+        );
+        let effects = super::ReadEffects::IssueReads {
+            effects: vec![super::ReadEffect::ListIssues, super::ReadEffect::ReadIssue],
+        };
+        assert!(!effects.covers(&request));
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub(in crate::owner) struct RepositoryBinding {
 pub(in crate::owner) struct PreparedMetadata {
     id: OperationId,
     lookup: RepositoryLookup,
+    operation_digest: [u8; 32],
     bytes: Zeroizing<Vec<u8>>,
     credential: Zeroizing<Vec<u8>>,
     wire_digest: [u8; 32],
@@ -126,10 +127,7 @@ impl PreparedMetadata {
             snapshot,
             now,
         } = input;
-        if !matches!(
-            operation.request().action(),
-            Action::ListIssues | Action::ReadIssue
-        ) {
+        if !operation.request().is_reusable_read() {
             return Err(dispatch::Error::Authorization(AuthorizationError::Denied));
         }
         authorizer
@@ -165,6 +163,7 @@ impl PreparedMetadata {
         Ok(Self {
             id,
             lookup,
+            operation_digest: operation.request().digest(),
             bytes,
             credential,
             wire_digest,
@@ -193,7 +192,10 @@ impl PreparedMetadata {
         selection: &CredentialSelection,
         policy_generation: u64,
     ) -> bool {
-        self.id == id && self.lookup.matches(request, selection, policy_generation) && self.intact()
+        self.id == id
+            && self.operation_digest == request.digest()
+            && self.lookup.matches(request, selection, policy_generation)
+            && self.intact()
     }
 }
 

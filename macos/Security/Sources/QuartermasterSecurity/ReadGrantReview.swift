@@ -56,15 +56,17 @@ public struct ReadGrantReview: Decodable, Sendable, Identifiable {
 
 public enum ReadPermission: Decodable, Sendable {
     case issueReads
+    case githubCategories([GitHubReadCategory])
 
-    private enum Kind: String, Decodable { case issueReads }
+    private enum Kind: String, Decodable { case issueReads, githubCategories }
     private enum CodingKeys: String, CodingKey { case kind, categories }
 
     public init(from decoder: any Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
         switch try fields.decode(Kind.self, forKey: .kind) {
         case .issueReads: self = .issueReads
-
+        case .githubCategories:
+            self = .githubCategories(try fields.decode([GitHubReadCategory].self, forKey: .categories))
         }
     }
 }
@@ -73,6 +75,11 @@ public struct ReadRootChoice: Codable, Equatable, Sendable, Identifiable {
     public let id: String
     public let pid: UInt32
     public let executable: String
+    public let scope: ReadRootScope
+}
+
+public enum ReadRootScope: String, Codable, Sendable {
+    case process, descendants
 }
 
 public struct ReadScopeReview: Sendable {
@@ -115,4 +122,8 @@ public enum GitHubEffect: String, Decodable, Sendable {
     case reopenIssue
     case deleteIssue
     case deleteRepository
+}
+
+public enum GitHubReadCategory: String, Decodable, Sendable, CaseIterable {
+    case repository, issues, actions, output
 }

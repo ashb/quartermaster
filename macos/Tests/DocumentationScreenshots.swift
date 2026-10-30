@@ -66,7 +66,9 @@ private final class DocumentationClient: BrokerClient, Sendable {
 
 @MainActor private func approval() throws -> ApprovalPresentation {
     let path = "/repos/example/project/issues/42"
-    let root: [String: Any] = ["id": "1200:0000000000000001:00000001", "pid": 1200, "executable": "/bin/zsh"]
+    let root: [String: Any] = [
+        "id": "1200:0000000000000001:00000001", "pid": 1200, "executable": "/bin/zsh", "scope": "descendants",
+    ]
     let request: [String: Any] = [
         "repository": "example/project", "repositoryId": 123, "issue": 42,
         "method": "GET", "path": path, "body": "", "origin": "https://api.github.com",
@@ -109,7 +111,7 @@ private final class DocumentationClient: BrokerClient, Sendable {
             "purpose": "quartermaster.read-grant",
             "grant": [
                 "id": String(repeating: "a", count: 32), "uid": 501, "codeHash": String(repeating: "1", count: 40),
-                "root": root, "effects": ["effects": ["listIssues", "readIssue"]],
+                "root": root, "effects": ["kind": "issueReads", "effects": ["listIssues", "readIssue"]],
                 "repository": "example/project", "role": "github-write", "expiresUnix": 1_793_192_400,
             ],
         ],

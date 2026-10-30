@@ -241,6 +241,8 @@ mod tests {
         let other = Shell::new();
         let root = peer.root(shell.child.id()).unwrap();
         assert!(root.verify_descendant(&peer).is_ok());
+        assert!(root.verify_process(&peer).is_err());
+        assert!(peer.own_root().unwrap().verify_process(&peer).is_ok());
         assert!(peer.root(other.child.id()).is_err());
     }
 
@@ -248,9 +250,22 @@ mod tests {
     fn retained_peer_and_root_both_reject_same_image_exec_after_capture() {
         let (mut shell, peer, _directory) = connected_shell(false);
         let root = peer.root(shell.child.id()).unwrap();
+        assert!(root.verify_process(&peer).is_ok());
         shell.command("exec /bin/zsh -f\nprint ready");
         assert!(peer.revalidate().is_err());
+        assert!(root.verify_process(&peer).is_err());
         assert!(root.verify_descendant(&peer).is_err());
+        assert!(root.revalidate().is_err());
+    }
+
+    #[test]
+    fn process_scope_ends_when_the_requesting_process_exits() {
+        let (mut shell, peer, _directory) = connected_shell(false);
+        let root = peer.own_root().unwrap();
+        assert!(root.verify_process(&peer).is_ok());
+        shell.child.kill().unwrap();
+        shell.child.wait().unwrap();
+        assert!(root.verify_process(&peer).is_err());
         assert!(root.revalidate().is_err());
     }
 

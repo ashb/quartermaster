@@ -1,4 +1,6 @@
-use super::{PrincipalBinding, RootDescription, RootEvidence, VerifiedPrincipal, VerifiedRoot};
+use super::{
+    PrincipalBinding, RootDescription, RootEvidence, RootScope, VerifiedPrincipal, VerifiedRoot,
+};
 use qm_macos::peer_identity::PeerIdentity;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::sync::Arc;
@@ -42,6 +44,8 @@ impl VerifiedPrincipal {
                 socket,
                 #[cfg(test)]
                 fixture_root: None,
+                #[cfg(test)]
+                fixture_shell: String::new(),
             },
             peer,
         ))
@@ -52,8 +56,10 @@ impl VerifiedPrincipal {
             .process
             .as_ref()
             .ok_or_else(|| io::Error::other("process scope unavailable"))?;
-        Ok(process
-            .ancestor_roots()?
+        let own = process.own_root()?;
+        let ancestors = process
+            .ancestor_roots()
+            .unwrap_or_default()
             .into_iter()
             .filter(|root| {
                 matches!(
@@ -62,14 +68,17 @@ impl VerifiedPrincipal {
                         .and_then(|s| s.to_str()),
                     Some("zsh" | "bash" | "sh" | "fish" | "dash" | "ksh" | "csh" | "tcsh" | "nu")
                 )
-            })
-            .map(|process| {
+            });
+        Ok(std::iter::once((own, RootScope::Process))
+            .chain(ancestors.map(|root| (root, RootScope::Descendants)))
+            .map(|(process, scope)| {
                 Arc::new(VerifiedRoot {
                     session: self.binding.session,
                     description: RootDescription {
                         id: process.identity().binding(),
                         pid: process.identity().pid(),
                         executable: process.executable().into(),
+                        scope,
                     },
                     evidence: RootEvidence::Native(process),
                 })
@@ -95,6 +104,7 @@ impl VerifiedRoot {
                 id: process.identity().binding(),
                 pid: process.identity().pid(),
                 executable: process.executable().into(),
+                scope: RootScope::Descendants,
             },
             evidence: RootEvidence::Native(process),
         })
@@ -104,6 +114,17 @@ impl VerifiedRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requesting_execution_is_the_default_root_across_connections() {
+        let (stream, _client) = UnixStream::pair().unwrap();
+        let (principal, _) = VerifiedPrincipal::capture(&stream, [1; 16]).unwrap();
+        let roots = principal.roots().unwrap();
+        assert_eq!(roots[0].description().pid, std::process::id());
+        let (other_stream, _other_client) = UnixStream::pair().unwrap();
+        let (same_process, _) = VerifiedPrincipal::capture(&other_stream, [1; 16]).unwrap();
+        assert!(roots[0].verify(&same_process).is_ok());
+    }
 
     #[test]
     fn native_root_membership_cannot_cross_backend_sessions_or_invalidation() {
@@ -121,6 +142,7 @@ mod tests {
                 id: process.identity().binding(),
                 pid: process.identity().pid(),
                 executable: process.executable().into(),
+                scope: RootScope::Process,
             },
             evidence: RootEvidence::Native(process),
         };

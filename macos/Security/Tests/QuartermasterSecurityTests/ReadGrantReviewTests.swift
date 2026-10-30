@@ -6,13 +6,13 @@ import Testing
 private func displayRequest(allowsReadScope: Bool = true) throws -> Data {
     try JSONSerialization.data(withJSONObject: [
         "method": "POST", "path": "/unfamiliar",
-        "readRoots": [["id": "backend-root", "pid": 123, "executable": "/bin/zsh"]],
+        "readRoots": [["id": "backend-root", "pid": 123, "executable": "/bin/zsh", "scope": "descendants"]],
         "presentation": [
             "intent": [
                 "kind": "readGrant",
                 "grant": [
                     "id": "backend-grant", "repository": "example/project",
-                    "root": ["id": "backend-root", "pid": 123, "executable": "/bin/zsh"],
+                    "root": ["id": "backend-root", "pid": 123, "executable": "/bin/zsh", "scope": "descendants"],
                     "expiresUnix": 4600, "permission": ["kind": "issueReads"],
                 ],
             ],

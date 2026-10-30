@@ -495,7 +495,9 @@ impl InFlightGitHub {
                 response::read(&mut stream, self.request.method()).map_err(|_| unavailable())?;
             remaining(self.ready.deadline)?;
             let response = match self.prepared.repository() {
-                Some(repository) => {
+                Some(repository)
+                    if self.request.action() != crate::owner::request::Action::ReadApi =>
+                {
                     wire.issues(&self.request, repository, self.prepared.credential())
                 }
                 _ => wire.application(
@@ -809,14 +811,32 @@ mod tests {
         original: crate::owner::request::FrozenOperation,
     }
 
-    impl ApprovedApi {
+    struct ScopedRead {
+        authorizer: Authorizer,
+        principal: VerifiedPrincipal,
+        registry: OperationRegistry,
+        id: crate::owner::operation::OperationId,
+        snapshot: qm_providers::VaultSnapshot,
+        session: qm_providers::ApprovalSession,
+    }
+
+    impl ScopedRead {
         fn new(raw: &str) -> Self {
-            Self::with_role(raw, "github-write")
+            Self::with_principal(
+                raw,
+                VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]),
+            )
         }
 
-        fn with_role(raw: &str, role: &str) -> Self {
-            let config = GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true}"#).unwrap();
+        fn with_principal(raw: &str, principal: VerifiedPrincipal) -> Self {
+            let config = GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}]}"#).unwrap();
             let request = request::read_configured(&mut Cursor::new(raw), Some(&config)).unwrap();
+            assert_eq!(
+                request.action(),
+                request::Action::ReadApi,
+                "{:?}",
+                request.application().unwrap().analysis()
+            );
             let mut authorizer = Authorizer::new([1; 16]);
             authorizer
                 .install(
@@ -825,18 +845,12 @@ mod tests {
                     Instant::now(),
                 )
                 .unwrap();
-            let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
-            let snapshot = vault::snapshot(role);
-            let crate::owner::policy::AuthorizationOutcome::RequireApproval(requirement) =
-                authorizer
-                    .authorize(&principal, request.clone(), Instant::now())
-                    .unwrap()
-            else {
-                panic!()
-            };
-            assert!(requirement.grant_claims().is_none());
+            let snapshot = vault::snapshot("github-read");
+            let requirement = authorizer
+                .request_read_grant(&principal, request, "github-read")
+                .unwrap();
             let mut registry = OperationRegistry::default();
-            let (id, session, _key, _digest) = test_support::approval::sign(
+            let (id, session, _, _) = test_support::approval::sign(
                 &mut registry,
                 &authorizer,
                 &principal,
@@ -845,25 +859,277 @@ mod tests {
                 Instant::now(),
                 Duration::ZERO,
             );
-            let prepared = crate::owner::execution::prepare_unscoped_github(
-                &registry,
-                id,
-                &principal,
-                &authorizer,
-                &snapshot,
-                Instant::now(),
-            )
-            .unwrap();
             Self {
                 authorizer,
                 principal,
                 registry,
                 id,
                 snapshot,
-                prepared,
                 session,
-                original: request,
             }
+        }
+
+        fn reuse(&mut self, raw: &str) {
+            let request = request::read_configured(
+                &mut Cursor::new(raw),
+                self.authorizer.github_configuration(),
+            )
+            .unwrap();
+            let outcome = self
+                .authorizer
+                .authorize(&self.principal, request, Instant::now())
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                crate::owner::policy::AuthorizationOutcome::Allowed(_)
+            ));
+            self.id = self.registry.register(outcome, Instant::now()).unwrap();
+            self.registry
+                .select_credential(self.id, &self.principal, vault::selection(&self.snapshot))
+                .unwrap();
+        }
+
+        fn metadata(
+            &mut self,
+            body: &[u8],
+        ) -> Result<crate::owner::github::repository::RepositoryBinding, MetadataFailure> {
+            let request = crate::owner::execution::prepare_metadata(
+                &self.registry,
+                self.id,
+                &self.principal,
+                &self.authorizer,
+                &self.snapshot,
+                Instant::now(),
+            )
+            .unwrap();
+            let mut reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            reply.extend_from_slice(body);
+            let (address, _, worker) = peer_reply(false, reply);
+            let ready = ReadyGitHub::connect_to(
+                address,
+                client_config(true),
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+            )
+            .unwrap();
+            let prepared = ready.stage_metadata(request).unwrap();
+            let admission = self
+                .registry
+                .admit_metadata(
+                    prepared.request(),
+                    &self.principal,
+                    &self.authorizer,
+                    &self.snapshot,
+                    Instant::now(),
+                )
+                .unwrap();
+            let result = prepared.handoff(admission).unwrap().response();
+            let outbound = String::from_utf8(worker.join().unwrap()).unwrap();
+            assert!(outbound.starts_with("GET /repos/example/one HTTP/1.1\r\n"));
+            assert!(outbound.contains("Authorization: Bearer quartermaster-dummy-canary\r\n"));
+            result
+        }
+
+        fn prepare(&mut self) -> crate::owner::dispatch::PreparedGitHubRequest {
+            let binding = self
+                .metadata(br#"{"id":123,"full_name":"example/one"}"#)
+                .unwrap();
+            crate::owner::execution::prepare_github(
+                &self.registry,
+                self.id,
+                &self.principal,
+                &self.authorizer,
+                &self.snapshot,
+                binding,
+                Instant::now(),
+            )
+            .unwrap()
+        }
+
+        fn dispatch(&mut self, expected: &str) {
+            let request = self.prepare();
+            let body = b"{\"data\":{\"fixture\":true}}";
+            let mut reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            reply.extend_from_slice(body);
+            let (address, _, worker) = peer_reply(false, reply);
+            let ready = ReadyGitHub::connect_to(
+                address,
+                client_config(true),
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+            )
+            .unwrap();
+            let response = PreparedOperation::github(request, ready)
+                .unwrap()
+                .handoff(
+                    &mut self.registry,
+                    &mut self.authorizer,
+                    &self.principal,
+                    &self.snapshot,
+                )
+                .unwrap()
+                .response();
+            let OperationResponse::Github(response) = response else {
+                panic!("read response rejected")
+            };
+            assert_eq!(response.public_parts().1, body);
+            let expected = expected
+                .replace(
+                    "Authorization: caller-placeholder",
+                    "Authorization: Bearer quartermaster-dummy-canary",
+                )
+                .replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n");
+            assert_eq!(worker.join().unwrap(), expected.as_bytes());
+            assert!(self.registry.preparation(self.id, &self.principal).is_err());
+        }
+    }
+
+    fn scoped_get(path: &str) -> String {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: caller-placeholder\r\nAccept: application/vnd.github.merge-info-preview+json, application/vnd.github.nebula-preview\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn signed_process_grant_reuses_recognised_reads_but_not_unfamiliar_requests() {
+        let body = r#"{ "query": "query Named($owner:String!,$name:String!) { repository(owner:$owner,name:$name) { alias:issueOrPullRequest(number:42) { ... on Issue { title } ... on PullRequest { title headRepository { nameWithOwner } } } } }", "variables": {"owner":"example","name":"one"} }"#;
+        let raw = format!(
+            "POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: caller-placeholder\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nGraphql-Features: merge_queue\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut fixture = ScopedRead::new(&raw);
+        assert!(fixture.authorizer.active_read_grants().is_empty());
+        fixture.dispatch(&raw);
+        assert_eq!(fixture.authorizer.active_read_grants().len(), 1);
+        fixture
+            .registry
+            .cancel_interactive_session(fixture.session.id());
+        for path in [
+            "/repos/example/one",
+            "/repos/example/one/readme",
+            "/repos/example/one/pulls?per_page=100&page=2",
+            "/repos/example/one/pulls/42",
+            "/repos/example/one/actions/workflows",
+            "/repos/example/one/actions/runs/7",
+            "/repos/example/one/actions/jobs/8",
+            "/repos/example/one/actions/runs/7/logs",
+            "/repos/example/one/actions/jobs/8/logs",
+            "/repos/example/one/check-runs/9/annotations",
+        ] {
+            let raw = scoped_get(path);
+            fixture.reuse(&raw);
+            fixture.dispatch(&raw);
+            assert_eq!(fixture.authorizer.active_read_grants().len(), 1);
+        }
+        fixture.reuse(&raw);
+        fixture.dispatch(&raw);
+        for path in [
+            "/repos/example/other/pulls",
+            "/repos/example/one/pulls?future=true",
+            "/repos/example/one/actions/artifacts/7/zip",
+        ] {
+            let request = request::read_configured(
+                &mut Cursor::new(scoped_get(path)),
+                fixture.authorizer.github_configuration(),
+            )
+            .unwrap();
+            assert!(
+                fixture
+                    .authorizer
+                    .authorize(&fixture.principal, request, Instant::now())
+                    .is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_signed_approval_covers_default_issue_view_and_later_connections() {
+        let captures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/github-logs/reads.json"
+        ))
+        .unwrap();
+        let requests: Vec<_> = captures.iter()
+            .filter(|capture| capture["target"] == "/graphql" && capture["body"]["variables"]["number"] == 1)
+            .map(|capture| {
+                let body = capture["body"].to_string();
+                format!("POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: caller-placeholder\r\nAccept: application/vnd.github.merge-info-preview+json, application/vnd.github.nebula-preview\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json; charset=utf-8\r\nGraphql-Features: merge_queue\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+            }).collect();
+        assert_eq!(requests.len(), 2);
+        let mut fixture = ScopedRead::new(&requests[0]);
+        assert!(fixture.authorizer.active_read_grants().is_empty());
+        fixture.dispatch(&requests[0]);
+        let granted = serde_json::to_value(fixture.authorizer.active_read_grants()).unwrap();
+        assert_eq!(granted.as_array().unwrap().len(), 1);
+        fixture
+            .registry
+            .cancel_interactive_session(fixture.session.id());
+
+        for (index, raw) in requests[1..].iter().chain(requests.iter()).enumerate() {
+            fixture.registry.release_connection(&fixture.principal);
+            let previous = fixture.principal.binding();
+            fixture.principal = VerifiedPrincipal::fixture_with_connection(
+                501,
+                "11".repeat(20),
+                [1; 16],
+                [index as u8 + 4; 16],
+            );
+            assert!(fixture.principal.binding() != previous);
+            fixture.reuse(raw);
+            fixture.dispatch(raw);
+            assert_eq!(
+                serde_json::to_value(fixture.authorizer.active_read_grants()).unwrap(),
+                granted
+            );
+        }
+
+        for principal in [
+            VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16])
+                .with_fixture_root("other-shell"),
+            VerifiedPrincipal::fixture(501, "22".repeat(20), [1; 16]),
+        ] {
+            let request = request::read_configured(
+                &mut Cursor::new(&requests[1]),
+                fixture.authorizer.github_configuration(),
+            )
+            .unwrap();
+            assert!(
+                fixture
+                    .authorizer
+                    .authorize(&principal, request, Instant::now())
+                    .is_err()
+            );
+        }
+        fixture.authorizer.revoke_read_grants().unwrap();
+        let request = request::read_configured(
+            &mut Cursor::new(&requests[1]),
+            fixture.authorizer.github_configuration(),
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .authorizer
+                .authorize(&fixture.principal, request, Instant::now())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scoped_read_metadata_rejects_missing_or_replaced_repository_identity() {
+        for body in [
+            br#"{"id":456,"full_name":"example/one"}"#.as_slice(),
+            br#"{"id":123,"full_name":"example/other"}"#,
+            br#"{"full_name":"example/one"}"#,
+        ] {
+            let mut fixture = ScopedRead::new(&scoped_get("/repos/example/one/actions/runs/7"));
+            assert!(fixture.metadata(body).is_err());
+            assert!(fixture.authorizer.active_read_grants().is_empty());
         }
     }
 
@@ -968,11 +1234,8 @@ mod tests {
             "/repos/example/one/actions/runs/7/attempts/2/logs",
             "/repos/example/one/actions/jobs/8/logs",
         ] {
-            let raw = format!(
-                "GET {path} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
-            );
-            let mut fixture = ApprovedApi::with_role(&raw, "github-read");
-            let request = fixture.prepared;
+            let mut fixture = ScopedRead::new(&scoped_get(path));
+            let request = fixture.prepare();
             let (address, _, worker) = peer_reply(false, b"HTTP/1.1 302 Found\r\nLocation: https://results-receiver.actions.githubusercontent.com/rest/runs/1/logs?signature=signed-canary\r\nContent-Length: 0\r\n\r\n".to_vec());
             let ready = ReadyGitHub::connect_to(
                 address,
@@ -1002,6 +1265,132 @@ mod tests {
                     .unwrap()
                     .starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes())
             );
+        }
+    }
+
+    #[test]
+    fn reused_github_read_scope_rechecks_authority_at_the_tls_handoff() {
+        for failure in [
+            "revoke",
+            "cancel",
+            "root",
+            "code",
+            "policy-reversion",
+            "credential-replacement",
+        ] {
+            let raw = scoped_get("/repos/example/one/actions/runs/7");
+            let mut fixture = ScopedRead::new(&raw);
+            fixture.dispatch(&raw);
+            fixture.reuse(&raw);
+            let request = fixture.prepare();
+            let (address, _, worker) = peer(false);
+            let ready = ReadyGitHub::connect_to(
+                address,
+                client_config(true),
+                Deadline::after(Duration::from_secs(3)).unwrap(),
+            )
+            .unwrap();
+            let operation = PreparedOperation::github(request, ready).unwrap();
+            match failure {
+                "revoke" => fixture.authorizer.revoke_read_grants().unwrap(),
+                "cancel" => assert_eq!(
+                    fixture.registry.cancel(fixture.id, &fixture.principal),
+                    CancellationResult::Canceled
+                ),
+                "root" => fixture.principal = fixture.principal.with_fixture_root("unrelated"),
+                "code" => {
+                    fixture.principal = VerifiedPrincipal::fixture(501, "22".repeat(20), [1; 16])
+                }
+                "policy-reversion" => {
+                    let config = fixture.authorizer.github_configuration().unwrap().clone();
+                    fixture.authorizer.invalidate_policy().unwrap();
+                    fixture
+                        .authorizer
+                        .install(
+                            Ok(FixturePolicy::default().with_github(config)),
+                            test_support::wall(1000),
+                            Instant::now(),
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    fixture.snapshot = vault::snapshot_with(
+                        "github-read",
+                        "33333333-3333-4333-8333-333333333333",
+                        [4; 16],
+                    )
+                }
+            }
+            assert!(
+                operation
+                    .handoff(
+                        &mut fixture.registry,
+                        &mut fixture.authorizer,
+                        &fixture.principal,
+                        &fixture.snapshot
+                    )
+                    .is_err(),
+                "{failure}"
+            );
+            assert!(worker.join().unwrap().is_empty(), "{failure}");
+        }
+    }
+
+    impl ApprovedApi {
+        fn new(raw: &str) -> Self {
+            Self::with_role(raw, "github-write")
+        }
+
+        fn with_role(raw: &str, role: &str) -> Self {
+            let config = GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true}"#).unwrap();
+            let request = request::read_configured(&mut Cursor::new(raw), Some(&config)).unwrap();
+            let mut authorizer = Authorizer::new([1; 16]);
+            authorizer
+                .install(
+                    Ok(FixturePolicy::default().with_github(config)),
+                    test_support::wall(1000),
+                    Instant::now(),
+                )
+                .unwrap();
+            let principal = VerifiedPrincipal::fixture(501, "11".repeat(20), [1; 16]);
+            let snapshot = vault::snapshot(role);
+            let crate::owner::policy::AuthorizationOutcome::RequireApproval(requirement) =
+                authorizer
+                    .authorize(&principal, request.clone(), Instant::now())
+                    .unwrap()
+            else {
+                panic!()
+            };
+            assert!(requirement.grant_claims().is_none());
+            let mut registry = OperationRegistry::default();
+            let (id, session, _key, _digest) = test_support::approval::sign(
+                &mut registry,
+                &authorizer,
+                &principal,
+                &snapshot,
+                requirement,
+                Instant::now(),
+                Duration::ZERO,
+            );
+            let prepared = crate::owner::execution::prepare_unscoped_github(
+                &registry,
+                id,
+                &principal,
+                &authorizer,
+                &snapshot,
+                Instant::now(),
+            )
+            .unwrap();
+            Self {
+                authorizer,
+                principal,
+                registry,
+                id,
+                snapshot,
+                prepared,
+                session,
+                original: request,
+            }
         }
     }
 

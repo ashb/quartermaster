@@ -278,7 +278,7 @@ struct PreferencesView: View {
         Group {
             PreferencesGroup(title: "Read access") {
                 HStack {
-                    Text("Grant lifetime")
+                    Text("Maximum grant lifetime")
                     Spacer()
                     Text("1 hour").foregroundStyle(.secondary)
                 }
@@ -293,9 +293,9 @@ struct PreferencesView: View {
                         VStack(alignment: .leading) {
                             Text(verbatim: grant.repository)
                             Text(verbatim: "\(grant.root.executable) · PID \(grant.root.pid)")
-                            Text(
-                                "\(grant.scopeName) until \(grant.expires.formatted(date: .abbreviated, time: .shortened))"
-                            )
+                            Text(grant.processScopeName)
+                            Text(grant.scopeName)
+                            Text(grant.lifetimeDescription)
                         }.font(.caption)
                         Spacer()
                         Button("Revoke") { application.revokeRead(grant.id) }

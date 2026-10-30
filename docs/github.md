@@ -1,10 +1,9 @@
 # Try the GitHub integration
 
-The development build lists and reads issues from configured GitHub repositories.
-An explicit opt-in also permits one-use approval of other REST and GraphQL
-requests, preserving their application bytes. Automated tests exercise that path
-against local TLS peers; live-provider and hardware acceptance remain.
-Credential delivery through environment variables is not implemented yet.
+The development build mediates repository, issue, pull request and Actions reads,
+including logs, for configured GitHub repositories. Other REST and GraphQL
+requests require an explicit opt-in and one-use approval. Quartermaster keeps
+the vault token in the backend and preserves application requests.
 
 ## Enrol a credential
 
@@ -12,9 +11,12 @@ First [build and start the signed app](development.md#sign-and-run). Use a
 dedicated development vault account.
 
 1. Create a fine-grained GitHub token limited to your test repository, with
-   **Issues: read-only** and **Metadata: read-only**. These cover the
-   [issue reads](https://docs.github.com/en/rest/issues/issues#list-repository-issues)
-   and [repository identity check](https://docs.github.com/en/rest/repos/repos#get-a-repository).
+   **Metadata**, [**Contents**](https://docs.github.com/en/rest/repos/contents#get-a-repository-readme),
+   **Issues**, **Pull requests**, **Commit statuses** and
+   [**Actions**](https://docs.github.com/en/rest/actions/workflow-runs#download-workflow-run-logs)
+   set to **read-only**. Grant **Issues: read and write** only if you need issue
+   close/reopen. Related project summaries may need additional upstream access;
+   a Quartermaster grant does not supply missing GitHub permissions.
 2. Put the token in a vault Login item's **password** field. The development UI
    selects this field; custom-field selection is not available in it yet.
 3. Open **Settings → GitHub** and enter the Login item UUID under **Token source**.
@@ -36,6 +38,13 @@ original data. **Sync Vault** refreshes the selected cache from Vaultwarden.
 
 The development enrolment uses the role label `github-write`. It can hold the
 read-only token above; the label does not give that token write permissions.
+
+Fine-grained PATs [cannot access the Checks API](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-tokens-limitations).
+With this token, default `gh pr view` can fail when a PR has Actions checks,
+and `gh run view` cannot display check annotations; log downloads still work.
+Checks require a GitHub App token with **Checks: read** or a classic PAT with
+`repo` scope for private repositories. **Workflows** permission does not enable
+check reads.
 
 ## Select a repository
 
@@ -94,11 +103,11 @@ handled interruption; SIGKILL cannot run cleanup. It leaves the shared backend
 running. This configures `gh`'s HTTP client, not Git subprocesses or arbitrary
 extensions with their own network clients.
 
-The first request opens the read-access dialog. Under **Authorize for**, choose
-**This shell** or **This request**. Review the caller, repository, credential and absolute
-expiry, then approve with Touch ID. Unlocking the cache and establishing the grant
-can use the same fingerprint. If no shell root can be verified, only one-request
-approval is available.
+The first request opens the read-access dialog with **This process** selected.
+Choose **This shell** for broader reuse. Review the caller, repository, credential
+and expiry, then approve with Touch ID. Unlocking the cache and establishing the
+grant can use the same fingerprint. If the process lifetime cannot be verified,
+only one-request approval is available.
 
 Read an individual issue by setting its number:
 
@@ -110,13 +119,19 @@ qm run gh -- api --hostname github.com --method GET -H 'Accept: application/vnd.
 
 ## What the grant permits
 
-A grant covers issue listing and issue reads in the selected repository, using
-the selected credential, for at most one hour. Only the verified caller
-executable and its instances beneath the approved shell execution can reuse it.
-Pagination and redirects require the same scope checks. Eligible reads work
-without another fingerprint or the UI remaining open. Shell exit or exec ends
-reuse; unrelated shells do not inherit the grant. A shell grant cannot identify
-an individual conversation inside a shared daemon.
+Read approvals default to all recognised reads for the selected repository:
+metadata/README, issues and pull requests, Actions metadata, logs and check
+annotations. The review also describes related summaries, which can refer to
+other repositories. Logs may contain sensitive workflow output. Writes and
+unfamiliar requests still need separate approval.
+
+**This process** covers subsequent requests from the same running execution,
+including new connections; children and later invocations cannot reuse it.
+**This shell** permits descendants using the same verified caller executable.
+Both scopes bind the selected credential and repository for at most one hour,
+ending earlier when the selected process exits or replaces its executable.
+Eligible reads work without another fingerprint or the UI remaining open.
+A shell grant cannot identify an individual conversation inside a shared daemon.
 
 Access preferences list active roots, repositories and expiry. Choose **Revoke**
 for one grant or **Revoke Read Access** for all grants. Backend restart or logout
@@ -125,15 +140,22 @@ and wake until expiry; time asleep counts against that expiry. Lock, sleep and
 session deactivation cancel pending approvals. These settings are not configurable
 in the development UI yet.
 
-Supported list parameters are `state` (`open`, `closed`, `all`), `per_page` (1–100),
-`page` (1–10000), and one bounded `before` or `after` cursor. At most three redirects
-within the configured repository are permitted. Automatic matching currently requires a supported
-JSON Accept header; `gh`'s wildcard default is unfamiliar input.
+Covered REST and GraphQL requests must have complete semantic analysis; an
+unknown field, argument or companion prevents reuse. Default `gh` request headers
+are supported. Workflow changes, PR reviews and arbitrary artifact downloads are
+outside the read grant.
+
+For logs, Quartermaster returns GitHub's presigned download URL unchanged and
+relays storage requests without API credentials. `gh` follows redirects, extracts
+archives and may fall back to individual job logs. Each relay allows 64 MiB of
+response bytes and 120 seconds. Issued URLs remain
+usable until GitHub expires them, even after a Quartermaster grant is revoked.
+Client decompression and cache use are outside these limits.
 
 ## Approve another API request once
 
 In **Settings → GitHub**, enable **Allow unfamiliar requests**, then review and approve the change. Without it, requests lacking a complete
-configured issue-read match are rejected. Enabling it does not create a read
+configured read match are rejected. Enabling it does not create a read
 grant or authorize a request by itself.
 
 The dialog shows the action, repository name when understood, command and process

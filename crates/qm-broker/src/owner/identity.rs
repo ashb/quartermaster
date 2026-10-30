@@ -16,6 +16,8 @@ pub(super) struct VerifiedPrincipal {
     binding: PrincipalBinding,
     #[cfg(test)]
     fixture_root: Option<String>,
+    #[cfg(test)]
+    fixture_shell: String,
     #[cfg(target_os = "macos")]
     process: Option<qm_macos::process_scope::ProcessPeer>,
     #[cfg(target_os = "macos")]
@@ -86,6 +88,7 @@ impl VerifiedPrincipal {
     ) -> Self {
         Self {
             fixture_root: Some("fixture-root".into()),
+            fixture_shell: "fixture-shell".into(),
             binding: PrincipalBinding {
                 uid,
                 code_hash,
@@ -106,6 +109,14 @@ pub(super) struct RootDescription {
     pub(super) id: String,
     pub(super) pid: u32,
     pub(super) executable: String,
+    pub(super) scope: RootScope,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum RootScope {
+    Process,
+    Descendants,
 }
 
 pub(super) struct VerifiedRoot {
@@ -144,15 +155,24 @@ impl VerifiedRoot {
         self.live()?;
         match &self.evidence {
             #[cfg(target_os = "macos")]
-            RootEvidence::Native(root) => root.verify_descendant(
-                principal
+            RootEvidence::Native(root) => {
+                let peer = principal
                     .process
                     .as_ref()
-                    .ok_or_else(|| io::Error::other("process scope unavailable"))?,
-            ),
+                    .ok_or_else(|| io::Error::other("process scope unavailable"))?;
+                match self.description.scope {
+                    RootScope::Process => root.verify_process(peer),
+                    RootScope::Descendants => root.verify_descendant(peer),
+                }
+            }
             #[cfg(test)]
             RootEvidence::Fixture(_)
-                if principal.fixture_root.as_deref() == Some(&self.description.id) =>
+                if match self.description.scope {
+                    RootScope::Process => {
+                        principal.fixture_root.as_deref() == Some(&self.description.id)
+                    }
+                    RootScope::Descendants => principal.fixture_shell == self.description.id,
+                } =>
             {
                 Ok(())
             }
@@ -163,12 +183,18 @@ impl VerifiedRoot {
 
     #[cfg(test)]
     pub(super) fn fixture(id: &str, session: [u8; 16]) -> Arc<Self> {
+        Self::fixture_scoped(id, session, RootScope::Process)
+    }
+
+    #[cfg(test)]
+    fn fixture_scoped(id: &str, session: [u8; 16], scope: RootScope) -> Arc<Self> {
         Arc::new(Self {
             session,
             description: RootDescription {
                 id: id.into(),
                 pid: 123,
                 executable: "/bin/zsh".into(),
+                scope,
             },
             evidence: RootEvidence::Fixture(std::sync::atomic::AtomicBool::new(true)),
         })
@@ -188,7 +214,14 @@ impl VerifiedPrincipal {
     pub(super) fn roots(&self) -> io::Result<Vec<Arc<VerifiedRoot>>> {
         #[cfg(test)]
         if let Some(id) = &self.fixture_root {
-            return Ok(vec![VerifiedRoot::fixture(id, self.binding.session)]);
+            return Ok(vec![
+                VerifiedRoot::fixture(id, self.binding.session),
+                VerifiedRoot::fixture_scoped(
+                    &self.fixture_shell,
+                    self.binding.session,
+                    RootScope::Descendants,
+                ),
+            ]);
         }
         #[cfg(target_os = "macos")]
         {

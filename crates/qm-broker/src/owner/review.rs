@@ -36,10 +36,7 @@ impl Presentation {
     fn new(operation: &FrozenOperation, authorization: Option<&ReadGrantClaims>) -> Self {
         let application = operation.application();
         let grant = authorization.map(ReadGrantClaims::display);
-        let allows_read_scope = matches!(
-            operation.action(),
-            super::request::Action::ListIssues | super::request::Action::ReadIssue
-        );
+        let allows_read_scope = operation.is_reusable_read();
         let mut effects = application.map_or_else(Vec::new, |application| {
             application
                 .analysis()
@@ -254,7 +251,7 @@ mod tests {
         assert_eq!(display["intent"]["grant"]["repository"], "example/one");
         assert_eq!(
             display["intent"]["grant"]["permission"],
-            serde_json::json!({"kind":"issueReads"})
+            serde_json::json!({"kind":"githubCategories","categories":["repository","issues","actions","output"]})
         );
         assert_eq!(
             display["intent"]["grant"]["root"],

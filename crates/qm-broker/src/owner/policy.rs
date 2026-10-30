@@ -451,10 +451,7 @@ impl Authorizer {
         }
         match &permit.evidence {
             AuthorizationEvidence::PolicyAllow(grant) => {
-                if !matches!(
-                    permit.request.action(),
-                    Action::ListIssues | Action::ReadIssue
-                ) {
+                if !permit.request.is_reusable_read() {
                     return Err(AuthorizationError::Denied);
                 }
                 self.grants
@@ -473,12 +470,7 @@ impl Authorizer {
                 }
                 match purpose {
                     ApprovalPurpose::SingleUse { .. } => {}
-                    ApprovalPurpose::ReadGrant(grant)
-                        if matches!(
-                            permit.request.action(),
-                            Action::ListIssues | Action::ReadIssue
-                        ) =>
-                    {
+                    ApprovalPurpose::ReadGrant(grant) if permit.request.is_reusable_read() => {
                         grant.proposal.verify(principal, now)?;
                     }
                     _ => return Err(AuthorizationError::Denied),
@@ -638,7 +630,7 @@ impl Authorizer {
             .policy
             .as_ref()
             .ok_or(AuthorizationError::InvalidPolicy)?;
-        if !matches!(request.action(), Action::ReadIssue | Action::ListIssues)
+        if !request.is_reusable_read()
             || request.mode()
                 != policy
                     .github

@@ -28,29 +28,49 @@ extension UnderstandingNotice {
 
 extension ReadGrantReview {
     public var title: String { permission.title }
-    public var summary: String { permission.summary }
+    public var summary: String {
+        permission.summary + " "
+            + (root.scope == .process
+                ? "Only this running process. Writes need separate approval."
+                : "This shell's descendants must use the same caller executable. Writes need separate approval.")
+    }
     public var scopeName: String { permission.scopeName }
+    public var lifetimeDescription: String {
+        let end =
+            root.scope == .process
+            ? "process exits or replaces its executable" : "shell exits or replaces its executable"
+        return "Until this \(end), \(expires.formatted(date: .abbreviated, time: .shortened)), or backend restart"
+    }
+    public var processScopeName: String {
+        root.scope == .process ? "This process" : "Shell descendants"
+    }
 }
 
 extension ReadPermission {
     var title: String {
         switch self {
         case .issueReads: "Allow issue reads"
-
+        case .githubCategories(let categories):
+            if Set(categories) == Set(GitHubReadCategory.allCases) {
+                "Allow GitHub reads"
+            } else {
+                categories.count == 1 ? categories[0].title : "Allow selected GitHub reads"
+            }
         }
     }
 
     var summary: String {
         switch self {
-        case .issueReads: "List and read issues from this shell's descendants using the same caller executable."
-
+        case .issueReads: "List and read issues."
+        case .githubCategories(let categories):
+            categories.map(\.summary).joined(separator: " ")
         }
     }
 
     var scopeName: String {
         switch self {
         case .issueReads: "Issue reads"
-
+        case .githubCategories(let categories): categories.map(\.name).joined(separator: ", ")
         }
     }
 }
@@ -82,6 +102,35 @@ extension GitHubEffect {
         case .reopenIssue: "Reopen issue"
         case .deleteIssue: "Delete issue"
         case .deleteRepository: "Delete repository"
+        }
+    }
+}
+
+extension GitHubReadCategory {
+    var name: String {
+        switch self {
+        case .repository: "Repository"
+        case .issues: "Issues and PRs"
+        case .actions: "Actions metadata"
+        case .output: "Build output"
+        }
+    }
+    var title: String {
+        switch self {
+        case .repository: "Allow repository reads"
+        case .issues: "Allow issue and PR reads"
+        case .actions: "Allow Actions metadata reads"
+        case .output: "Allow build output reads"
+        }
+    }
+    var summary: String {
+        switch self {
+        case .repository: "Read repository metadata and README, including owner summaries."
+        case .issues:
+            "Read issues and pull requests, including actor, fork, linked issue and project summaries across repositories."
+        case .actions:
+            "Read Actions workflows, runs, jobs and artifact lists, including related actor, fork and check summaries."
+        case .output: "Read build logs and check annotations. Output may contain sensitive values printed by workflows."
         }
     }
 }

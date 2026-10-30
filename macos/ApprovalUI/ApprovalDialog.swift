@@ -196,10 +196,8 @@ struct ApprovalDialogView: View {
                         Text(verbatim: title).font(.subheadline).lineLimit(3)
                     }
                     if let grant = presentation.readGrant {
-                        Text(
-                            "Until \(grant.expires.formatted(date: .abbreviated, time: .shortened)) or backend restart"
-                        )
-                        .font(.subheadline).foregroundStyle(.secondary)
+                        Text(grant.lifetimeDescription)
+                            .font(.subheadline).foregroundStyle(.secondary)
                     } else if presentation.readScope != nil {
                         Text("For this request only")
                             .font(.subheadline).foregroundStyle(.secondary)

@@ -121,9 +121,8 @@ impl GitHubConfig {
                 .map(|repository| Pattern {
                     id: repository.read_pattern_id(),
                     predicates: vec![
-                        Predicate::Method("GET".into()),
-                        Predicate::OnlyEffects(vec![EffectKind::ListIssues, EffectKind::ReadIssue]),
-                        Predicate::AllResourcesInRepository(ApiRepository {
+                        Predicate::OnlyEffects(EffectKind::READS.to_vec()),
+                        Predicate::AllResourcesInRepositoryWithRelatedSummaries(ApiRepository {
                             owner: repository.owner.clone(),
                             name: repository.name.clone(),
                         }),
@@ -156,7 +155,8 @@ impl GitHubConfig {
     pub(in crate::owner) fn digest(&self) -> [u8; 32] {
         digest(
             &SHA256,
-            &serde_json::to_vec(self).expect("validated GitHub configuration is serializable"),
+            &serde_json::to_vec(&(qm_api_github::SEMANTICS_VERSION, self))
+                .expect("validated GitHub configuration is serializable"),
         )
         .as_ref()
         .try_into()

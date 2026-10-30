@@ -223,17 +223,18 @@ or API classification. Quoting preserves argument boundaries and makes control
 characters and invisible formatting explicit. Environment values are excluded;
 observed commands are never logged or persisted. Arguments confer no authority.
 
-Root-scoped read authority uses separate native evidence: an approved execution
-lifetime and a bounded, revalidated descendant relationship. The executable
+Process-scoped reads use separate native evidence for the requesting execution
+lifetime. Shell-scoped reads additionally require a bounded, revalidated descendant
+relationship. The executable
 restriction remains in force. A readable shell can be the root even when macOS
 denies access to its login parent; children need no PTY. Root exec, including
 same-image exec, and root exit end reuse. Failed proof leaves per-use approval
-available without widening the grant. Approval offers the nearest proven shell,
-other proven shell ancestors and a one-request choice in the process tree.
+available without widening the grant. Approval defaults to the requesting process,
+with proven shell ancestors offered as broader choices in the process tree.
 Other processes remain visible but cannot be selected. App bundle icons and
 names aid recognition; executable paths remain available on hover.
 Each choice creates a new frozen review; the signed grant binds an explicit,
-versioned read-effect set and its original one-hour expiry. Access preferences
+read permission and its original one-hour maximum expiry. Access preferences
 show installed scopes and support selected or complete revocation.
 
 The native verifier walks at most 32 processes, independently of display limits,
@@ -259,12 +260,9 @@ release tools and archive downloads can use different routes and require their
 own adapters. A verified SSH signature establishes key use, not whether Git will
 fetch or push or which repository it will affect.
 
-Normal `gh` onboarding will show its `http_unix_socket` setting and offer to
-apply it explicitly. Preserve preferences, aliases and credentials; disclose an
-existing socket setting before replacing it. Managed configurations can be
-changed at their source. Explain how to restore the previous setting and that
-routed requests require Quartermaster to be running. The current development
-setup uses an [isolated configuration](github.md).
+[`qm run gh --`](github.md) starts the bundled backend and creates temporary gh
+configuration for each command. The normal gh configuration and stored
+credentials remain untouched.
 
 ## Guest and Docker services
 

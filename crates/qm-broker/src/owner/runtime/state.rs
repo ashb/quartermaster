@@ -150,11 +150,7 @@ impl OwnerState {
                 AuthorizationError::Denied
                 | AuthorizationError::Expired
                 | AuthorizationError::CredentialMismatch,
-            ) if matches!(
-                request.action(),
-                http_request::Action::ReadIssue | http_request::Action::ListIssues
-            ) =>
-            {
+            ) if request.is_reusable_read() => {
                 let role = match self.provider.snapshot() {
                     Some(snapshot) => snapshot.binding().role().to_owned(),
                     None => binding?

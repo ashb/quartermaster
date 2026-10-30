@@ -15,6 +15,7 @@ pub const SIMULATION_HOST: &str = "github.example.invalid";
 pub(super) enum Action {
     ListIssues,
     ReadIssue,
+    ReadApi,
     CloseIssue,
     Api,
 }
@@ -32,6 +33,7 @@ pub(super) struct FrozenOperation {
 enum Operation {
     ListIssues,
     ReadIssue(NonZeroU64),
+    ReadApi,
     CloseIssue(NonZeroU64),
     Api,
 }
@@ -119,7 +121,9 @@ impl FrozenOperation {
         match self.operation {
             Operation::ListIssues | Operation::ReadIssue(_) => "GET",
             Operation::CloseIssue(_) => "PATCH",
-            Operation::Api => unreachable!("API operation has a captured application"),
+            Operation::Api | Operation::ReadApi => {
+                unreachable!("API operation has a captured application")
+            }
         }
     }
     pub(super) fn path(&self) -> &str {
@@ -138,13 +142,16 @@ impl FrozenOperation {
         match self.operation {
             Operation::ListIssues | Operation::ReadIssue(_) => b"",
             Operation::CloseIssue(_) => b"{\"state\":\"closed\"}",
-            Operation::Api => unreachable!("API operation has a captured application"),
+            Operation::Api | Operation::ReadApi => {
+                unreachable!("API operation has a captured application")
+            }
         }
     }
     pub(super) fn action(&self) -> Action {
         match self.operation {
             Operation::ListIssues => Action::ListIssues,
             Operation::ReadIssue(_) => Action::ReadIssue,
+            Operation::ReadApi => Action::ReadApi,
             Operation::CloseIssue(_) => Action::CloseIssue,
             Operation::Api => Action::Api,
         }
@@ -157,7 +164,7 @@ impl FrozenOperation {
     pub(super) fn issue_number(&self) -> Option<NonZeroU64> {
         match self.operation {
             Operation::ListIssues => None,
-            Operation::Api => {
+            Operation::Api | Operation::ReadApi => {
                 let mut numbers =
                     self.application()?
                         .analysis()
@@ -209,7 +216,7 @@ impl FrozenOperation {
 
     pub(super) fn role(&self) -> &str {
         match self.action() {
-            Action::ListIssues | Action::ReadIssue => "github-read",
+            Action::ListIssues | Action::ReadIssue | Action::ReadApi => "github-read",
             Action::CloseIssue | Action::Api => "github-write",
         }
     }
@@ -226,6 +233,13 @@ impl FrozenOperation {
     pub(super) fn has_mutation(&self) -> bool {
         self.action() == Action::CloseIssue
             || self.application().is_some_and(Application::has_mutation)
+    }
+
+    pub(super) fn is_reusable_read(&self) -> bool {
+        matches!(
+            self.action(),
+            Action::ListIssues | Action::ReadIssue | Action::ReadApi
+        )
     }
 }
 
@@ -373,8 +387,10 @@ pub(super) fn from_capture(
                     }
                 })
                 .unwrap_or(Operation::Api),
-            _ => Operation::Api,
+            _ => Operation::ReadApi,
         }
+    } else if analysis.complete() && resource.is_some() && !application.has_mutation() {
+        Operation::ReadApi
     } else {
         Operation::Api
     };
@@ -477,6 +493,69 @@ mod github_tests {
     use super::*;
     use crate::owner::github::configuration::GitHubConfig;
     use std::io::Cursor;
+
+    #[test]
+    fn complete_graphql_and_actions_reads_keep_repository_identity_and_original_bytes() {
+        for (method, path, body) in [
+            (
+                "POST",
+                "/graphql",
+                r#"{"query":"{repository(owner:\"quartermaster\",name:\"one\"){issueOrPullRequest(number:42){... on Issue{title} ... on PullRequest{body}}}}"}"#,
+            ),
+            (
+                "POST",
+                "/graphql",
+                r#"{"query":"{repository(owner:\"quartermaster\",name:\"one\"){issue(number:42){parent{id title repository{nameWithOwner}}}}}"}"#,
+            ),
+            ("GET", "/repos/quartermaster/one/readme", ""),
+            (
+                "GET",
+                "/repos/quartermaster/one/actions/runs?exclude_pull_requests=true&per_page=20",
+                "",
+            ),
+            (
+                "GET",
+                "/repos/quartermaster/one/actions/runs/101/attempts/2/logs",
+                "",
+            ),
+            ("GET", "/repos/quartermaster/one/actions/jobs/301/logs", ""),
+        ] {
+            let raw = format!(
+                "{method} {path} HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github.merge-info-preview+json, application/vnd.github.nebula-preview\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let request = read_configured(&mut Cursor::new(&raw), Some(&config())).unwrap();
+            assert_ne!(request.action(), Action::Api, "{path}: {body}");
+            assert!(request.matches_configuration(&config()));
+            assert_eq!(request.repository(), "quartermaster/one");
+            assert_eq!(
+                request.application().unwrap().capture().original(),
+                raw.as_bytes()
+            );
+            assert!(!request.has_mutation());
+        }
+    }
+
+    #[test]
+    fn unfamiliar_graphql_companions_other_repositories_and_writes_have_no_read_identity() {
+        for query in [
+            "{repository(owner:\"quartermaster\",name:\"one\"){name future}}",
+            "{repository(owner:\"quartermaster\",name:\"one\"){name} other:repository(owner:\"quartermaster\",name:\"two\"){name}}",
+            "{repository(owner:\"quartermaster\",name:\"one\"){issue(number:42){parent{body}}}}",
+            "mutation{closeIssue(input:{issueId:\"I_fixture\"}){issue{id}}}",
+            "mutation{reopenIssue(input:{issueId:\"I_fixture\"}){issue{id}}}",
+            "{node(id:\"I_fixture\"){... on Issue{title}}}",
+        ] {
+            let body = serde_json::json!({"query":query}).to_string();
+            let raw = format!(
+                "POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let request = read_configured(&mut Cursor::new(raw), Some(&config())).unwrap();
+            assert_eq!(request.action(), Action::Api, "{query}");
+            assert!(request.github_identity().is_none());
+        }
+    }
 
     #[test]
     fn github_reads_keep_the_clients_repository_path_and_query_octets() {

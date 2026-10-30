@@ -62,6 +62,10 @@ impl ProcessPeer {
         })
     }
 
+    pub fn own_root(&self) -> io::Result<ProcessRoot> {
+        self.root(self.identity.pid)
+    }
+
     pub fn root(&self, pid: u32) -> io::Result<ProcessRoot> {
         let started = Instant::now();
         let identity = native::observe(pid)?.identity;
@@ -128,6 +132,16 @@ impl ProcessRoot {
 
     pub fn revalidate(&self) -> io::Result<()> {
         check_lifetime(&self.watch, self.identity, || Ok(()))
+    }
+
+    pub fn verify_process(&self, peer: &ProcessPeer) -> io::Result<()> {
+        let started = Instant::now();
+        if self.identity != peer.identity {
+            return Err(unavailable());
+        }
+        self.revalidate()?;
+        peer.revalidate()?;
+        within_budget(started)
     }
 
     pub fn verify_descendant(&self, peer: &ProcessPeer) -> io::Result<()> {

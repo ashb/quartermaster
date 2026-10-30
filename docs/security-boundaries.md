@@ -97,7 +97,8 @@ field is insufficient. A verified interpreter does not authenticate its script
 or package; interpreted workloads need independently established narrow authority.
 Displayed ancestry and command arguments provide context and never grant permission.
 
-An explicitly approved process root may scope reusable reads to verified
+Reusable reads default to the exact approved process execution, excluding its
+children. An explicitly selected shell root can instead admit verified
 descendants of that execution. Retain the caller's verified executable restriction;
 root membership cannot approve writes or authenticate an interpreter's script.
 Bind the root to its uid, kernel process unique identity and exec generation in
@@ -243,7 +244,35 @@ a mandatory scope restriction. Unknown or multiple repository targets must not
 be presented as one understood repository. Reusable grants show their extent and
 expiry; per-request approval creates none.
 
-Approval follows the request binding above and [authority lifecycle](#keep-authority-narrow-and-short-lived).
+GitHub read approvals default to all recognised read categories for the approved
+repository: metadata/README, issues/PRs, Actions metadata and build output (logs
+and check annotations). This lets one `gh` invocation perform its supporting
+reads without repeated approval. The review includes logs, which may contain
+sensitive workflow output. Grants retain an explicit category set: narrower
+grants cannot authorise other categories, and independent grants are not combined.
+Writes and unfamiliar requests remain outside read grants. Rust alone maps each
+category to API effects; the signed grant carries category IDs, without a second
+effect list. Rust supplies the typed scope inside the frozen review;
+Swift renders its description without deciding GitHub permissions.
+
+Repository, issue/PR and Actions metadata categories include bounded related
+actor/fork summaries; issue/PR reads include linked issue/project summaries,
+and Actions metadata includes check summaries. These may refer to other repositories.
+GraphQL summary contexts cannot traverse into those resources' contents. REST
+PR/run responses include the related metadata in their fixed API representations;
+they are not limited to GraphQL's selected summary fields. Artifact downloads,
+workflow writes and arbitrary related-resource access are excluded.
+
+Complete analysis must
+cover every effect and resource, and the matcher/schema version contributes to
+the effective configuration digest. Rust owns semantic classification and the
+typed approval intent. The native UI binds its signature to the frozen review
+bytes, including that intent, without reclassifying the captured request.
+Root, executable, credential, policy generation and repository identity are
+rechecked through the existing admission path. POST alone never implies a write
+or permission to reuse a read grant.
+
+Per-request approval follows the request binding above and [authority lifecycle](#keep-authority-narrow-and-short-lived).
 It creates no reusable grant, extends none and installs no rule. The UI receives
 credential identity only.
 
@@ -371,16 +400,18 @@ A one-use issuance challenge belongs to the current backend and approval session
 consuming it cannot extend an existing grant. Proof acceptance remains pending
 until the initiating read's final admission atomically installs the grant.
 Cancellation or UI loss before admission prevents issuance; eligible reads then
-survive UI exit. Within the bound session, a grant covers the verified executable only under the
-explicitly selected shell execution root. Every admission rechecks that lifetime
-and descendant relationship. Missing evidence leaves per-request approval
-available, subject to policy. The versioned effect set currently covers only
-REST issue listing and issue reads; later effect families require new approval.
+survive UI exit. Within the bound session, a process grant covers only the same
+verified execution across connections; a shell grant also requires a verified
+descendant relationship and the approved caller executable. Every admission
+rechecks the selected lifetime and membership. Missing evidence leaves per-request approval
+available, subject to policy.
 
-The broker offers proven shell ancestors, nearest first, and a one-request
-choice. Changing selection before authentication replaces the frozen review and
+The broker defaults to the requesting process and offers proven shell ancestors,
+nearest first. Without process-lifetime evidence, only one-request approval is
+available. Changing selection before authentication replaces the frozen review and
 nonce without extending expiry. Selection after authentication is rejected.
-Access controls list active roots, repositories, issue scope and absolute expiry.
+Access controls list active roots, process or descendant scope, repositories,
+read categories and absolute expiry.
 Selected revocation preserves other installed grants and cancels pending approval
 work; revoke-all also invalidates pending issuance. Neither requires Touch ID. Configuration can revoke grants,
 never create them. Expiry or backend restart requires fresh approval on next use,

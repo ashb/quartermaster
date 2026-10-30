@@ -18,6 +18,7 @@
       "role": "github-write",
       "expiresUnix": 4600,
       "effects": {
+        "kind": "issueReads",
         "effects": [
           "listIssues",
           "readIssue"
@@ -26,7 +27,8 @@
       "root": {
         "id": "fixture-root",
         "pid": 123,
-        "executable": "/bin/zsh"
+        "executable": "/bin/zsh",
+        "scope": "process"
       }
     }
   }

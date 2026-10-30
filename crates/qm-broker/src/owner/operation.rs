@@ -694,10 +694,7 @@ impl OperationRegistry {
         let preparation = self
             .preparation(id, principal)
             .map_err(dispatch::Error::Operation)?;
-        if !matches!(
-            preparation.operation.request().action(),
-            super::request::Action::ListIssues | super::request::Action::ReadIssue
-        ) {
+        if !preparation.operation.request().is_reusable_read() {
             return Err(dispatch::Error::Authorization(AuthorizationError::Denied));
         }
         Ok(preparation)
