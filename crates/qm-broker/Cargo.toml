@@ -28,8 +28,8 @@ core-foundation = "0.10.1"
 block2 = "=0.6.2"
 dispatch2 = "=0.3.1"
 objc2 = "=0.6.5"
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDate", "NSDistributedNotificationCenter", "NSError", "NSNotification", "NSObject", "NSRunLoop", "NSSet", "NSString", "NSXPCConnection", "block2", "libc"] }
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSDate", "NSDistributedNotificationCenter", "NSError", "NSNotification", "NSObject", "NSRunLoop", "NSSet", "NSString", "NSURL", "NSXPCConnection", "block2", "libc"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSRunningApplication", "NSWorkspace", "block2"] }
 objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext"] }
 qm-macos = { path = "../qm-macos" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "time", "net", "sync", "macros"] }

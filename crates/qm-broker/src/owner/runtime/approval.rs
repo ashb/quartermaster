@@ -17,7 +17,6 @@ use qm_providers::ApprovalSession;
 use ring::digest::{SHA256, digest};
 use serde::Serialize;
 use std::{
-    process::Command,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -167,22 +166,20 @@ pub(super) fn request_approval(
         peer: peer.presentation(),
     };
     let document = crate::owner::review::ReviewDocument::new(operation, authorization, context)?;
-    if !Command::new("/usr/bin/open")
-        .arg("-a")
-        .arg(&paths.app)
-        .status()
-        .map_err(|_| Error::State(Fault::LaunchFailed))?
-        .success()
-    {
-        return Err(Error::State(Fault::LaunchFailed));
-    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    crate::platform::macos::application::launch_application(&paths.app, deadline)
+        .map_err(|_| Error::State(Fault::LaunchFailed))?;
     let state = shared
         .0
         .lock()
         .map_err(|_| Error::State(Fault::StateUnavailable))?;
     let (state, _) = shared
         .1
-        .wait_timeout_while(state, Duration::from_secs(15), |s| s.ui.is_none())
+        .wait_timeout_while(
+            state,
+            deadline.saturating_duration_since(Instant::now()),
+            |s| s.ui.is_none(),
+        )
         .map_err(|_| Error::State(Fault::StateUnavailable))?;
     drop(state);
     let current = paths.vault_source()?;
