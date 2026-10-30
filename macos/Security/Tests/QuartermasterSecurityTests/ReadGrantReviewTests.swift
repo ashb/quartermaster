@@ -10,11 +10,11 @@ private func grantRequest(changing change: (inout [String: Any]) -> Void = { _ i
         "readRoots": [["id": "123:0000000000000001:00000001", "pid": 123, "executable": "/bin/zsh"]],
         "peer": ["cdHash": String(repeating: "1", count: 40)],
         "authorization": [
-            "purpose": "quartermaster.read-grant.v2",
+            "purpose": "quartermaster.read-grant",
             "grant": [
                 "id": String(repeating: "a", count: 32), "uid": 501,
                 "codeHash": String(repeating: "1", count: 40),
-                "effects": ["version": 1, "effects": ["listIssues", "readIssue"]],
+                "effects": ["effects": ["listIssues", "readIssue"]],
                 "root": ["id": "123:0000000000000001:00000001", "pid": 123, "executable": "/bin/zsh"],
                 "repository": "example/one", "role": "github-write", "expiresUnix": 4600,
             ],
@@ -52,7 +52,7 @@ func readGrantReviewRejectsMisrepresentedOrUnboundedPermissions(_ field: String)
         var grant = authorization["grant"] as! [String: Any]
         switch field {
         case "purpose": authorization[field] = "approve-write"
-        case "effects": grant[field] = ["version": 1, "effects": ["closeIssue"]]
+        case "effects": grant[field] = ["effects": ["closeIssue"]]
         case "root": grant[field] = ["id": "999:0000000000000001:00000001", "pid": 999, "executable": "/bin/zsh"]
         case "readRoots": request[field] = []
         case "repository": grant[field] = "example/two"
@@ -84,16 +84,15 @@ func readGrantReviewRejectsMisrepresentedOrUnboundedPermissions(_ field: String)
     #expect(scope.roots[0].pid == 123)
 }
 
-@Test(arguments: ["oldVersion", "unknownEffect", "duplicateEffect", "unknownRoot", "duplicateRoot", "malformedRoot"])
+@Test(arguments: ["unknownEffect", "duplicateEffect", "unknownRoot", "duplicateRoot", "malformedRoot"])
 func rootClaimsRejectIncompatibleOrAmbiguousScope(_ change: String) throws {
     let bytes = try grantRequest { request in
         var authorization = request["authorization"] as! [String: Any]
         var grant = authorization["grant"] as! [String: Any]
         switch change {
-        case "oldVersion": authorization["purpose"] = "quartermaster.issue-read-grant.v1"
         case "unknownEffect":
-            grant["effects"] = ["version": 1, "effects": ["listIssues", "readIssue", "readPullRequest"]]
-        case "duplicateEffect": grant["effects"] = ["version": 1, "effects": ["readIssue", "readIssue"]]
+            grant["effects"] = ["effects": ["listIssues", "readIssue", "readPullRequest"]]
+        case "duplicateEffect": grant["effects"] = ["effects": ["readIssue", "readIssue"]]
         case "unknownRoot": request["readRoots"] = []
         case "duplicateRoot": request["readRoots"] = [grant["root"]!, grant["root"]!]
         case "malformedRoot": request["readRoots"] = [["id": "123", "pid": 123, "executable": "/bin/zsh"]]

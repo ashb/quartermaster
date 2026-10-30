@@ -62,7 +62,7 @@ public struct ReadGrantReview: Sendable {
             })
         else { throw Failure.invalidGrant }
         let hex = { (text: String) in text.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
-        guard authorization.purpose == "quartermaster.read-grant.v2", grant.effects.version == 1,
+        guard authorization.purpose == "quartermaster.read-grant",
             grant.effects.effects == ["listIssues", "readIssue"], grant.root.valid,
             request.readRoots.contains(grant.root),
             grant.id.count == 32, hex(grant.id), grant.uid == uid,
@@ -97,7 +97,6 @@ public struct ReadRootChoice: Codable, Equatable, Sendable, Identifiable {
 }
 
 private struct ReadEffectSet: Decodable, Sendable {
-    let version: UInt8
     let effects: [String]
 }
 
@@ -154,7 +153,7 @@ public struct ActiveReadGrant: Decodable, Sendable, Identifiable {
     public var root: ReadRootChoice { grant.root }
     public var expires: Date { Date(timeIntervalSince1970: TimeInterval(grant.expiresUnix)) }
     public var valid: Bool {
-        purpose == "quartermaster.read-grant.v2" && grant.root.valid && grant.effects.version == 1
+        purpose == "quartermaster.read-grant" && grant.root.valid
             && grant.effects.effects == ["listIssues", "readIssue"]
             && id.count == 32 && id.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
             && RepositoryName(fullName: repository) != nil

@@ -1089,7 +1089,7 @@ mod tests {
             panic!("ungranted read was allowed");
         };
         let claims = serde_json::to_value(requirement.grant_claims().unwrap()).unwrap();
-        assert_eq!(claims["purpose"], "quartermaster.read-grant.v2");
+        assert_eq!(claims["purpose"], "quartermaster.read-grant");
         assert_eq!(claims["grant"]["codeHash"], "11".repeat(20));
         assert_eq!(claims["grant"]["role"], "github-write");
         assert!(

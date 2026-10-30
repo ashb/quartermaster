@@ -9,7 +9,7 @@
     "cdHash": "1111111111111111111111111111111111111111"
   },
   "authorization": {
-    "purpose": "quartermaster.read-grant.v2",
+    "purpose": "quartermaster.read-grant",
     "grant": {
       "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "uid": 501,
@@ -18,7 +18,6 @@
       "role": "github-write",
       "expiresUnix": 4600,
       "effects": {
-        "version": 1,
         "effects": [
           "listIssues",
           "readIssue"

@@ -114,7 +114,7 @@ mod test_support {
                 "id": "0123456789abcdef0123456789abcdef",
                 "uid": 501,
                 "codeHash": "11".repeat(20),
-                "effects": {"version": 1, "effects": ["readIssue"]},
+                "effects": {"effects": ["readIssue"]},
                 "root": {"id": "fixture-root", "pid": 123, "executable": "/bin/zsh"},
                 "repository": "quartermaster/demo",
                 "role": "github-read",

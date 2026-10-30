@@ -27,7 +27,6 @@ enum ReadEffect {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ReadEffects {
-    version: u8,
     effects: Vec<ReadEffect>,
 }
 
@@ -46,8 +45,14 @@ pub(super) struct GrantRule {
 }
 
 #[derive(Clone, Serialize, PartialEq, Eq)]
+enum GrantPurpose {
+    #[serde(rename = "quartermaster.read-grant")]
+    Read,
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub(super) struct ReadGrantClaims {
-    purpose: &'static str,
+    purpose: GrantPurpose,
     grant: GrantRule,
 }
 
@@ -85,7 +90,6 @@ impl GrantRule {
         session: [u8; 16],
     ) -> bool {
         principal.matches(self.uid, &self.code_hash, session)
-            && self.effects.version == 1
             && self.effects.effects.iter().any(|effect| {
                 matches!(
                     (effect, operation.action()),
@@ -144,7 +148,6 @@ impl ReadGrantProposal {
                 uid: principal.uid(),
                 code_hash: principal.code_hash().to_owned(),
                 effects: ReadEffects {
-                    version: 1,
                     effects: vec![ReadEffect::ListIssues, ReadEffect::ReadIssue],
                 },
                 root: root.description().clone(),
@@ -186,7 +189,7 @@ impl ReadGrantProposal {
 
     pub(super) fn claims(&self) -> ReadGrantClaims {
         ReadGrantClaims {
-            purpose: "quartermaster.read-grant.v2",
+            purpose: GrantPurpose::Read,
             grant: self.rule.clone(),
         }
     }
@@ -255,7 +258,7 @@ impl GrantTable {
             .iter()
             .filter(|grant| grant.check(now).is_ok())
             .map(|grant| ReadGrantClaims {
-                purpose: "quartermaster.read-grant.v2",
+                purpose: GrantPurpose::Read,
                 grant: grant.rule.clone(),
             })
             .collect()
@@ -765,6 +768,22 @@ mod tests {
             owner.authorize(&principal, read_request(), now + Duration::from_secs(5)),
             Err(AuthorizationError::Expired)
         ));
+    }
+
+    #[test]
+    fn read_grant_claims_identify_the_purpose_without_a_format_version() {
+        let principal = crate::owner::test_support::principal([1; 16]);
+        let proposal =
+            super::ReadGrantProposal::new(&principal, &read_request(), "github-read").unwrap();
+        let claims = serde_json::to_value(proposal.claims()).unwrap();
+        assert_eq!(claims["purpose"], "quartermaster.read-grant");
+        assert!(claims["grant"]["effects"].get("version").is_none());
+        let permission: super::ReadEffects =
+            serde_json::from_value(claims["grant"]["effects"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(permission).unwrap(),
+            claims["grant"]["effects"]
+        );
     }
 
     fn github_config(id: u64) -> crate::owner::github::configuration::GitHubConfig {

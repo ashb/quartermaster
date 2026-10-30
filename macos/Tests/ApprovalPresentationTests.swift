@@ -310,11 +310,11 @@ private func approvalPresentation(
     let once = try view(JSONSerialization.data(withJSONObject: request))
     for selected in [root, parent] {
         request["authorization"] = [
-            "purpose": "quartermaster.read-grant.v2",
+            "purpose": "quartermaster.read-grant",
             "grant": [
                 "id": String(repeating: "a", count: 32), "uid": 501,
                 "codeHash": String(repeating: "1", count: 40), "root": selected,
-                "effects": ["version": 1, "effects": ["listIssues", "readIssue"]],
+                "effects": ["effects": ["listIssues", "readIssue"]],
                 "repository": "quartermaster/one", "role": "github-write", "expiresUnix": 4600,
             ],
         ]

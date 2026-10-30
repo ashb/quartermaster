@@ -96,10 +96,10 @@ private final class DocumentationClient: BrokerClient, Sendable {
             ).base64EncodedString(),
         ],
         "authorization": [
-            "purpose": "quartermaster.read-grant.v2",
+            "purpose": "quartermaster.read-grant",
             "grant": [
                 "id": String(repeating: "a", count: 32), "uid": 501, "codeHash": String(repeating: "1", count: 40),
-                "root": root, "effects": ["version": 1, "effects": ["listIssues", "readIssue"]],
+                "root": root, "effects": ["effects": ["listIssues", "readIssue"]],
                 "repository": "example/project", "role": "github-write", "expiresUnix": 1_793_192_400,
             ],
         ],
