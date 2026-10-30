@@ -21,6 +21,8 @@ pub(super) enum OperationResponse {
     IssueOpen,
     IssueClosed,
     Denied,
+    ApprovalUnavailable,
+    FrontendChanged,
     Uncertain,
     Github(super::github::response::PublicResponse),
     Redirect(Box<ReadRedirect>),
@@ -46,6 +48,14 @@ impl OperationResponse {
             Self::Denied => (
                 "403 Forbidden".into(),
                 b"{\"message\":\"Quartermaster denied this operation\"}",
+            ),
+            Self::ApprovalUnavailable => (
+                "503 Service Unavailable".into(),
+                b"{\"message\":\"Quartermaster could not connect to its approval window. Open Quartermaster and retry.\"}",
+            ),
+            Self::FrontendChanged => (
+                "503 Service Unavailable".into(),
+                b"{\"message\":\"The Quartermaster app changed while its backend was running. Restart the backend and reopen Quartermaster, then retry.\"}",
             ),
             Self::Uncertain => (
                 "502 Bad Gateway".into(),

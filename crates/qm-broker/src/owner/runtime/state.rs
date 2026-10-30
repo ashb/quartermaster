@@ -30,6 +30,7 @@ type ConsoleCapture =
 pub(super) struct OwnerState {
     pub(super) administration: super::settings::Administration,
     pub(super) ui: Option<UiSession>,
+    pub(super) frontend_requirement: Option<String>,
     pub(super) approval_public_key: Option<Vec<u8>>,
     pub(super) pending: Option<ApprovalDelivery>,
     pub(super) provider: ProviderState,
@@ -72,6 +73,7 @@ impl OwnerState {
         Ok(Self {
             administration: super::settings::Administration::default(),
             ui: None,
+            frontend_requirement: None,
             approval_public_key: None,
             pending: None,
             provider: ProviderState::default(),

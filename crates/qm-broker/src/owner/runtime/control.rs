@@ -226,12 +226,14 @@ pub(super) fn listen(
     runtime: tokio::runtime::Handle,
 ) -> Result<impl Sized> {
     let requirement = requirement_for_path(&paths.app)?;
-    let events = shared
-        .0
-        .lock()
-        .map_err(|_| Error::State(Fault::StateUnavailable))?
-        .host_events
-        .clone();
+    let events = {
+        let mut state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.frontend_requirement = Some(requirement.clone());
+        state.host_events.clone()
+    };
     let work_limit = Arc::new(tokio::sync::Semaphore::new(8));
     ipc::listen(SERVICE, &requirement, events, move |event| {
         handle_event(event, &shared, &paths, &runtime, &work_limit)

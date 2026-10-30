@@ -1,6 +1,6 @@
 use crate::owner::{
     dispatch, operation::OperationError, policy::AuthorizationError, protocol::ControlError,
-    provider_lifecycle, settings::Error as SettingsError, vault,
+    provider_lifecycle, settings::Error as SettingsError, transport::OperationResponse, vault,
 };
 use std::{fmt, io};
 
@@ -32,6 +32,7 @@ pub(in crate::owner) enum Fault {
     MainThreadRequired,
     IngressUnavailable,
     UiDisconnected,
+    FrontendChanged,
     UiNotEnrolled,
     ApprovalKeyChanged,
     PendingMissing,
@@ -58,6 +59,16 @@ pub(in crate::owner) enum Fault {
 }
 
 impl Error {
+    pub(super) fn http_response(&self) -> OperationResponse {
+        match self {
+            Self::State(Fault::FrontendChanged) => OperationResponse::FrontendChanged,
+            Self::State(Fault::UiDisconnected | Fault::LaunchFailed) => {
+                OperationResponse::ApprovalUnavailable
+            }
+            _ => OperationResponse::Denied,
+        }
+    }
+
     pub(super) fn io(operation: &'static str, source: io::Error) -> Self {
         Self::Io { operation, source }
     }
@@ -215,6 +226,31 @@ impl std::error::Error for Error {
 mod tests {
     use super::*;
     use crate::owner::protocol::{Reply, encode_reply};
+
+    #[test]
+    fn ui_failures_are_distinct_from_denials_without_exposing_internal_errors() {
+        for fault in [
+            Fault::UiDisconnected,
+            Fault::LaunchFailed,
+            Fault::FrontendChanged,
+        ] {
+            let response = Error::State(fault).http_response();
+            let (status, body) = response.public_parts();
+            assert_eq!(status, "503 Service Unavailable");
+            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert!(body["message"].as_str().unwrap().contains("retry"));
+        }
+        for error in [
+            Error::State(Fault::Canceled),
+            Error::Authorization(AuthorizationError::Denied),
+            Error::io("SECRET_CANARY", io::Error::other("SECRET_CANARY")),
+        ] {
+            let response = error.http_response();
+            let (status, body) = response.public_parts();
+            assert_eq!(status, "403 Forbidden");
+            assert!(!String::from_utf8_lossy(body).contains("SECRET_CANARY"));
+        }
+    }
 
     #[test]
     fn structured_failures_retain_their_wire_categories() {

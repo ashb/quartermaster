@@ -9,7 +9,6 @@ mod settings;
 mod state;
 mod vault_workflow;
 
-use crate::owner::transport::OperationResponse;
 use error::{Error, Fault, Result};
 use ring::rand::{SecureRandom, SystemRandom};
 use state::OwnerState;
@@ -231,7 +230,7 @@ async fn serve_ingress(
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = http::handle_http(&mut stream, &shared, &paths) {
                         eprintln!("Request denied: {error}");
-                        let _ = http::response(&mut stream, OperationResponse::Denied);
+                        let _ = http::response(&mut stream, error.http_response());
                     }
                 })
                 .await?;
@@ -275,6 +274,7 @@ use {
         policy::AuthorizationOutcome,
         protocol::{Client, Reply, decode_client, encode_reply},
         request as http_request,
+        transport::OperationResponse,
     },
     base64::{Engine, engine::general_purpose::STANDARD as BASE64},
     qm_macos::{
@@ -1052,6 +1052,59 @@ mod tests {
     use crate::owner::operation::Admission;
     use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn unavailable_approval_ui_returns_an_actionable_http_error_without_dispatch() {
+        for changed in [false, true] {
+            let (_root, mut paths, _key, mut state, _receive) = fixture();
+            state.disconnect_ui();
+            state.frontend_requirement = Some(
+                qm_macos::peer_identity::requirement_for_path(&std::env::current_exe().unwrap())
+                    .unwrap(),
+            );
+            if changed {
+                paths.app = "/usr/bin/true".into();
+            }
+            let upstream = state.upstream.clone();
+            let socket = paths.root.join("ui-failure.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut client = UnixStream::connect(&socket).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let listener = {
+                let _entered = runtime.enter();
+                tokio::net::UnixListener::from_std(listener).unwrap()
+            };
+            let shared = Arc::new((Mutex::new(state), Condvar::new()));
+            let worker = runtime.spawn(serve_ingress(listener, shared, paths));
+            client.write_all(b"PATCH /api/v3/repos/quartermaster/demo/issues/42 HTTP/1.1\r\nHost: github.example.invalid\r\nContent-Length: 18\r\n\r\n{\"state\":\"closed\"}").unwrap();
+            let mut response = String::new();
+            let read = client.read_to_string(&mut response);
+            worker.abort();
+            runtime.shutdown_timeout(Duration::from_secs(2));
+            read.unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+                "{response}"
+            );
+            let body: Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert!(body["message"].as_str().unwrap().contains(if changed {
+                "Restart the backend"
+            } else {
+                "approval window"
+            }));
+            assert!(body["message"].as_str().unwrap().contains("retry"));
+            assert_eq!(super::super::transport::fixture::observe(&upstream).0, 0);
+        }
+    }
 
     #[test]
     fn a_changed_selected_credential_requires_fresh_grant_approval() {

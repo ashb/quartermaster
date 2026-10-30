@@ -103,6 +103,17 @@ pub(super) struct UiSession {
     pub(super) session: ApprovalSession,
     pub(super) connection: Option<ConnectionId>,
 }
+
+fn check_frontend(expected: Option<&str>, app: &std::path::Path) -> Result<()> {
+    let expected = expected.ok_or(Error::State(Fault::UiDisconnected))?;
+    let installed = qm_macos::peer_identity::requirement_for_path(app)
+        .map_err(|_| Error::State(Fault::UiDisconnected))?;
+    if installed != expected {
+        return Err(Error::State(Fault::FrontendChanged));
+    }
+    Ok(())
+}
+
 pub(super) fn request_approval(
     id: OperationId,
     principal: &Arc<VerifiedPrincipal>,
@@ -111,12 +122,17 @@ pub(super) fn request_approval(
     shared: &Shared,
     paths: &ServicePaths,
 ) -> Result<mpsc::Receiver<ApprovalCompletion>> {
-    let generation = shared
-        .0
-        .lock()
-        .map_err(|_| Error::State(Fault::StateUnavailable))?
-        .provider
-        .generation();
+    let (generation, frontend_requirement) = {
+        let state = shared
+            .0
+            .lock()
+            .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        (
+            state.provider.generation(),
+            state.frontend_requirement.clone(),
+        )
+    };
+    check_frontend(frontend_requirement.as_deref(), &paths.app)?;
     let source = paths.vault_source()?;
     let identity = source.identity()?;
     let (operation, authorization, read_roots, frozen) = {
@@ -154,7 +170,8 @@ pub(super) fn request_approval(
     if !Command::new("/usr/bin/open")
         .arg("-a")
         .arg(&paths.app)
-        .status()?
+        .status()
+        .map_err(|_| Error::State(Fault::LaunchFailed))?
         .success()
     {
         return Err(Error::State(Fault::LaunchFailed));
@@ -379,4 +396,38 @@ pub(super) fn native_presence(
         .lock()
         .map_err(|_| Error::State(Fault::StateUnavailable))?;
     complete_native_presence(id, &mut state, &policy, current)
+}
+
+#[cfg(test)]
+mod frontend_tests {
+    use super::*;
+    use qm_macos::peer_identity::requirement_for_path;
+
+    #[test]
+    fn frontend_preflight_rejects_changed_missing_or_invalid_code() {
+        let executable = std::env::current_exe().unwrap();
+        let expected = requirement_for_path(&executable).unwrap();
+        assert!(check_frontend(Some(&expected), &executable).is_ok());
+        let other = requirement_for_path(std::path::Path::new("/usr/bin/true")).unwrap();
+        assert_ne!(expected, other);
+        assert!(matches!(
+            check_frontend(Some(&other), &executable),
+            Err(Error::State(Fault::FrontendChanged))
+        ));
+        assert!(matches!(
+            check_frontend(None, &executable),
+            Err(Error::State(Fault::UiDisconnected))
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("frontend");
+        for exists in [false, true] {
+            if exists {
+                std::fs::write(&app, b"not signed code").unwrap();
+            }
+            assert!(matches!(
+                check_frontend(Some(&expected), &app),
+                Err(Error::State(Fault::UiDisconnected))
+            ));
+        }
+    }
 }
