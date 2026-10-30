@@ -5,7 +5,7 @@ extension ApprovalDisplay {
         switch intent {
         case .request: "Approve GitHub request"
         case .issue(let action, let number):
-            number.map { "\(action.label) #\($0)" } ?? action.label
+            number.map { "\(action.label) #\($0)?" } ?? "\(action.label)?"
         case .readGrant(let grant): grant.title
         }
     }
@@ -22,6 +22,7 @@ extension UnderstandingNotice {
     var text: String {
         switch self {
         case .incompleteRequest: "This request isn't fully understood. Review the HTTP details before approving."
+        case .unresolvedIssue: "Couldn’t verify which issue this ID identifies."
         }
     }
 }

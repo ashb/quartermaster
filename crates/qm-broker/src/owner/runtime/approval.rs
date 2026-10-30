@@ -126,6 +126,7 @@ pub(super) fn request_approval(
             .0
             .lock()
             .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        state.check_review_context(id, principal)?;
         (
             state.provider.generation(),
             state.frontend_requirement.clone(),

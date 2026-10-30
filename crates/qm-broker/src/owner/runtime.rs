@@ -605,7 +605,7 @@ mod github_tests {
     };
     use std::net::SocketAddr;
 
-    fn setup(
+    pub(super) fn setup(
         address: SocketAddr,
     ) -> (
         tempfile::TempDir,
@@ -2387,3 +2387,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod resource_context_tests;

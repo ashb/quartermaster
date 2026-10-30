@@ -294,7 +294,7 @@ func suppliedResourceTitlesPreserveUnicode(_ title: String) throws {
 
 @Test func issueIntentRendersTheSuppliedActionAndNumber() throws {
     let presentation = try approvalPresentation(intent: ["kind": "issue", "action": "closeIssue", "number": 42])
-    #expect(presentation.operationTitle == "Close issue #42")
+    #expect(presentation.operationTitle == "Close issue #42?")
     #expect(presentation.additionalEffects.isEmpty)
 }
 

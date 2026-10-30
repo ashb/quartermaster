@@ -301,7 +301,7 @@ pub(super) fn execute_github(
     principal: &VerifiedPrincipal,
     mut id: OperationId,
 ) -> Result<()> {
-    let (deadline, connector) = {
+    let (deadline, connector, observation) = {
         let policy = paths.load_policy();
         let mut state = shared
             .0
@@ -312,7 +312,14 @@ pub(super) fn execute_github(
             state
                 .operations
                 .dispatch_deadline(id, principal, &state.authorizer, Instant::now())?;
-        (deadline, state.github.clone())
+        let observation = state.provider.snapshot().and_then(|snapshot| {
+            crate::owner::github::resource_context::Observation::new(
+                state.operations.request(id, principal).ok()?.clone(),
+                CredentialSelection::at_generation(snapshot, state.provider.generation()),
+                state.authorizer.policy_generation(),
+            )
+        });
+        (deadline, state.github.clone(), observation)
     };
     let mut visited = Vec::new();
     let unscoped = {
@@ -413,6 +420,11 @@ pub(super) fn execute_github(
             .0
             .lock()
             .map_err(|_| Error::State(Fault::StateUnavailable))?;
+        if let Some(observation) = &observation {
+            state
+                .github_resources
+                .observe(observation, &outcome, Instant::now());
+        }
         state.finish(id, &outcome)?;
         match outcome {
             OperationResponse::Redirect(redirect) => {

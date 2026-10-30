@@ -497,6 +497,9 @@ impl WireResponse {
 }
 
 impl PublicResponse {
+    pub(super) fn lookup_body(&self) -> Option<&[u8]> {
+        (self.status == 200).then_some(&self.body)
+    }
     pub(in crate::owner) fn public_parts(&self) -> (String, &[u8]) {
         let reason = match self.status {
             200 => "OK",

@@ -30,6 +30,7 @@ enum GitHubApprovalIntent {
 #[serde(rename_all = "camelCase")]
 enum UnderstandingNotice {
     IncompleteRequest,
+    UnresolvedIssue,
 }
 
 impl Presentation {
@@ -46,14 +47,26 @@ impl Presentation {
                 .collect()
         });
         let complete = application.is_some_and(|application| application.analysis().complete());
+        let context = application.and_then(|application| application.resource_context.as_ref());
+        let unresolved =
+            application.is_some_and(|application| application.unresolved_issue().is_some());
         let repository = if !operation.repository().is_empty() {
             Some(operation.repository().to_owned())
         } else {
-            application.and_then(|application| application.requested_repository())
+            context
+                .map(|target| target.repository.clone())
+                .or_else(|| application.and_then(|application| application.requested_repository()))
         };
         let intent = if let Some(grant) = grant {
             effects.clear();
             GitHubApprovalIntent::ReadGrant { grant }
+        } else if unresolved {
+            let action = effects[0];
+            effects.clear();
+            GitHubApprovalIntent::Issue {
+                action,
+                number: context.map(|target| target.number),
+            }
         } else if complete
             && effects == [EffectKind::CloseIssue]
             && let Some(number) = operation.issue_number()
@@ -68,6 +81,10 @@ impl Presentation {
         };
         let understanding_notice = if application.is_none() || complete {
             None
+        } else if unresolved {
+            context
+                .is_none()
+                .then_some(UnderstandingNotice::UnresolvedIssue)
         } else {
             Some(UnderstandingNotice::IncompleteRequest)
         };
@@ -82,7 +99,7 @@ impl Presentation {
         Self {
             intent,
             repository,
-            resource_title: None,
+            resource_title: context.map(|target| target.title.clone()),
             additional_effects: effects,
             understanding_notice,
             allows_read_scope,

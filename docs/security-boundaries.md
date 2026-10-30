@@ -150,6 +150,14 @@ unverified.
 If the complete request cannot be presented within supported bounds, refuse
 approval. Classification and policy remain in Rust, without a second UI policy.
 
+The GitHub adapter may retain resource labels from authenticated, successful
+lookup responses in a 256-entry LRU cache for 60 seconds. Hits do not renew
+expiry. Entries are scoped to the credential selection, policy generation and
+repository configuration. Labels are frozen into the signed request review;
+they describe a recent observation, not current repository confinement. They
+never authorise requests, change semantic coverage, or supply client responses.
+Unknown semantics retain their warning even when a resource label is available.
+
 Only one approval may be armed for user presence at a time. The UI owns the
 biometric-protected approval key; the broker receives its enrolled public key and
 request-bound proof. Enrolment must authenticate the key-holding component and

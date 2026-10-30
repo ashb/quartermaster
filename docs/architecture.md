@@ -208,6 +208,12 @@ sibling cannot hide unfamiliar input. The broker supplies its own pattern
 catalogue and uses these observations for policy and approval. The classifier
 remains independent of the daemon and credential authority.
 
+GitHub lookup responses can supply bounded resource labels for later approval
+dialogs. Query-aware extraction belongs in `qm-api-github`; the GitHub adapter
+owns the 60-second, 256-entry LRU cache and credential/configuration bindings.
+This metadata never serves client requests or changes authorisation. Other
+services can supply their own resource context without adopting GitHub schemas.
+
 ## Caller attribution
 
 The broker verifies the socket peer's running code through its kernel audit

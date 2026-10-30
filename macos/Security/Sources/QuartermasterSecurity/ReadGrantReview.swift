@@ -42,7 +42,7 @@ public enum GitHubApprovalIntent: Decodable, Sendable {
 }
 
 public enum UnderstandingNotice: String, Decodable, Sendable {
-    case incompleteRequest
+    case incompleteRequest, unresolvedIssue
 }
 
 public struct ReadGrantReview: Decodable, Sendable, Identifiable {

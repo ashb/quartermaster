@@ -1,7 +1,7 @@
 use crate::CapturedRequest;
 use std::collections::BTreeSet;
 
-pub const SEMANTICS_VERSION: &str = "quartermaster.github-semantics.v2";
+pub const SEMANTICS_VERSION: &str = "quartermaster.github-semantics.v3";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Repository {
@@ -225,6 +225,7 @@ pub struct Analysis {
     pub matches: Vec<PatternMatch>,
     remaining_output: usize,
     pub(crate) exhausted: bool,
+    pub(crate) lookup: crate::lookup::LookupPlan,
 }
 
 impl Analysis {
@@ -237,6 +238,7 @@ impl Analysis {
             matches: Vec::new(),
             remaining_output: output_bytes,
             exhausted: false,
+            lookup: crate::lookup::LookupPlan::default(),
         }
     }
 

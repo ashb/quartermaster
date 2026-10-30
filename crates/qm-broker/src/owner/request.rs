@@ -230,6 +230,12 @@ impl FrozenOperation {
             if config.mode() == Mode::Github && configuration_digest == config.digest())
     }
 
+    pub(super) fn set_resource_context(&mut self, target: super::github::resource_context::Target) {
+        if let Some(application) = &mut self.application {
+            Arc::make_mut(application).resource_context = Some(target);
+        }
+    }
+
     pub(super) fn has_mutation(&self) -> bool {
         self.action() == Action::CloseIssue
             || self.application().is_some_and(Application::has_mutation)

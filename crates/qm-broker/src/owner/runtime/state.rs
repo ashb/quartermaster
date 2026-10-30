@@ -38,6 +38,7 @@ pub(super) struct OwnerState {
     pub(super) session_policy: SessionPolicy,
     pub(super) upstream: DummyUpstream,
     pub(super) github: Connector,
+    pub(super) github_resources: crate::owner::github::resource_context::ResourceCache,
     pub(super) operations: OperationRegistry,
     pub(super) host_events: HostEvents,
     observed_events: Observation,
@@ -81,6 +82,7 @@ impl OwnerState {
             session_policy: SessionPolicy::default(),
             upstream: DummyUpstream::default(),
             github: Connector::default(),
+            github_resources: Default::default(),
             operations: OperationRegistry::default(),
             host_events: HostEvents::default(),
             observed_events: Observation::default(),
@@ -105,11 +107,13 @@ impl OwnerState {
                 .is_some_and(|old| !old.same_as(stamp))
         });
         if changed {
+            self.github_resources.clear();
             self.authorizer.invalidate_policy()?;
         }
         self.policy_stamp = stamp;
         match self.authorizer.install_current(decoded) {
             Ok(true) => {
+                self.github_resources.clear();
                 self.cancel_pending();
                 if let Some(ui) = &self.ui {
                     ui.session.update_policy(self.authorizer.policy_digest()?)?;
@@ -127,12 +131,24 @@ impl OwnerState {
     pub(super) fn authorize(
         &mut self,
         principal: &VerifiedPrincipal,
-        request: http_request::FrozenOperation,
+        mut request: http_request::FrozenOperation,
         policy: &PolicyInput,
         binding: Result<Option<qm_providers::ProviderBinding>, crate::owner::vault::Error>,
     ) -> Result<AuthorizationOutcome> {
         self.refresh_policy(policy)?;
         let now = Instant::now();
+        if let Some(snapshot) = self.provider.snapshot()
+            && let Some(configuration) = self.authorizer.github_configuration()
+            && request.matches_service(configuration)
+        {
+            self.github_resources.resolve(
+                &mut request,
+                CredentialSelection::at_generation(snapshot, self.provider.generation()),
+                self.authorizer.policy_generation(),
+                configuration.digest(),
+                now,
+            );
+        }
         let outcome = self
             .authorizer
             .authorize(principal, request.clone(), now)
@@ -169,6 +185,37 @@ impl OwnerState {
         }
     }
 
+    pub(super) fn check_review_context(
+        &self,
+        id: crate::owner::operation::OperationId,
+        principal: &VerifiedPrincipal,
+    ) -> Result<()> {
+        let request = self.operations.request(id, principal)?;
+        if let Some(target) = request
+            .application()
+            .and_then(|application| application.resource_context.as_ref())
+        {
+            let snapshot = self
+                .provider
+                .snapshot()
+                .ok_or(Error::State(Fault::ProviderChanged))?;
+            let configuration = self
+                .authorizer
+                .github_configuration()
+                .ok_or(Error::State(Fault::ProviderChanged))?;
+            let selection =
+                CredentialSelection::at_generation(snapshot, self.provider.generation());
+            if !target.matches(
+                &selection,
+                self.authorizer.policy_generation(),
+                configuration.digest(),
+            ) {
+                return Err(Error::State(Fault::ProviderChanged));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn cancel_pending(&mut self) {
         if let Some(pending) = self.pending.take() {
             self.operations.cancel(pending.id, &pending.principal);
@@ -184,6 +231,7 @@ impl OwnerState {
     }
 
     pub(super) fn lock_vault(&mut self) -> Result<()> {
+        self.github_resources.clear();
         self.disconnect_ui();
         self.provider.lock()?;
         Ok(())
@@ -194,6 +242,7 @@ impl OwnerState {
             return Ok(());
         }
         self.authorizer.revoke_session();
+        self.github_resources.clear();
         self.disconnect_ui();
         self.provider.lock().map_err(Error::from)
     }

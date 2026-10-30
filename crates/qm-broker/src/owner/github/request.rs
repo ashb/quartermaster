@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use qm_api_github::{Analysis, CapturedRequest, EffectKind, PatternSet, RequestLimits, Resource};
+use qm_api_github::{
+    Analysis, CapturedRequest, EffectKind, PatternSet, RequestLimits, Resource, UncoveredReason,
+};
 use ring::digest::{SHA256, digest};
 use serde::{Serialize, Serializer};
 use std::io::{self, Read};
@@ -9,15 +11,17 @@ use zeroize::Zeroizing;
 
 pub(in crate::owner) const REVIEW_VERSION: &str = "quartermaster.github-request.v1";
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(in crate::owner) struct Application {
     capture: CapturedRequest,
     analysis: Analysis,
+    pub(in crate::owner) resource_context: Option<super::resource_context::Target>,
 }
 
 impl PartialEq for Application {
     fn eq(&self, other: &Self) -> bool {
         self.capture.original() == other.capture.original()
+            && self.resource_context == other.resource_context
     }
 }
 impl Eq for Application {}
@@ -93,7 +97,11 @@ impl Application {
             return Err(io::Error::other("GitHub destination is not permitted"));
         }
         let analysis = qm_api_github::analyze(&capture, patterns).map_err(io::Error::other)?;
-        Ok(Self { capture, analysis })
+        Ok(Self {
+            capture,
+            analysis,
+            resource_context: None,
+        })
     }
 
     pub(in crate::owner) fn capture(&self) -> &CapturedRequest {
@@ -121,6 +129,28 @@ impl Application {
             }
         }
         repository.map(|name| format!("{}/{}", name.owner, name.name))
+    }
+
+    pub(in crate::owner) fn unresolved_issue(&self) -> Option<&str> {
+        if self.analysis.complete()
+            || self.analysis.uncovered.is_empty()
+            || self
+                .analysis
+                .uncovered
+                .iter()
+                .any(|item| item.reason != UncoveredReason::ResourceOwnership)
+            || self.analysis.effects.len() != 1
+            || !matches!(
+                self.analysis.effects[0].kind,
+                EffectKind::CloseIssue | EffectKind::ReopenIssue | EffectKind::DeleteIssue
+            )
+        {
+            return None;
+        }
+        match self.analysis.resources.as_slice() {
+            [Resource::NodeId(id)] => Some(id),
+            _ => None,
+        }
     }
 
     pub(in crate::owner) fn has_mutation(&self) -> bool {
@@ -189,7 +219,7 @@ impl Serialize for Application {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct Review {
+        struct Review<'a> {
             version: &'static str,
             request: String,
             original_digest: String,
@@ -197,6 +227,10 @@ impl Serialize for Application {
             effects: Vec<EffectKind>,
             #[serde(skip_serializing_if = "Option::is_none")]
             requested_repository: Option<String>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            unresolved_target: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            resource_context: Option<&'a super::resource_context::Target>,
         }
         let effects = self
             .analysis
@@ -211,6 +245,8 @@ impl Serialize for Application {
             complete: self.analysis.complete(),
             effects,
             requested_repository: self.requested_repository(),
+            unresolved_target: self.unresolved_issue().is_some(),
+            resource_context: self.resource_context.as_ref(),
         }
         .serialize(serializer)
     }

@@ -175,3 +175,15 @@ qm run gh -- api --hostname github.com --method GET rate_limit
 ```
 
 This request uses fresh one-use approval even if an issue-read grant exists.
+
+With an Issues-write token, `gh issue close NUMBER -R "$QM_REPOSITORY"` and
+`gh issue reopen NUMBER -R "$QM_REPOSITORY"` use the same route. Covered lookups
+can reuse the read grant; each mutation requires fresh exact-request approval.
+Cancel sends no mutation and leaves independent read grants intact.
+
+For issue mutations addressed by a GraphQL node ID, the approval can show the
+repository, number and title from a recent successful lookup. GitHub lookup
+metadata stays in a 256-entry LRU cache for 60 seconds; cache hits do not extend
+expiry. This cache is internal to Quartermaster: every client request still
+goes upstream after authorisation. Missing context produces an unresolved-target
+message; unfamiliar operations or fields retain the broader warning.

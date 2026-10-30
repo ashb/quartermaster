@@ -180,6 +180,7 @@ fn document(
         budget,
         exhausted: false,
         max_depth: limits.graphql_depth,
+        response_path: Vec::new(),
     };
     if let Some(definitions) = operation.variable_definitions() {
         for definition in definitions.variable_definitions() {
@@ -288,6 +289,7 @@ struct Walker<'a> {
     budget: &'a mut Budget,
     exhausted: bool,
     max_depth: usize,
+    response_path: Vec<String>,
 }
 
 impl Walker<'_> {
@@ -449,6 +451,15 @@ impl Walker<'_> {
                     if self.analysis.exhausted {
                         return Err(AnalysisError::Limit);
                     }
+                    let response_name = field
+                        .alias()
+                        .and_then(|alias| alias.name())
+                        .map(|name| name.text().to_string())
+                        .unwrap_or_else(|| name.clone());
+                    self.response_path.push(response_name);
+                    self.analysis
+                        .lookup
+                        .record(context.name(), &name, &args, &self.response_path);
                     match (child, field.selection_set()) {
                         (Some(child), Some(selection)) => {
                             self.walk(selection, child, &location, false, depth + 1, active)?
@@ -458,6 +469,7 @@ impl Walker<'_> {
                             self.unknown(&location, UncoveredReason::Schema)
                         }
                     }
+                    self.response_path.pop();
                 }
                 cst::Selection::FragmentSpread(spread) => {
                     if !self.included(spread.directives(), path) {
