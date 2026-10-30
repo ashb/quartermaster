@@ -109,23 +109,22 @@ impl Application {
                     repository = Some(name);
                 }
                 Resource::IssueNumber(_) => {}
-                Resource::RepositoryId(_) | Resource::NodeId(_) => return None,
+                _ => return None,
             }
         }
         repository.map(|name| format!("{}/{}", name.owner, name.name))
     }
 
     pub(in crate::owner) fn has_mutation(&self) -> bool {
-        self.analysis.effects.iter().any(|effect| {
-            !matches!(
-                effect.kind,
-                EffectKind::ReadRepository | EffectKind::ListIssues | EffectKind::ReadIssue
-            )
-        }) || self
-            .analysis
-            .graphql_roots
+        self.analysis
+            .effects
             .iter()
-            .any(|(kind, _)| *kind == qm_api_github::GraphqlOperation::Mutation)
+            .any(|effect| !effect.kind.is_read())
+            || self
+                .analysis
+                .graphql_roots
+                .iter()
+                .any(|(kind, _)| *kind == qm_api_github::GraphqlOperation::Mutation)
     }
 
     pub(in crate::owner) fn wire(&self, credential: &[u8]) -> Zeroizing<Vec<u8>> {

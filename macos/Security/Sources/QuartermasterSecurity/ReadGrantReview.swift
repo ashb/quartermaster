@@ -94,7 +94,25 @@ public enum GitHubEffect: String, Decodable, Sendable {
     case readRepository
     case listIssues
     case readIssue
+    case readReadme
+    case listPullRequests
+    case readPullRequest
+    case listWorkflows
+    case readWorkflow
+    case listWorkflowRuns
+    case readWorkflowRun
+    case listWorkflowJobs
+    case readWorkflowJob
+    case listRunArtifacts
+    case readCheckAnnotations
+    case readRunLogs
+    case readJobLogs
+    case readRelatedSummaries
+    case readLinkedIssueSummaries
+    case readProjectSummaries
+    case readCheckSummaries
     case closeIssue
+    case reopenIssue
     case deleteIssue
     case deleteRepository
 }

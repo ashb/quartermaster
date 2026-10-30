@@ -3,6 +3,8 @@ use crate::{
     json::Json,
 };
 
+mod details;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Context {
     Query,
@@ -15,6 +17,9 @@ pub(super) enum Context {
     PageInfo,
     ClosePayload,
     DeletePayload,
+    Object(&'static str),
+    Connection(&'static str),
+    EdgeOf(&'static str),
     Unknown,
 }
 
@@ -31,9 +36,87 @@ impl Context {
             Self::PageInfo => "PageInfo",
             Self::ClosePayload => "CloseIssuePayload",
             Self::DeletePayload => "DeleteIssuePayload",
+            Self::Object(name) => match name {
+                "RelatedIssue" => "Issue",
+                "RelatedRepository" => "Repository",
+                "RelatedOrganisation" => "Organization",
+                "PullRequestReviewRequest" => "ReviewRequest",
+                name => name,
+            },
+            Self::Connection(name) => match name {
+                "PullRequest" => "PullRequestConnection",
+                "Label" => "LabelConnection",
+                "User" => "UserConnection",
+                "IssueComment" => "IssueCommentConnection",
+                "RelatedIssue" => "IssueConnection",
+                "ProjectV2Item" => "ProjectV2ItemConnection",
+                "PullRequestReviewRequest" => "ReviewRequestConnection",
+                "PullRequestReview" => "PullRequestReviewConnection",
+                "PullRequestCommit" => "PullRequestCommitConnection",
+                "StatusCheckRollupContext" => "StatusCheckRollupContextConnection",
+                _ => "",
+            },
+            Self::EdgeOf(name) => match name {
+                "PullRequest" => "PullRequestEdge",
+                "Label" => "LabelEdge",
+                "User" => "UserEdge",
+                "IssueComment" => "IssueCommentEdge",
+                "RelatedIssue" => "IssueEdge",
+                "ProjectV2Item" => "ProjectV2ItemEdge",
+                "PullRequestReviewRequest" => "ReviewRequestEdge",
+                "PullRequestReview" => "PullRequestReviewEdge",
+                "PullRequestCommit" => "PullRequestCommitEdge",
+                "StatusCheckRollupContext" => "StatusCheckRollupContextEdge",
+                _ => "",
+            },
             Self::Unknown => "",
         }
     }
+
+    pub(super) fn refine(self, name: &str) -> Option<Self> {
+        if self.name() == name {
+            return Some(self);
+        }
+        match (self, name) {
+            (Self::Object("IssueOrPullRequest"), "Issue") => Some(Self::Issue),
+            (Self::Object("IssueOrPullRequest"), "PullRequest") => {
+                Some(Self::Object("PullRequest"))
+            }
+            (Self::Object("Actor" | "RepositoryOwner" | "RequestedReviewer"), "User") => {
+                Some(Self::Object("User"))
+            }
+            (Self::Object("Actor" | "RequestedReviewer"), "Bot") => Some(Self::Object("Bot")),
+            (Self::Object("Actor" | "RepositoryOwner"), "Organization") => {
+                Some(Self::Object("RelatedOrganisation"))
+            }
+            (Self::Object("RequestedReviewer"), "Team") => Some(Self::Object("Team")),
+            (Self::Object("StatusCheckRollupContext"), "StatusContext") => {
+                Some(Self::Object("StatusContext"))
+            }
+            (Self::Object("StatusCheckRollupContext"), "CheckRun") => {
+                Some(Self::Object("CheckRun"))
+            }
+            (Self::Object("ProjectV2ItemFieldValue"), "ProjectV2ItemFieldSingleSelectValue") => {
+                Some(Self::Object("ProjectV2ItemFieldSingleSelectValue"))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn input_type_matches(name: &str, value: &Json) -> Option<bool> {
+    Some(match name {
+        "IssueOrder" => details::valid_order(value),
+        "PullRequestOrder" => details::valid_pull_request_order(value),
+        "IssueFilters" => details::valid_issue_filter(value),
+        "IssueOrderField" => matches!(
+            value.string(),
+            Some("CREATED_AT" | "UPDATED_AT" | "COMMENTS")
+        ),
+        "PullRequestOrderField" => matches!(value.string(), Some("CREATED_AT" | "UPDATED_AT")),
+        "OrderDirection" => matches!(value.string(), Some("ASC" | "DESC")),
+        _ => return None,
+    })
 }
 
 pub(super) fn inspect(
@@ -89,6 +172,8 @@ pub(super) fn inspect(
                     ("states", Json::Array(states)) => states
                         .iter()
                         .all(|state| matches!(state.string(), Some("OPEN" | "CLOSED"))),
+                    ("orderBy", value) => details::valid_order(value),
+                    ("filterBy", value) => details::valid_issue_filter(value),
                     _ => false,
                 };
                 if !valid {
@@ -103,7 +188,9 @@ pub(super) fn inspect(
             }
             (
                 Some(Context::Issues),
-                &["first", "last", "after", "before", "states"],
+                &[
+                    "first", "last", "after", "before", "states", "orderBy", "filterBy",
+                ],
             )
         }
         (Context::Repository, "issue") => {
@@ -122,10 +209,12 @@ pub(super) fn inspect(
             };
             (Some(Context::Issue), &["number"])
         }
-        (Context::Mutation, "closeIssue" | "deleteIssue") => {
+        (Context::Mutation, "closeIssue" | "reopenIssue" | "deleteIssue") => {
             analysis.effect_graphql(
                 if name == "closeIssue" {
                     EffectKind::CloseIssue
+                } else if name == "reopenIssue" {
+                    EffectKind::ReopenIssue
                 } else {
                     EffectKind::DeleteIssue
                 },
@@ -150,7 +239,7 @@ pub(super) fn inspect(
                 unknown(analysis, path, UncoveredReason::Argument);
             }
             (
-                Some(if name == "closeIssue" {
+                Some(if name != "deleteIssue" {
                     Context::ClosePayload
                 } else {
                     Context::DeletePayload
@@ -176,6 +265,9 @@ pub(super) fn inspect(
         (Context::Issues, "pageInfo") => (Some(Context::PageInfo), &[]),
         (Context::Edge, "node") | (Context::ClosePayload, "issue") => (Some(Context::Issue), &[]),
         _ => {
+            if let Some(child) = details::inspect(analysis, context, name, args, path) {
+                return child;
+            }
             unknown(analysis, path, UncoveredReason::Field);
             (Some(Context::Unknown), &[])
         }

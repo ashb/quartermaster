@@ -14,11 +14,15 @@ const schema = buildSchema(`
   enum IssueState { OPEN, CLOSED }
   type Repository {
     name: String!
+    hasIssuesEnabled: Boolean!
     issue(number: Int!): Issue!
+    issueOrPullRequest(number: Int!): IssueOrPullRequest!
     issues(first: Int, last: Int, after: String, before: String, states: [IssueState!]): IssueConnection!
     future: String!
   }
-  type Issue { number: Int!, title: String!, repository: Repository! }
+  union IssueOrPullRequest = Issue | PullRequest
+  type Issue { number: Int!, title: String!, body: String!, repository: Repository! }
+  type PullRequest { number: Int!, title: String!, body: String!, repository: Repository! }
   type IssueConnection {
     nodes: [Issue!]!
     edges: [IssueEdge!]!
@@ -46,7 +50,8 @@ function execute(request) {
       const semanticPath = [...(paths.get(parent) || []), info.fieldName];
       paths.set(responsePath.join('\0'), semanticPath);
       const field = `${info.parentType.name}.${info.fieldName}`;
-      const effect = {
+      const effect = field === 'Repository.issueOrPullRequest'
+        ? (args.number % 2 ? 'ReadIssue' : 'ReadPullRequest') : {
         'Query.repository': 'ReadRepository',
         'Repository.issue': 'ReadIssue',
         'Repository.issues': 'ListIssues',
@@ -64,14 +69,23 @@ function execute(request) {
         case 'Repository.issue':
           observation.resources.push(`issue:${args.number}`);
           return { repository: source, number: args.number };
+        case 'Repository.issueOrPullRequest':
+          observation.resources.push(`${args.number % 2 ? 'issue' : 'pull'}:${args.number}`);
+          return { __typename: args.number % 2 ? 'Issue' : 'PullRequest', repository: source, number: args.number };
+        case 'Repository.hasIssuesEnabled':
+          return true;
         case 'Repository.issues':
           return { repository: source };
         case 'Repository.future':
           observation.unfamiliar = true;
           return 'future';
         case 'Issue.repository':
+        case 'PullRequest.repository':
           return source.repository;
         case 'Issue.title':
+        case 'Issue.body':
+        case 'PullRequest.title':
+        case 'PullRequest.body':
           return 'fixture';
         case 'IssueConnection.nodes':
           return [{ repository: source.repository, number: 1 }];

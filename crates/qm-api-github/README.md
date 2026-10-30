@@ -37,11 +37,19 @@ allow matches; see the [approval contract](../../docs/security-boundaries.md#git
 
 ## Recognition and capture
 
-The model covers issue list/read/close and repository read/delete REST requests,
-plus a limited GraphQL repository/issue model. Automatic recognition requires
-the explicit `2022-11-28` API version and supported JSON media types. GraphQL
-analysis resolves operation selection, variables, fragments, aliases and Boolean
-directives within configurable analysis limits.
+The model covers repository/README, issue/PR and Actions metadata/log REST reads,
+plus issue close and repository delete. GraphQL covers the default gh repository,
+issue and PR selections, including both issue/PR union branches. Automatic
+recognition requires the explicit `2022-11-28` API version and supported JSON
+media types, including gh's merge-info and nebula previews. Unknown companions
+prevent complete coverage.
+
+Related actors, forks, linked issues, projects and checks have separate effects.
+Their finite summaries require `AllResourcesInRepositoryWithRelatedSummaries`;
+`AllResourcesInRepository` rejects them. Summary contexts cannot traverse into
+other repositories' issues, project items or actor-owned resources. Actions
+identifiers describe the named API path; they do not prove run/job ownership or
+authorise a storage redirect. Node-ID mutations retain unresolved ownership.
 
 Capture preserves original method, target, headers and body bytes, including
 unfamiliar application input. It accepts one HTTPS authority and fixed-length

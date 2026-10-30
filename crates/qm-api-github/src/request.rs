@@ -48,6 +48,7 @@ impl Header {
     }
 }
 
+#[derive(Clone)]
 pub struct CapturedRequest {
     original: Box<[u8]>,
     method: String,

@@ -1,6 +1,6 @@
 mod reference_cases;
 
-use hegel::TestCase;
+use hegel::{TestCase, generators as gs};
 use qm_api_github::{
     CapturedRequest, EffectKind, Location, Pattern, PatternSet, Predicate, Repository,
     RequestLimits, Resource, analyze,
@@ -154,7 +154,7 @@ fn assert_execution(request: &Value, executed: Execution) {
             }
             Resource::IssueNumber(number) => format!("issue:{number}"),
             Resource::NodeId(id) => format!("node:{id}"),
-            Resource::RepositoryId(id) => panic!("unexpected repository id {id}"),
+            resource => panic!("unexpected resource {resource:?}"),
         })
         .collect();
     assert_eq!(observed_resources, expected_resources, "{request}");
@@ -300,4 +300,78 @@ fn generated_classifications_agree_with_reference_execution(tc: TestCase) {
     ));
     tc.target_labelled(executed.effects.len() as f64, "executed effects");
     assert_execution(&request, executed);
+}
+
+#[hegel::test(test_cases = 500, database = None, derandomize = false)]
+fn union_analysis_covers_every_runtime_branch_without_trusting_the_fixture_type(tc: TestCase) {
+    let number = tc.draw(gs::integers::<u16>().min_value(1));
+    let included = tc.draw(gs::booleans());
+    let named_fragment = tc.draw(gs::booleans());
+    let foreign = tc.draw(gs::booleans());
+    let selection = if named_fragment {
+        "...IssueFields ...PullFields"
+    } else {
+        "... on Issue{title} ... on PullRequest{body}"
+    };
+    let fragments = if named_fragment {
+        "fragment IssueFields on Issue{title} fragment PullFields on PullRequest{body}"
+    } else {
+        ""
+    };
+    let request = json!({
+        "query": format!("query Renamed($number:Int!,$go:Boolean!){{r:repository(owner:\"scope\",name:\"repository\"){{hasIssuesEnabled item:issueOrPullRequest(number:$number) @include(if:$go){{__typename {selection}}}}} {}}} {fragments}",
+            if foreign { "other:repository(owner:\"outside\",name:\"other\"){name}" } else { "" }),
+        "variables": {"number":number,"go":included},
+    });
+    tc.note(&request.to_string());
+    let execution = execute(std::slice::from_ref(&request)).pop().unwrap();
+    assert!(execution.errors.is_empty(), "{:?}", execution.errors);
+    let captured = capture(&request);
+    let kinds = vec![
+        EffectKind::ReadRepository,
+        EffectKind::ReadIssue,
+        EffectKind::ReadPullRequest,
+    ];
+    let patterns = PatternSet::new(vec![Pattern {
+        id: "scope".into(),
+        predicates: vec![
+            Predicate::OnlyEffects(kinds),
+            Predicate::AllResourcesInRepository(Repository {
+                owner: "scope".into(),
+                name: "repository".into(),
+            }),
+        ],
+    }])
+    .unwrap();
+    let analysis = analyze(&captured, &patterns).unwrap();
+    assert!(analysis.complete());
+    let effects: BTreeSet<_> = analysis
+        .effects
+        .iter()
+        .map(|effect| {
+            let Location::Graphql(path) = &effect.location else {
+                panic!()
+            };
+            (format!("{:?}", effect.kind), path.clone())
+        })
+        .collect();
+    for effect in execution.effects {
+        assert!(effects.contains(&(effect.kind, effect.path)));
+    }
+    for kind in ["ReadIssue", "ReadPullRequest"] {
+        assert_eq!(
+            effects.contains(&(
+                kind.into(),
+                vec!["repository".into(), "issueOrPullRequest".into()]
+            )),
+            included
+        );
+    }
+    assert_eq!(
+        analysis
+            .matches
+            .iter()
+            .any(|matched| matched.id == "scope" && matched.complete),
+        !foreign
+    );
 }

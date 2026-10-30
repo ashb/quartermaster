@@ -1,0 +1,14 @@
+POST /graphql HTTP/1.1
+Host: api.github.com
+User-Agent: GitHub CLI 2.102.1
+Content-Length: 818
+Accept: application/vnd.github.merge-info-preview+json, application/vnd.github.nebula-preview
+Authorization: token quartermaster-p4-local-dummy
+Content-Type: application/json; charset=utf-8
+Graphql-Features: merge_queue
+Time-Zone: Europe/London
+X-Github-Api-Version: 2022-11-28
+Accept-Encoding: gzip
+Connection: close
+
+{"query":"fragment issue on Issue {number,title,url,state,updatedAt,labels(first:100){nodes{id,name,description,color},totalCount},stateReason}\n\tquery IssueList($owner: String!, $repo: String!, $limit: Int, $endCursor: String, $states: [IssueState!] = OPEN, $assignee: String, $author: String, $mention: String) {\n\t\trepository(owner: $owner, name: $repo) {\n\t\t\thasIssuesEnabled\n\t\t\tissues(first: $limit, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}, states: $states, filterBy: {assignee: $assignee, createdBy: $author, mentioned: $mention}) {\n\t\t\t\ttotalCount\n\t\t\t\tnodes {\n\t\t\t\t\t...issue\n\t\t\t\t}\n\t\t\t\tpageInfo {\n\t\t\t\t\thasNextPage\n\t\t\t\t\tendCursor\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\t","variables":{"limit":30,"owner":"fixture","repo":"demo","states":["OPEN"]}}

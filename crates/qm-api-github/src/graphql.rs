@@ -214,9 +214,12 @@ fn document(
                     Json::Null
                 }
             };
-            if definition.ty().is_none_or(|ty| !type_matches(ty, &value)) {
-                walker.unknown(&[], UncoveredReason::Variable);
-                value = Json::Null;
+            match definition.ty() {
+                Some(ty) if type_matches(ty.clone(), &value) => value = coerce_lists(ty, value),
+                _ => {
+                    walker.unknown(&[], UncoveredReason::Variable);
+                    value = Json::Null;
+                }
             }
             walker.variables.insert(name, value);
         }
@@ -475,7 +478,7 @@ impl Walker<'_> {
                     if fragment.directives().is_some() {
                         self.unknown(path, UncoveredReason::Directive);
                     }
-                    self.check_type(fragment.type_condition(), context, path);
+                    let context = self.check_type(fragment.type_condition(), context, path);
                     self.walk(
                         fragment.selection_set().ok_or(AnalysisError::Fragment)?,
                         context,
@@ -490,7 +493,7 @@ impl Walker<'_> {
                     if !self.included(fragment.directives(), path) {
                         continue;
                     }
-                    self.check_type(fragment.type_condition(), context, path);
+                    let context = self.check_type(fragment.type_condition(), context, path);
                     self.walk(
                         fragment.selection_set().ok_or(AnalysisError::Fragment)?,
                         context,
@@ -510,14 +513,20 @@ impl Walker<'_> {
         condition: Option<cst::TypeCondition>,
         context: Context,
         path: &[String],
-    ) {
-        if condition.is_some_and(|condition| {
-            condition
+    ) -> Context {
+        match condition {
+            None => context,
+            Some(condition) => match condition
                 .named_type()
                 .and_then(|ty| ty.name())
-                .is_none_or(|name| name.text() != context.name())
-        }) {
-            self.unknown(path, UncoveredReason::Schema);
+                .and_then(|name| context.refine(name.text().as_ref()))
+            {
+                Some(refined) => refined,
+                None => {
+                    self.unknown(path, UncoveredReason::Schema);
+                    context
+                }
+            },
         }
     }
 }
@@ -541,10 +550,46 @@ fn type_matches(ty: cst::Type, value: &Json) -> bool {
     }
 }
 
+fn coerce_lists(ty: cst::Type, value: Json) -> Json {
+    if matches!(value, Json::Null) {
+        return value;
+    }
+    let list = match ty {
+        cst::Type::ListType(list) => Some(list),
+        cst::Type::NonNullType(ty) => ty.list_type(),
+        _ => None,
+    };
+    let Some(ty) = list.and_then(|list| list.ty()) else {
+        return value;
+    };
+    let values = match value {
+        Json::Array(values) => values,
+        value => vec![value],
+    };
+    Json::Array(
+        values
+            .into_iter()
+            .map(|value| coerce_lists(ty.clone(), value))
+            .collect(),
+    )
+}
+
 fn known_type(ty: &cst::Type) -> bool {
     let named = |ty: cst::NamedType| {
-        ty.name()
-            .is_some_and(|name| matches!(name.text().as_ref(), "String" | "ID" | "Int" | "Boolean"))
+        ty.name().is_some_and(|name| {
+            matches!(
+                name.text().as_ref(),
+                "String"
+                    | "ID"
+                    | "Int"
+                    | "Boolean"
+                    | "IssueState"
+                    | "PullRequestState"
+                    | "CloseIssueInput"
+                    | "ReopenIssueInput"
+                    | "DeleteIssueInput"
+            ) || schema::input_type_matches(name.text().as_ref(), &Json::Null).is_some()
+        })
     };
     match ty {
         cst::Type::NamedType(ty) => named(ty.clone()),
@@ -563,8 +608,22 @@ fn named_type_matches(ty: cst::NamedType, value: &Json) -> bool {
     let Some(name) = ty.name() else {
         return false;
     };
+    if let Some(valid) = schema::input_type_matches(name.text().as_ref(), value) {
+        return valid;
+    }
     match (name.text().as_ref(), value) {
         ("String" | "ID", Json::String(_)) | ("Boolean", Json::Bool(_)) => true,
+        ("IssueState", Json::String(value)) => matches!(value.as_str(), "OPEN" | "CLOSED"),
+        ("PullRequestState", Json::String(value)) => {
+            matches!(value.as_str(), "OPEN" | "CLOSED" | "MERGED")
+        }
+        ("CloseIssueInput" | "ReopenIssueInput" | "DeleteIssueInput", Json::Object(fields)) => {
+            value.unique("issueId").and_then(Json::string).is_some()
+                && fields.iter().all(|(name, value)| {
+                    matches!(name.as_str(), "issueId" | "clientMutationId")
+                        && value.string().is_some()
+                })
+        }
         ("Int", Json::Number(value)) => value
             .as_i64()
             .is_some_and(|value| i32::try_from(value).is_ok()),
@@ -573,18 +632,21 @@ fn named_type_matches(ty: cst::NamedType, value: &Json) -> bool {
 }
 
 fn list_type_matches(ty: cst::ListType, value: &Json) -> bool {
-    let (Some(ty), Json::Array(values)) = (ty.ty(), value) else {
+    let Some(ty) = ty.ty() else {
         return false;
     };
-    values.iter().all(|value| type_matches(ty.clone(), value))
+    match value {
+        Json::Array(values) => values.iter().all(|value| type_matches(ty.clone(), value)),
+        value => type_matches(ty, value),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EffectKind, Repository, Resource};
     use crate::{
-        PatternSet, analyze, analyze_with_limits,
+        EffectKind, Pattern, PatternSet, Predicate, Repository, Resource, analyze,
+        analyze_with_limits,
         test_support::{
             GraphqlSyntax, graphql,
             query_model::{MutationFacts, MutationPlan, QueryFacts, QueryPlan},
@@ -593,6 +655,361 @@ mod tests {
     };
     use hegel::{TestCase, generators as gs};
     use serde_json::json;
+
+    #[test]
+    fn connection_edge_fragments_preserve_their_owned_or_related_context() {
+        for (selection, fragment) in [
+            (
+                "pullRequests(first:1){edges{...E}}",
+                "fragment E on PullRequestEdge{node{title}}",
+            ),
+            (
+                "issue(number:42){labels(first:1){edges{...E}}}",
+                "fragment E on LabelEdge{node{name}}",
+            ),
+            (
+                "issue(number:42){subIssues(first:1){edges{...E}}}",
+                "fragment E on IssueEdge{node{title repository{nameWithOwner}}}",
+            ),
+            (
+                "pullRequest(number:42){reviewRequests(first:1){nodes{...R}}}",
+                "fragment R on ReviewRequest{requestedReviewer{... on User{login}}}",
+            ),
+        ] {
+            let request = graphql(
+                &format!(
+                    "{{repository(owner:\"scope\",name:\"repository\"){{{selection}}}}} {fragment}"
+                ),
+                json!({}),
+                None,
+            );
+            assert!(
+                analyze(&request, &PatternSet::default())
+                    .unwrap()
+                    .complete(),
+                "{selection}"
+            );
+        }
+        let request = graphql(
+            "{repository(owner:\"scope\",name:\"repository\"){issue(number:42){subIssues(first:1){edges{...E}}}}} fragment E on IssueEdge{node{body}}",
+            json!({}),
+            None,
+        );
+        assert!(
+            !analyze(&request, &PatternSet::default())
+                .unwrap()
+                .complete()
+        );
+    }
+
+    #[test]
+    fn ordering_and_filter_variables_have_the_same_coverage_as_supported_literals() {
+        for (types, arguments, variables) in [
+            (
+                "$order:IssueOrder!,$filter:IssueFilters",
+                "orderBy:$order,filterBy:$filter",
+                json!({"order":{"field":"CREATED_AT","direction":"DESC"},"filter":{"assignee":"alice","createdBy":null}}),
+            ),
+            (
+                "$field:IssueOrderField!,$direction:OrderDirection!",
+                "orderBy:{field:$field,direction:$direction}",
+                json!({"field":"CREATED_AT","direction":"DESC"}),
+            ),
+        ] {
+            let request = graphql(
+                &format!(
+                    "query({types}){{repository(owner:\"scope\",name:\"repository\"){{issues(first:1,{arguments}){{nodes{{title}}}}}}}}"
+                ),
+                variables,
+                None,
+            );
+            assert!(
+                analyze(&request, &PatternSet::default())
+                    .unwrap()
+                    .complete(),
+                "{types}"
+            );
+        }
+        for order in [
+            json!({"field":"FUTURE","direction":"DESC"}),
+            json!({"field":"CREATED_AT","direction":"DESC","future":true}),
+        ] {
+            let request = graphql(
+                "query($order:IssueOrder!){repository(owner:\"scope\",name:\"repository\"){issues(first:1,orderBy:$order){nodes{title}}}}",
+                json!({"order":order}),
+                None,
+            );
+            assert!(
+                !analyze(&request, &PatternSet::default())
+                    .unwrap()
+                    .complete()
+            );
+        }
+    }
+
+    #[test]
+    fn nullable_order_and_filter_inputs_preserve_read_coverage_when_null_or_omitted() {
+        for variables in [
+            json!({}),
+            json!({"order": null, "filter": null, "prOrder": null}),
+        ] {
+            let request = graphql(
+                "query($order:IssueOrder,$filter:IssueFilters,$prOrder:PullRequestOrder){repository(owner:\"scope\",name:\"repository\"){issues(first:1,orderBy:$order,filterBy:$filter){nodes{title}} pullRequests(first:1,orderBy:$prOrder){nodes{title}}}}",
+                variables,
+                None,
+            );
+            let analysis = analyze(&request, &PatternSet::default()).unwrap();
+            assert!(analysis.complete(), "{analysis:?}");
+            assert!(
+                analysis
+                    .effects
+                    .iter()
+                    .any(|effect| effect.kind == EffectKind::ListIssues)
+            );
+            assert!(
+                analysis
+                    .effects
+                    .iter()
+                    .any(|effect| effect.kind == EffectKind::ListPullRequests)
+            );
+        }
+    }
+
+    #[test]
+    fn installed_gh_default_reads_have_complete_explicit_effects() {
+        for (name, bytes, expected) in [
+            (
+                "repo",
+                include_bytes!("../tests/fixtures/gh-2.102.1/repo-view.http").as_slice(),
+                vec!["ReadRepository", "ReadRelatedSummaries"],
+            ),
+            (
+                "issue-list",
+                include_bytes!("../tests/fixtures/gh-2.102.1/issue-list.http").as_slice(),
+                vec!["ReadRepository", "ListIssues"],
+            ),
+            (
+                "issue-view",
+                include_bytes!("../tests/fixtures/gh-2.102.1/issue-view.http").as_slice(),
+                vec![
+                    "ReadRepository",
+                    "ReadIssue",
+                    "ReadPullRequest",
+                    "ReadRelatedSummaries",
+                    "ReadLinkedIssueSummaries",
+                ],
+            ),
+            (
+                "issue-projects",
+                include_bytes!("../tests/fixtures/gh-2.102.1/issue-projects.http").as_slice(),
+                vec!["ReadRepository", "ReadIssue", "ReadProjectSummaries"],
+            ),
+            (
+                "pr-list",
+                include_bytes!("../tests/fixtures/gh-2.102.1/pr-list.http").as_slice(),
+                vec!["ReadRepository", "ListPullRequests", "ReadRelatedSummaries"],
+            ),
+            (
+                "pr-view",
+                include_bytes!("../tests/fixtures/gh-2.102.1/pr-view.http").as_slice(),
+                vec![
+                    "ReadRepository",
+                    "ReadPullRequest",
+                    "ReadRelatedSummaries",
+                    "ReadCheckSummaries",
+                ],
+            ),
+            (
+                "pr-projects",
+                include_bytes!("../tests/fixtures/gh-2.102.1/pr-projects.http").as_slice(),
+                vec!["ReadRepository", "ReadPullRequest", "ReadProjectSummaries"],
+            ),
+            (
+                "run-pr",
+                include_bytes!("../tests/fixtures/gh-2.102.1/run-view.http").as_slice(),
+                vec!["ReadRepository", "ListPullRequests", "ReadRelatedSummaries"],
+            ),
+        ] {
+            let request = CapturedRequest::parse(bytes, crate::RequestLimits::default()).unwrap();
+            let analysis = analyze(&request, &PatternSet::default()).unwrap();
+            assert!(analysis.complete(), "{name}: {:?}", analysis.uncovered);
+            assert_eq!(
+                analysis
+                    .effects
+                    .iter()
+                    .map(|effect| format!("{:?}", effect.kind))
+                    .collect::<BTreeSet<_>>(),
+                expected.into_iter().map(str::to_owned).collect(),
+                "{name}"
+            );
+            assert_eq!(request.original(), bytes);
+        }
+    }
+
+    #[test]
+    fn relationship_summaries_cannot_be_used_to_traverse_foreign_resources() {
+        for selection in [
+            "issue(number:42){parent{body}}",
+            "issue(number:42){parent{repository{issues(first:1){nodes{title}}}}}",
+            "issue(number:42){parent{... on Issue {comments(first:1){nodes{body}}}}}",
+            "pullRequest(number:42){headRepository{... on Repository {issues(first:1){nodes{title}}}}}",
+            "issue(number:42){author{... on User {repositories(first:1){nodes{name}}}}}",
+            "issue(number:42){projectItems(first:1){nodes{project{items(first:1){totalCount}}}}}",
+            "issue(number:42){projectItems(first:1){nodes{fieldValueByName(name:\"Secret\"){... on ProjectV2ItemFieldSingleSelectValue{name}}}}}",
+            "issue(number:42){projectItems(first:1){nodes{project{id title future}}}}",
+            "pullRequest(number:42){reviews(first:0){totalCount}}",
+            "issueOrPullRequest(number:42){... on Issue {title} ... on PullRequest {future}}",
+        ] {
+            let request = graphql(
+                &format!("{{repository(owner:\"scope\",name:\"repository\"){{{selection}}}}}"),
+                serde_json::json!({}),
+                None,
+            );
+            assert!(
+                !analyze(&request, &PatternSet::default())
+                    .unwrap()
+                    .complete(),
+                "{selection}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_issue_mutation_inputs_remain_writes_with_unresolved_node_ownership() {
+        for (field, input, effect) in [
+            ("closeIssue", "CloseIssueInput", "CloseIssue"),
+            ("reopenIssue", "ReopenIssueInput", "ReopenIssue"),
+        ] {
+            let request = graphql(
+                &format!(
+                    "mutation Renamed($input:{input}!){{{field}(input:$input){{issue{{id}}}}}}"
+                ),
+                json!({"input":{"issueId":"I_fixture"}}),
+                None,
+            );
+            let analysis = analyze(&request, &PatternSet::default()).unwrap();
+            assert!(!analysis.complete());
+            assert_eq!(
+                analysis
+                    .effects
+                    .iter()
+                    .map(|effect| format!("{:?}", effect.kind))
+                    .collect::<Vec<_>>(),
+                vec![effect]
+            );
+            assert!(
+                analysis
+                    .resources
+                    .contains(&Resource::NodeId("I_fixture".into()))
+            );
+            assert!(
+                analysis
+                    .uncovered
+                    .iter()
+                    .all(|item| item.reason == UncoveredReason::ResourceOwnership)
+            );
+        }
+    }
+
+    #[hegel::test(test_cases = 500, database = None, derandomize = false)]
+    fn related_summaries_require_explicit_scope_under_equivalent_documents(tc: TestCase) {
+        let choices = [
+            (
+                "issue(number:42){parent{id title repository{nameWithOwner}}}",
+                EffectKind::ReadLinkedIssueSummaries,
+            ),
+            (
+                "issue(number:42){projectItems(first:10){nodes{project{id title}}}}",
+                EffectKind::ReadProjectSummaries,
+            ),
+            (
+                "pullRequest(number:42){headRepository{id name nameWithOwner}}",
+                EffectKind::ReadRelatedSummaries,
+            ),
+            (
+                "issue(number:42){author{login ... on User{name}}}",
+                EffectKind::ReadRelatedSummaries,
+            ),
+        ];
+        let index = tc.draw(gs::integers::<usize>().max_value(choices.len() - 1));
+        let (selection, related) = choices[index];
+        let alias = tc.draw(gs::booleans());
+        let fragment = tc.draw(gs::booleans());
+        let foreign = tc.draw(gs::booleans());
+        let unknown = tc.draw(gs::booleans());
+        let name = tc.draw(gs::sampled_from(&[
+            "Renamed",
+            "SomethingElse",
+            "UnrelatedLabel",
+        ]));
+        let fields = format!(
+            "{} {selection}",
+            if unknown { "futureField" } else { "name" }
+        );
+        let (fields, definitions) = if fragment {
+            (
+                "...Shared".to_owned(),
+                format!("fragment Shared on Repository{{{fields}}}"),
+            )
+        } else {
+            (fields, String::new())
+        };
+        let document = format!(
+            "query {name}{{{}repository(owner:\"scope\",name:\"repository\"){{{fields}}} {}}} {definitions}",
+            if alias { "alias:" } else { "" },
+            if foreign {
+                "other:repository(owner:\"other\",name:\"repo\"){name}"
+            } else {
+                ""
+            }
+        );
+        tc.note(&document);
+        let repository = Repository {
+            owner: "scope".into(),
+            name: "repository".into(),
+        };
+        let effects = vec![
+            EffectKind::ReadRepository,
+            EffectKind::ReadIssue,
+            EffectKind::ReadPullRequest,
+            related,
+        ];
+        let patterns = PatternSet::new(vec![
+            Pattern {
+                id: "contained".into(),
+                predicates: vec![
+                    Predicate::OnlyEffects(effects.clone()),
+                    Predicate::AllResourcesInRepository(repository.clone()),
+                ],
+            },
+            Pattern {
+                id: "related".into(),
+                predicates: vec![
+                    Predicate::OnlyEffects(effects),
+                    Predicate::AllResourcesInRepositoryWithRelatedSummaries(repository),
+                ],
+            },
+        ])
+        .unwrap();
+        let request = graphql(&document, serde_json::json!({}), Some(name));
+        let analysis = analyze(&request, &patterns).unwrap();
+        assert_eq!(analysis.complete(), !unknown);
+        assert!(analysis.effects.iter().any(|effect| effect.kind == related));
+        assert!(analysis.resources.contains(&Resource::RelatedSummary));
+        assert!(
+            !analysis
+                .matches
+                .iter()
+                .any(|matched| matched.id == "contained")
+        );
+        assert_eq!(
+            analysis
+                .matches
+                .iter()
+                .any(|matched| matched.id == "related" && matched.complete),
+            !foreign && !unknown
+        );
+    }
 
     #[test]
     fn insignificant_commas_do_not_change_alias_or_fragment_parsing() {
@@ -1328,7 +1745,7 @@ mod tests {
             (
                 "[Boolean!]!",
                 json!(false),
-                Some(UncoveredReason::Variable),
+                Some(UncoveredReason::Directive),
                 true,
             ),
             (

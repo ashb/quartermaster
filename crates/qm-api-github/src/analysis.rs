@@ -1,6 +1,8 @@
 use crate::CapturedRequest;
 use std::collections::BTreeSet;
 
+pub const SEMANTICS_VERSION: &str = "quartermaster.github-semantics.v2";
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Repository {
     pub owner: String,
@@ -13,17 +15,71 @@ pub enum Resource {
     RepositoryId(String),
     NodeId(String),
     IssueNumber(std::num::NonZeroU64),
+    PullRequestNumber(std::num::NonZeroU64),
+    WorkflowRun(std::num::NonZeroU64),
+    RunAttempt(std::num::NonZeroU64),
+    WorkflowJob(std::num::NonZeroU64),
+    Workflow(std::num::NonZeroU64),
+    CheckRun(std::num::NonZeroU64),
+    RelatedSummary,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EffectKind {
     ReadRepository,
     ListIssues,
     ReadIssue,
+    ReadReadme,
+    ListPullRequests,
+    ReadPullRequest,
+    ListWorkflows,
+    ReadWorkflow,
+    ListWorkflowRuns,
+    ReadWorkflowRun,
+    ListWorkflowJobs,
+    ReadWorkflowJob,
+    ListRunArtifacts,
+    ReadCheckAnnotations,
+    ReadRunLogs,
+    ReadJobLogs,
+    ReadRelatedSummaries,
+    ReadLinkedIssueSummaries,
+    ReadProjectSummaries,
+    ReadCheckSummaries,
     CloseIssue,
+    ReopenIssue,
     DeleteIssue,
     DeleteRepository,
+}
+
+impl EffectKind {
+    pub const READS: &'static [Self] = &[
+        Self::ReadRepository,
+        Self::ReadReadme,
+        Self::ListIssues,
+        Self::ReadIssue,
+        Self::ListPullRequests,
+        Self::ReadPullRequest,
+        Self::ListWorkflows,
+        Self::ReadWorkflow,
+        Self::ListWorkflowRuns,
+        Self::ReadWorkflowRun,
+        Self::ListWorkflowJobs,
+        Self::ReadWorkflowJob,
+        Self::ListRunArtifacts,
+        Self::ReadCheckAnnotations,
+        Self::ReadRunLogs,
+        Self::ReadJobLogs,
+        Self::ReadRelatedSummaries,
+        Self::ReadLinkedIssueSummaries,
+        Self::ReadProjectSummaries,
+        Self::ReadCheckSummaries,
+    ];
+
+    pub fn is_read(self) -> bool {
+        Self::READS.contains(&self)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +142,8 @@ pub enum Predicate {
     },
     /// Matches only complete resource coverage; ownership still needs a trusted mapping.
     AllResourcesInRepository(Repository),
+    /// Includes only the finite relationship summaries recognised by the schema.
+    AllResourcesInRepositoryWithRelatedSummaries(Repository),
 }
 
 #[derive(Clone, Debug)]
@@ -158,7 +216,7 @@ pub enum AnalysisError {
     Fragment,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Analysis {
     pub effects: Vec<Effect>,
     pub resources: Vec<Resource>,
@@ -235,7 +293,14 @@ impl Analysis {
                 repository.owner.len().saturating_add(repository.name.len())
             }
             Resource::RepositoryId(id) | Resource::NodeId(id) => id.len(),
-            Resource::IssueNumber(_) => 0,
+            Resource::IssueNumber(_)
+            | Resource::PullRequestNumber(_)
+            | Resource::WorkflowRun(_)
+            | Resource::RunAttempt(_)
+            | Resource::WorkflowJob(_)
+            | Resource::Workflow(_)
+            | Resource::CheckRun(_)
+            | Resource::RelatedSummary => 0,
         };
         if self.reserve(std::mem::size_of::<Resource>().saturating_add(bytes)) {
             self.resources.push(resource);
@@ -298,7 +363,8 @@ pub fn analyze_with_limits(
                 .graphql_roots
                 .iter()
                 .any(|(kind, name)| kind == operation && name == field),
-            Predicate::AllResourcesInRepository(expected) => {
+            Predicate::AllResourcesInRepository(expected)
+            | Predicate::AllResourcesInRepositoryWithRelatedSummaries(expected) => {
                 analysis.complete()
                     && !analysis.resources.is_empty()
                     && analysis
@@ -307,7 +373,17 @@ pub fn analyze_with_limits(
                         .any(|resource| matches!(resource, Resource::Repository(_)))
                     && analysis.resources.iter().all(|resource| match resource {
                         Resource::Repository(repository) => repository == expected,
-                        Resource::IssueNumber(_) => true,
+                        Resource::IssueNumber(_)
+                        | Resource::PullRequestNumber(_)
+                        | Resource::WorkflowRun(_)
+                        | Resource::RunAttempt(_)
+                        | Resource::WorkflowJob(_)
+                        | Resource::Workflow(_)
+                        | Resource::CheckRun(_) => true,
+                        Resource::RelatedSummary => matches!(
+                            predicate,
+                            Predicate::AllResourcesInRepositoryWithRelatedSummaries(_)
+                        ),
                         Resource::RepositoryId(_) | Resource::NodeId(_) => false,
                     })
             }
@@ -359,8 +435,21 @@ fn inspect_headers(request: &CapturedRequest, analysis: &mut Analysis) {
             {
                 None
             }
-            "accept" if matches!(value, "application/vnd.github+json" | "application/json") => None,
+            "accept"
+                if value.split(',').all(|media| {
+                    matches!(
+                        media.trim().to_ascii_lowercase().as_str(),
+                        "application/vnd.github+json"
+                            | "application/json"
+                            | "application/vnd.github.merge-info-preview+json"
+                            | "application/vnd.github.nebula-preview"
+                    )
+                }) =>
+            {
+                None
+            }
             "accept" => Some(UncoveredReason::MediaType),
+            "graphql-features" if value == "merge_queue" => None,
             "content-type"
                 if matches!(
                     value.to_ascii_lowercase().as_str(),
@@ -391,6 +480,44 @@ mod tests {
     use super::*;
     use crate::test_support::{raw_request, request};
     use hegel::{TestCase, generators as gs};
+
+    #[test]
+    fn installed_gh_media_ranges_are_covered_only_when_every_companion_is_supported() {
+        for (accept, feature, complete) in [
+            (
+                "application/vnd.github.merge-info-preview+json, application/vnd.github.nebula-preview",
+                "merge_queue",
+                true,
+            ),
+            ("application/vnd.github+json, application/json", "", true),
+            (
+                "application/vnd.github.merge-info-preview+json, application/vnd.github.future-preview",
+                "",
+                false,
+            ),
+            ("application/vnd.github+json, */*", "", false),
+            ("application/vnd.github+json", "merge_queue,unknown", false),
+            ("application/vnd.github+json,", "", false),
+        ] {
+            let feature = if feature.is_empty() {
+                String::new()
+            } else {
+                format!("Graphql-Features: {feature}\r\n")
+            };
+            let raw = format!(
+                "GET /repos/a/b HTTP/1.1\r\nHost: api.github.com\r\nAccept: {accept}\r\nX-GitHub-Api-Version: 2022-11-28\r\n{feature}\r\n"
+            );
+            let captured =
+                CapturedRequest::parse(raw.as_bytes(), crate::RequestLimits::default()).unwrap();
+            assert_eq!(
+                analyze(&captured, &PatternSet::default())
+                    .unwrap()
+                    .complete(),
+                complete,
+                "{accept}"
+            );
+        }
+    }
 
     #[test]
     fn standard_gzip_and_timezone_headers_keep_complete_issue_read_coverage() {

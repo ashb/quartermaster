@@ -1,0 +1,14 @@
+POST /graphql HTTP/1.1
+Host: api.github.com
+User-Agent: GitHub CLI 2.102.1
+Content-Length: 197
+Accept: application/vnd.github.merge-info-preview+json, application/vnd.github.nebula-preview
+Authorization: token quartermaster-p4-local-dummy
+Content-Type: application/json; charset=utf-8
+Graphql-Features: merge_queue
+Time-Zone: Europe/London
+X-Github-Api-Version: 2022-11-28
+Accept-Encoding: gzip
+Connection: close
+
+{"query":"query RepositoryInfo($owner: String!, $name: String!) {\n\t\trepository(owner: $owner, name: $name) {name,owner{id,login},description}\n\t}","variables":{"name":"demo","owner":"fixture"}}
