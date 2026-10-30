@@ -118,8 +118,6 @@ func readableJSONRequiresAnUnambiguousContentType(_ headers: String) throws {
 @Test func apiReviewShowsTheCompleteRequestProducedByRustWithoutGrantingScope() throws {
     let data = try JSONSerialization.data(withJSONObject: apiFixture())
     let review = try #require(try APIRequestReview.parse(request: data))
-    #expect(!review.complete)
-    #expect(review.effects.isEmpty)
     #expect(review.text.hasPrefix("POST /graphql?option=%2f HTTP/1.1\n"))
     #expect(review.text.contains("X-Custom: first\nx-custom: second"))
     #expect(review.text.contains("<selected Quartermaster credential>"))
@@ -145,7 +143,7 @@ func apiReviewShowsLineBreaksWithoutHidingOtherControls(_ body: String, _ expect
 }
 
 @Test(arguments: ["version", "method", "origin", "digest"])
-func apiReviewRejectsUnsupportedOrInconsistentCaptureBindings(_ field: String) throws {
+func apiReviewFormatsTheSuppliedCaptureWithoutInterpretingBackendPolicy(_ field: String) throws {
     var fixture = try apiFixture()
     var application = try #require(fixture["application"] as? [String: Any])
     switch field {
@@ -156,7 +154,8 @@ func apiReviewRejectsUnsupportedOrInconsistentCaptureBindings(_ field: String) t
     }
     fixture["application"] = application
     let data = try JSONSerialization.data(withJSONObject: fixture)
-    #expect(throws: APIRequestReview.Failure.self) { try APIRequestReview.parse(request: data) }
+    let review = try #require(try APIRequestReview.parse(request: data))
+    #expect(review.text.hasPrefix("POST /graphql?option=%2f HTTP/1.1\n"))
 }
 
 @Test func apiReviewEscapesBinaryAndControlBytesWithoutDroppingThem() throws {
@@ -173,23 +172,9 @@ func apiReviewRejectsUnsupportedOrInconsistentCaptureBindings(_ field: String) t
     #expect(review.readableText == nil)
 }
 
-@Test(arguments: [("quartermaster/one", false), ("owner/repo/extra", true), ("owner/space name", true)])
-func repositoryDisplayContextRequiresACompleteAnalysisAndAValidName(_ repository: String, _ complete: Bool) throws {
-    var fixture = try apiFixture()
-    var application = try #require(fixture["application"] as? [String: Any])
-    application["requestedRepository"] = repository
-    application["complete"] = complete
-    fixture["application"] = application
-    let bytes = try JSONSerialization.data(withJSONObject: fixture)
-    #expect(throws: APIRequestReview.Failure.self) { try APIRequestReview.parse(request: bytes) }
-}
-
-@Test func applicationBodyApprovalsRemainAvailableWithoutIssueReadScope() throws {
-    var fixture = try apiFixture()
-    fixture["readRoots"] = []
-    fixture["repository"] = ""
-    #expect(fixture["body"] == nil)
-    let bytes = try JSONSerialization.data(withJSONObject: fixture)
-    #expect(try ReadScopeReview.parse(request: bytes) == nil)
-    #expect(try APIRequestReview.parse(request: bytes) != nil)
+@Test func invalidCaptureEncodingFailsDecoding() throws {
+    #expect(throws: DecodingError.self) {
+        try APIRequestReview.parse(request: Data(#"{"application":{"request":"not base64"}}"#.utf8))
+    }
+    #expect(try APIRequestReview.parse(request: Data("{}".utf8)) == nil)
 }

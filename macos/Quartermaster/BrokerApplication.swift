@@ -171,7 +171,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             }
             let dialog = ApprovalDialog(
                 presentation: ApprovalPresentation(
-                    request: pending.request, provider: pending.provider, readGrant: pending.readGrant,
+                    request: pending.request, provider: pending.provider, display: pending.display,
                     apiRequest: pending.apiRequest, readScope: pending.readScope), backend: pending,
                 selectRoot: { root in try await pending.selectRoot(root) })
             present(dialog)

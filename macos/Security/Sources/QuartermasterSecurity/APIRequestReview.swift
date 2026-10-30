@@ -1,49 +1,17 @@
 import Foundation
 
 public struct APIRequestReview: Sendable {
-    public enum Failure: Error { case invalidRequest }
-    public let complete: Bool
-    public let effects: [String]
     public let text: String
     public let readableText: String?
-    public let requestedRepository: String?
 
     private struct Envelope: Decodable {
-        let method: String
-        let path: String
-        let origin: String
+        struct Capture: Decodable { let request: Data }
         let application: Capture?
     }
 
-    private struct Capture: Decodable {
-        let version: String
-        let request: Data
-        let originalDigest: Data
-        let complete: Bool
-        let effects: [String]
-        let requestedRepository: String?
-    }
-
     public static func parse(request: Data) throws -> Self? {
-        guard request.count <= BrokerLimits.reviewBytes,
-            let envelope = try? JSONDecoder().decode(Envelope.self, from: request)
-        else { throw Failure.invalidRequest }
-        guard let capture = envelope.application else { return nil }
-        guard envelope.origin == "https://api.github.com",
-            capture.version == "quartermaster.github-request.v1",
-            capture.originalDigest.count == 32,
-            capture.request.count <= 262_400,
-            !envelope.method.isEmpty, envelope.method.utf8.allSatisfy({ (33...126).contains($0) }),
-            envelope.path.hasPrefix("/"), envelope.path.utf8.allSatisfy({ (33...126).contains($0) }),
-            capture.request.starts(with: Data("\(envelope.method) \(envelope.path) HTTP/1.1\r\n".utf8)),
-            capture.effects.count <= 4096, capture.effects.allSatisfy({ $0.utf8.count <= 64 })
-        else { throw Failure.invalidRequest }
-        if let repository = capture.requestedRepository {
-            guard capture.complete, RepositoryName(fullName: repository) != nil else { throw Failure.invalidRequest }
-        }
-        return Self(
-            complete: capture.complete, effects: capture.effects, text: escaped(capture.request),
-            readableText: readable(capture.request), requestedRepository: capture.requestedRepository)
+        guard let capture = try JSONDecoder().decode(Envelope.self, from: request).application else { return nil }
+        return Self(text: escaped(capture.request), readableText: readable(capture.request))
     }
 
     private static func readable(_ data: Data) -> String? {

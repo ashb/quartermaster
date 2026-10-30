@@ -95,7 +95,7 @@ impl Application {
         &self.analysis
     }
 
-    fn requested_repository(&self) -> Option<String> {
+    pub(in crate::owner) fn requested_repository(&self) -> Option<String> {
         if !self.analysis.complete() {
             return None;
         }
@@ -187,7 +187,7 @@ impl Serialize for Application {
             request: String,
             original_digest: String,
             complete: bool,
-            effects: Vec<&'static str>,
+            effects: Vec<EffectKind>,
             #[serde(skip_serializing_if = "Option::is_none")]
             requested_repository: Option<String>,
         }
@@ -195,14 +195,7 @@ impl Serialize for Application {
             .analysis
             .effects
             .iter()
-            .map(|effect| match effect.kind {
-                EffectKind::ReadRepository => "Read repository",
-                EffectKind::ListIssues => "List issues",
-                EffectKind::ReadIssue => "Read issue",
-                EffectKind::CloseIssue => "Close issue",
-                EffectKind::DeleteIssue => "Delete issue",
-                EffectKind::DeleteRepository => "Delete repository",
-            })
+            .map(|effect| effect.kind)
             .collect();
         Review {
             version: REVIEW_VERSION,

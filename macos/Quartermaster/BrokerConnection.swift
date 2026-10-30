@@ -195,7 +195,7 @@ final class BrokerPending: ApprovalBackend {
     let id: String
     private(set) var request: DialogRequest
     private(set) var provider: ApprovalProviderIdentity
-    private(set) var readGrant: ReadGrantReview?
+    private(set) var display: ApprovalDisplay
     private(set) var apiRequest: APIRequestReview?
     private(set) var readScope: ReadScopeReview?
     private var nonce: Data
@@ -207,23 +207,16 @@ final class BrokerPending: ApprovalBackend {
         let id = review.id
         let bytes = review.request
         let request = try JSONDecoder().decode(DialogRequest.self, from: bytes)
-        let readGrant = try ReadGrantReview.parse(
-            request: bytes, role: review.provider.role, uid: geteuid(), now: Date())
+        let display = try ApprovalDisplay.parse(request: bytes)
         let apiRequest = try APIRequestReview.parse(request: bytes)
         let readScope = try ReadScopeReview.parse(request: bytes)
-        guard request.peer != nil, !request.processChain.isEmpty, request.processChain.count <= 32,
-            request.validProcessTree, readGrant.map({ request.canDisplay(root: $0.root) }) ?? true
-        else {
-            throw BrokerFailure.invalidMessage
-        }
-        guard readGrant != nil || apiRequest != nil || readScope != nil else { throw BrokerFailure.invalidMessage }
         self.readScope = readScope
         nonce = review.nonce
         self.client = client
         self.id = id
         self.request = request
         self.provider = review.provider
-        self.readGrant = readGrant
+        self.display = display
         self.apiRequest = apiRequest
     }
 
@@ -233,17 +226,17 @@ final class BrokerPending: ApprovalBackend {
             review.created == reviewCreated
         else { throw BrokerFailure.invalidMessage }
         let replacement = try BrokerPending(client: client, review: review)
-        guard replacement.readGrant?.root.id == root else { throw BrokerFailure.invalidMessage }
+        guard replacement.display.grant?.root.id == root else { throw BrokerFailure.invalidMessage }
         workflow.cancel()
         workflow = replacement.workflow
         nonce = replacement.nonce
         request = replacement.request
         provider = replacement.provider
-        readGrant = replacement.readGrant
+        display = replacement.display
         apiRequest = replacement.apiRequest
         readScope = replacement.readScope
         return ApprovalPresentation(
-            request: request, provider: provider, readGrant: readGrant, apiRequest: apiRequest, readScope: readScope)
+            request: request, provider: provider, display: display, apiRequest: apiRequest, readScope: readScope)
     }
 
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {

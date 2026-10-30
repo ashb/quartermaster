@@ -75,7 +75,12 @@ pub(super) fn handle(
             })
         }
         Client::ReadGrants {} => Ok(Reply::ReadGrants {
-            grants: state.authorizer.active_read_grants(),
+            grants: state
+                .authorizer
+                .active_read_grants()
+                .iter()
+                .map(|grant| grant.display())
+                .collect(),
         }),
         Client::RevokeReadGrant { id } => {
             OperationId::parse(&id)?;

@@ -95,6 +95,16 @@ private final class DocumentationClient: BrokerClient, Sendable {
                     .utf8
             ).base64EncodedString(),
         ],
+        "presentation": [
+            "intent": [
+                "kind": "readGrant",
+                "grant": [
+                    "id": "sample", "root": root, "repository": "example/project", "expiresUnix": 1_793_192_400,
+                    "permission": ["kind": "issueReads"],
+                ],
+            ],
+            "repository": "example/project", "additionalEffects": [], "allowsReadScope": true,
+        ],
         "authorization": [
             "purpose": "quartermaster.read-grant",
             "grant": [
@@ -112,8 +122,7 @@ private final class DocumentationClient: BrokerClient, Sendable {
                 .utf8))
     return ApprovalPresentation(
         request: try JSONDecoder().decode(DialogRequest.self, from: bytes), provider: provider,
-        readGrant: try ReadGrantReview.parse(
-            request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1_793_188_800)),
+        display: try ApprovalDisplay.parse(request: bytes),
         apiRequest: try APIRequestReview.parse(request: bytes), readScope: try ReadScopeReview.parse(request: bytes))
 }
 

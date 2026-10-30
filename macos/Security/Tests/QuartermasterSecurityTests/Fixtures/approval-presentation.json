@@ -1,0 +1,14 @@
+{
+  "presentation": {
+    "intent": {
+      "kind": "issue",
+      "action": "closeIssue",
+      "number": 42
+    },
+    "repository": "example/one",
+    "resourceTitle": null,
+    "additionalEffects": [],
+    "understandingNotice": null,
+    "allowsReadScope": false
+  }
+}

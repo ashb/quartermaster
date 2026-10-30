@@ -1,83 +1,71 @@
 import Foundation
 
-public struct ReadGrantReview: Sendable {
-    public enum Failure: Error { case invalidGrant }
+public struct ApprovalDisplay: Decodable, Sendable {
+    public let intent: GitHubApprovalIntent
+    public let repository: String?
+    public let resourceTitle: String?
+    public let additionalEffects: [GitHubEffect]
+    public let understandingNotice: UnderstandingNotice?
+    public let allowsReadScope: Bool
+
+    public var grant: ReadGrantReview? {
+        if case .readGrant(let grant) = intent { return grant }
+        return nil
+    }
+
+    public static func parse(request: Data) throws -> Self {
+        struct Envelope: Decodable { let presentation: ApprovalDisplay }
+        return try JSONDecoder().decode(Envelope.self, from: request).presentation
+    }
+}
+
+public enum GitHubApprovalIntent: Decodable, Sendable {
+    case request
+    case issue(action: GitHubEffect, number: UInt64?)
+    case readGrant(ReadGrantReview)
+
+    private enum Kind: String, Decodable { case request, issue, readGrant }
+    private enum CodingKeys: String, CodingKey { case kind, action, number, grant }
+
+    public init(from decoder: any Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        switch try fields.decode(Kind.self, forKey: .kind) {
+        case .request: self = .request
+        case .issue:
+            self = .issue(
+                action: try fields.decode(GitHubEffect.self, forKey: .action),
+                number: try fields.decodeIfPresent(UInt64.self, forKey: .number))
+        case .readGrant:
+            self = .readGrant(try fields.decode(ReadGrantReview.self, forKey: .grant))
+        }
+    }
+}
+
+public enum UnderstandingNotice: String, Decodable, Sendable {
+    case incompleteRequest
+}
+
+public struct ReadGrantReview: Decodable, Sendable, Identifiable {
+    public let id: String
     public let repository: String
-    public let repositoryID: UInt64
-    public let expires: Date
     public let root: ReadRootChoice
+    public let permission: ReadPermission
+    private let expiresUnix: Int64
+    public var expires: Date { Date(timeIntervalSince1970: TimeInterval(expiresUnix)) }
+}
 
-    private struct Authorization: Decodable {
-        let purpose: String
-        let grant: Rule
-    }
+public enum ReadPermission: Decodable, Sendable {
+    case issueReads
 
-    private struct Rule: Decodable {
-        let id: String
-        let uid: UInt32
-        let codeHash: String
-        let effects: ReadEffectSet
-        let root: ReadRootChoice
-        let repository: String
-        let role: String
-        let expiresUnix: Int64
-    }
+    private enum Kind: String, Decodable { case issueReads }
+    private enum CodingKeys: String, CodingKey { case kind, categories }
 
-    private struct Request: Decodable {
-        struct Peer: Decodable { let cdHash: String }
-        let method: String
-        let path: String
-        let body: String
-        let origin: String
-        let repository: String
-        let repositoryId: UInt64
-        let peer: Peer
-        let authorization: Authorization
-        let readRoots: [ReadRootChoice]
-    }
+    public init(from decoder: any Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        switch try fields.decode(Kind.self, forKey: .kind) {
+        case .issueReads: self = .issueReads
 
-    public static func parse(request: Data, role: String, uid: UInt32, now: Date) throws -> Self? {
-        struct Presence: Decodable {
-            struct Purpose: Decodable { let purpose: String }
-            let authorization: Purpose?
         }
-        guard try JSONDecoder().decode(Presence.self, from: request).authorization != nil else { return nil }
-        return try Self(request: request, role: role, uid: uid, now: now)
-    }
-
-    public init(request: Data, role: String, uid: UInt32, now: Date) throws {
-        guard let request = try? JSONDecoder().decode(Request.self, from: request) else { throw Failure.invalidGrant }
-        let authorization = request.authorization
-        let grant = authorization.grant
-        let expires = Date(timeIntervalSince1970: TimeInterval(grant.expiresUnix))
-        let path = String(request.path.split(separator: "?", maxSplits: 1)[0])
-        let prefixes = ["/repos/\(request.repository)/issues", "/repositories/\(request.repositoryId)/issues"]
-        guard request.origin == "https://api.github.com", request.repositoryId > 0,
-            prefixes.contains(where: { prefix in
-                if path == prefix { return true }
-                guard path.hasPrefix(prefix + "/") else { return false }
-                let number = path.dropFirst(prefix.count + 1)
-                return !number.isEmpty && number.utf8.allSatisfy({ (48...57).contains($0) })
-                    && (UInt64(number) ?? 0) > 0
-            })
-        else { throw Failure.invalidGrant }
-        let hex = { (text: String) in text.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
-        guard authorization.purpose == "quartermaster.read-grant",
-            grant.effects.effects == ["listIssues", "readIssue"], grant.root.valid,
-            request.readRoots.contains(grant.root),
-            grant.id.count == 32, hex(grant.id), grant.uid == uid,
-            [40, 64].contains(grant.codeHash.count), hex(grant.codeHash), grant.codeHash == request.peer.cdHash,
-            grant.repository == request.repository,
-            grant.role == role, ["github-read", "github-write"].contains(role),
-            expires > now, expires.timeIntervalSince(now) <= 3601,
-            request.method == "GET", request.body.isEmpty
-        else {
-            throw Failure.invalidGrant
-        }
-        repository = request.repository
-        repositoryID = request.repositoryId
-        self.expires = expires
-        root = grant.root
     }
 }
 
@@ -85,77 +73,28 @@ public struct ReadRootChoice: Codable, Equatable, Sendable, Identifiable {
     public let id: String
     public let pid: UInt32
     public let executable: String
-
-    var valid: Bool {
-        let parts = id.split(separator: ":")
-        return pid > 1 && parts.count == 3 && parts[0] == String(pid)
-            && parts[1].count == 16 && parts[2].count == 8
-            && parts.dropFirst().allSatisfy { $0.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
-            && executable.hasPrefix("/") && executable.utf8.count <= 4096
-            && !executable.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
-    }
-}
-
-private struct ReadEffectSet: Decodable, Sendable {
-    let effects: [String]
 }
 
 public struct ReadScopeReview: Sendable {
     public let roots: [ReadRootChoice]
 
     public static func parse(request: Data) throws -> Self? {
-        struct Request: Decodable {
-            let method: String
-            let body: String?
-            let path: String
-            let origin: String
-            let repository: String?
-            let repositoryId: UInt64?
-            let readRoots: [ReadRootChoice]?
+        struct Envelope: Decodable {
+            let presentation: ApprovalDisplay
+            let readRoots: [ReadRootChoice]
         }
-        let value = try JSONDecoder().decode(Request.self, from: request)
-        guard let roots = value.readRoots else { return nil }
-        let path = String(value.path.split(separator: "?", maxSplits: 1)[0])
-        let prefixes = ["/repos/\(value.repository ?? "")/issues", "/repositories/\(value.repositoryId ?? 0)/issues"]
-        let issueRead =
-            value.origin == "https://api.github.com" && value.method == "GET" && value.body == ""
-            && (value.repositoryId ?? 0) > 0 && RepositoryName(fullName: value.repository ?? "") != nil
-            && prefixes.contains { prefix in
-                if path == prefix { return true }
-                guard path.hasPrefix(prefix + "/") else { return false }
-                let number = path.dropFirst(prefix.count + 1)
-                return !number.isEmpty && number.utf8.allSatisfy({ (48...57).contains($0) })
-                    && (UInt64(number) ?? 0) > 0
-            }
-        guard issueRead else {
-            guard roots.isEmpty else { throw ReadGrantReview.Failure.invalidGrant }
-            return nil
-        }
-        guard roots.count <= 32, roots.allSatisfy(\.valid), Set(roots.map(\.id)).count == roots.count else {
-            throw ReadGrantReview.Failure.invalidGrant
-        }
-        return Self(roots: roots)
+        let value = try JSONDecoder().decode(Envelope.self, from: request)
+        return value.presentation.allowsReadScope ? Self(roots: value.readRoots) : nil
     }
 }
 
-public struct ActiveReadGrant: Decodable, Sendable, Identifiable {
-    private struct Rule: Decodable, Sendable {
-        let id: String
-        let repository: String
-        let root: ReadRootChoice
-        let effects: ReadEffectSet
-        let expiresUnix: Int64
-    }
-    private let purpose: String
-    private let grant: Rule
-    public var id: String { grant.id }
-    public var repository: String { grant.repository }
-    public var root: ReadRootChoice { grant.root }
-    public var expires: Date { Date(timeIntervalSince1970: TimeInterval(grant.expiresUnix)) }
-    public var valid: Bool {
-        purpose == "quartermaster.read-grant" && grant.root.valid
-            && grant.effects.effects == ["listIssues", "readIssue"]
-            && id.count == 32 && id.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
-            && RepositoryName(fullName: repository) != nil
-    }
+public typealias ActiveReadGrant = ReadGrantReview
+
+public enum GitHubEffect: String, Decodable, Sendable {
+    case readRepository
+    case listIssues
+    case readIssue
+    case closeIssue
+    case deleteIssue
+    case deleteRepository
 }

@@ -131,7 +131,11 @@ final class IPCFixture: ApprovalBackend {
             from: Data(
                 #"{"server":"https://vault.example.invalid","account":"dummy","email":"dummy@example.invalid","item":"dummy","field":"password","role":"github-write","enrollment":"disposable","generation":1}"#
                     .utf8))
-        let presentation = ApprovalPresentation(request: request, provider: provider, readGrant: nil)
+        let display = try ApprovalDisplay.parse(
+            request: Data(
+                #"{"presentation":{"intent":{"kind":"request"},"repository":"quartermaster/demo","additionalEffects":[],"allowsReadScope":false}}"#
+                    .utf8))
+        let presentation = ApprovalPresentation(request: request, provider: provider, display: display)
         let dialog = ApprovalDialog(presentation: presentation, backend: self, keys: keys)
         let controller = dialog.controller
         defer {

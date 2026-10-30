@@ -194,7 +194,7 @@ pub(super) enum Reply {
     UnknownOperation,
     ReadGrantsRevoked,
     ReadGrants {
-        grants: Vec<super::grant::ReadGrantClaims>,
+        grants: Vec<super::grant::ReadGrantDisplay>,
     },
     SettingsStatus {
         settings: super::settings::Snapshot,

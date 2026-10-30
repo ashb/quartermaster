@@ -156,6 +156,11 @@ establish the required key protection; a supplied public key alone proves neithe
 UI success, a policy result or an authentication boolean cannot replace required
 proof. A signature proves key use, not faithful presentation: the UI remains trusted.
 
+Rust supplies typed approval intents, effects, read scopes, warning codes and
+available choices inside the frozen request review. Swift owns their wording
+without reclassifying GitHub requests or deciding grant coverage. Its signature
+must still bind the exact reviewed bytes to the current authentication event.
+
 The UI may transfer its fresh OS-authenticated `LAContext` over mutually
 authenticated NSXPC so the Rust owner can open its own protected cache. Native
 context handles remain confined to their owning queue and connection generation.

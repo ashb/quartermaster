@@ -15,7 +15,8 @@ pub enum Resource {
     IssueNumber(std::num::NonZeroU64),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum EffectKind {
     ReadRepository,
     ListIssues,

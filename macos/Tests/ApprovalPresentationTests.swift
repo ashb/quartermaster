@@ -9,23 +9,22 @@ import Testing
 @testable import QuartermasterApprovalUI
 
 private func approvalPresentation(
-    complete: Bool = true, effects: [String] = ["Close issue"], repository: String? = "quartermaster/one",
+    intent: [String: Any] = ["kind": "issue", "action": "closeIssue", "number": 42], effects: [String] = [],
+    repository: String? = "quartermaster/one",
+    notice: String? = nil, resourceTitle: String? = nil,
     ancestryComplete: Bool? = nil, ancestryNote: String? = nil, read: Bool = false
 ) throws -> ApprovalPresentation {
-    let path = "/repos/quartermaster/one/issues/42"
-    let method = read ? "GET" : "PATCH"
-    let body = read ? "" : #"{"state":"closed"}"#
-    var application: [String: Any] = [
-        "version": "quartermaster.github-request.v1", "complete": complete, "effects": effects,
-        "originalDigest": Data(repeating: 1, count: 32).base64EncodedString(),
-        "request": Data("\(method) \(path) HTTP/1.1\r\nHost: api.github.com\r\n\r\n\(body)".utf8)
-            .base64EncodedString(),
+    var display: [String: Any] = [
+        "intent": intent,
+        "additionalEffects": effects, "allowsReadScope": read,
     ]
-    if complete, let repository { application["requestedRepository"] = repository }
+    display["repository"] = repository
+    display["understandingNotice"] = notice
+    display["resourceTitle"] = resourceTitle
     var payload: [String: Any] = [
-        "repository": read ? "quartermaster/one" : "", "repositoryId": 123,
-        "issue": 42, "method": method, "body": body, "path": path, "origin": "https://api.github.com",
-        "processChain": ["codex", "gh"], "application": application, "readRoots": [],
+        "repository": "", "repositoryId": 123, "issue": 42, "method": "PATCH", "body": "",
+        "path": "/unfamiliar", "origin": "https://example.invalid",
+        "processChain": ["codex", "gh"], "readRoots": [], "presentation": display,
     ]
     if let ancestryComplete {
         var peer: [String: Any] = [
@@ -43,47 +42,22 @@ private func approvalPresentation(
             #"{"server":"https://vault.example.invalid","account":"dummy","email":"dummy@example.invalid","item":"dummy","field":"LoginPassword","role":"github-write","enrollment":"disposable","generation":1}"#
                 .utf8))
     return ApprovalPresentation(
-        request: request, provider: provider, readGrant: nil, apiRequest: try APIRequestReview.parse(request: bytes),
+        request: request, provider: provider, display: try ApprovalDisplay.parse(request: bytes),
+        apiRequest: try APIRequestReview.parse(request: bytes),
         readScope: try ReadScopeReview.parse(request: bytes))
 }
 
-@Test func aRecognisedCloseShowsItsNamedRepositoryAndDoesNotRepeatTheTitleAsAnEffect() throws {
-    let presentation = try approvalPresentation()
-    #expect(presentation.operationTitle == "Close issue #42")
-    #expect(presentation.repository == "quartermaster/one")
-    #expect(presentation.additionalEffects.isEmpty)
-}
-
-@Test(arguments: [true, false]) func extraActionsRemainVisibleAndCannotHideBehindACloseTitle(_ complete: Bool) throws {
-    let presentation = try approvalPresentation(complete: complete, effects: ["Close issue", "Delete repository"])
-    #expect(presentation.operationTitle == "Approve GitHub request")
-    #expect(presentation.additionalEffects == ["Close issue", "Delete repository"])
-}
-
-@Test func unfamiliarRequestsRetainKnownActionsWithoutPretendingToBeASimpleClose() throws {
-    let presentation = try approvalPresentation(complete: false, repository: nil)
-    #expect(presentation.operationTitle == "Approve GitHub request")
-    #expect(presentation.repository == nil)
-    #expect(presentation.additionalEffects == ["Close issue"])
-    #expect(presentation.apiRequest?.complete == false)
-}
-
-@Test func theReadScopeSummaryDoesNotRepeatTheRequestedAction() throws {
-    let presentation = try approvalPresentation(effects: ["Read issue"], read: true)
-    #expect(presentation.readScope != nil)
-    #expect(presentation.additionalEffects.isEmpty)
-}
-
-@Test(arguments: [true, false]) func unexpectedReadActionsRemainVisible(_ complete: Bool) throws {
+@Test func approvalRendersBackendDescriptionsWithoutInterpretingTheRequest() throws {
     let presentation = try approvalPresentation(
-        complete: complete, effects: ["Read issue", "Delete repository"], read: true)
-    #expect(presentation.additionalEffects == ["Read issue", "Delete repository"])
-}
-
-@Test func anIncompleteReadStillShowsItsKnownActions() throws {
-    let presentation = try approvalPresentation(complete: false, effects: ["Read issue"], read: true)
-    #expect(presentation.additionalEffects == ["Read issue"])
-    #expect(presentation.apiRequest?.complete == false)
+        intent: ["kind": "request"], effects: ["closeIssue", "deleteIssue"],
+        repository: "example/records", notice: "incompleteRequest")
+    #expect(presentation.operationTitle == "Approve GitHub request")
+    #expect(presentation.repository == "example/records")
+    #expect(presentation.additionalEffects == ["Close issue", "Delete issue"])
+    #expect(
+        presentation.understandingNotice
+            == "This request isn't fully understood. Review the HTTP details before approving.")
+    #expect(presentation.authenticationReason == "approve this GitHub request once")
 }
 
 @Test func incompleteAncestryShowsTheBackendsExplanation() throws {
@@ -180,36 +154,6 @@ private func approvalPresentation(
     #expect(ProcessApplication(executable: nil) == nil)
 }
 
-@Test func malformedTreesAndMissingSelectedRootsCannotBePresentedAsValidGrants() throws {
-    let root = try JSONDecoder().decode(
-        ReadRootChoice.self,
-        from: Data(
-            #"{"id":"20:0000000000000001:00000001","pid":20,"executable":"/bin/zsh"}"#.utf8))
-    let shell = DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false)
-    let leaf = DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false)
-    var request = try approvalPresentation(ancestryComplete: true).request
-    request.peer?.processes = [shell, leaf]
-    #expect(request.validProcessTree)
-    #expect(request.canDisplay(root: root))
-    for rows in [
-        [], [shell], [shell, leaf, leaf],
-        [shell, DialogProcess(pid: 30, name: "gh", executable: "/other/gh", limited: false)],
-        [shell, DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: true)],
-        (100...131).map { DialogProcess(pid: $0, name: "ancestor", executable: "/bin/zsh", limited: false) } + [leaf],
-    ] {
-        request.peer?.processes = rows
-        #expect(!request.validProcessTree)
-    }
-    for rows in [
-        [leaf],
-        [DialogProcess(pid: 20, name: "zsh", executable: "/other/zsh", limited: false), leaf],
-        [DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: true), leaf],
-    ] {
-        request.peer?.processes = rows
-        #expect(!request.canDisplay(root: root))
-    }
-}
-
 @MainActor private final class ScopeReviewBackend: ApprovalBackend {
     let reviewCreated = MonotonicTimestamp.now
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {
@@ -220,7 +164,7 @@ private func approvalPresentation(
 }
 
 @Test @MainActor func refreshingTheScopePreservesTheHostingView() throws {
-    let presentation = try approvalPresentation(effects: ["Read issue"], read: true)
+    let presentation = try approvalPresentation(read: true)
     let dialog = ApprovalDialog(presentation: presentation, backend: ScopeReviewBackend())
     let content = try #require(dialog.window.contentView)
     _ = content.fittingSize
@@ -230,7 +174,7 @@ private func approvalPresentation(
 }
 
 @Test @MainActor func replacingTheScopeKeepsTheFooterLabelsSteady() throws {
-    let presentation = try approvalPresentation(effects: ["Read issue"], read: true)
+    let presentation = try approvalPresentation(read: true)
     let controller = ApprovalController(backend: ScopeReviewBackend(), reason: "Test scope layout")
     let view = ApprovalDialogView(presentation: presentation, controller: controller, close: {})
     let cancel = view.cancelTitle
@@ -241,7 +185,7 @@ private func approvalPresentation(
 }
 
 @Test @MainActor func aRetainedDialogBindsTheFingerprintViewToTheReplacementContext() throws {
-    let presentation = try approvalPresentation(effects: ["Read issue"], read: true)
+    let presentation = try approvalPresentation(read: true)
     func view(_ controller: ApprovalController) -> ApprovalDialogView {
         ApprovalDialogView(presentation: presentation, controller: controller, close: {})
     }
@@ -299,27 +243,42 @@ private func approvalPresentation(
         let presentation = ApprovalPresentation(
             request: try JSONDecoder().decode(DialogRequest.self, from: bytes),
             provider: provider,
-            readGrant: try ReadGrantReview.parse(
-                request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000)),
+            display: try ApprovalDisplay.parse(request: bytes),
             apiRequest: try APIRequestReview.parse(request: bytes),
             readScope: try ReadScopeReview.parse(request: bytes))
         return NSHostingView(
             rootView: ApprovalDialogView(
                 presentation: presentation, controller: controller, close: {}, selectRoot: { _ in }))
     }
+    var display: [String: Any] = [
+        "intent": ["kind": "request"],
+        "repository": "quartermaster/one", "additionalEffects": [], "allowsReadScope": true,
+    ]
+    request["presentation"] = display
     let once = try view(JSONSerialization.data(withJSONObject: request))
     for selected in [root, parent] {
-        request["authorization"] = [
-            "purpose": "quartermaster.read-grant",
+        display["intent"] = [
+            "kind": "readGrant",
             "grant": [
-                "id": String(repeating: "a", count: 32), "uid": 501,
-                "codeHash": String(repeating: "1", count: 40), "root": selected,
-                "effects": ["effects": ["listIssues", "readIssue"]],
-                "repository": "quartermaster/one", "role": "github-write", "expiresUnix": 4600,
+                "id": "grant", "root": selected, "repository": "quartermaster/one", "expiresUnix": 4600,
+                "permission": ["kind": "issueReads"],
             ],
         ]
+        request["presentation"] = display
         let shell = try view(JSONSerialization.data(withJSONObject: request))
         #expect(once.fittingSize.height > 0)
         #expect(once.fittingSize == shell.fittingSize)
     }
+}
+
+@Test(arguments: ["Test issue", "Fix 👩‍💻 workflow", "العربية / עברית / 日本語 / café"])
+func suppliedResourceTitlesPreserveUnicode(_ title: String) throws {
+    let presentation = try approvalPresentation(resourceTitle: title)
+    #expect(presentation.display.resourceTitle == title)
+}
+
+@Test func issueIntentRendersTheSuppliedActionAndNumber() throws {
+    let presentation = try approvalPresentation(intent: ["kind": "issue", "action": "closeIssue", "number": 42])
+    #expect(presentation.operationTitle == "Close issue #42")
+    #expect(presentation.additionalEffects.isEmpty)
 }

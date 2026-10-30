@@ -3,106 +3,99 @@ import Testing
 
 @testable import QuartermasterSecurity
 
-private func grantRequest(changing change: (inout [String: Any]) -> Void = { _ in }) throws -> Data {
-    var request: [String: Any] = [
-        "method": "GET", "path": "/repos/example/one/issues", "body": "",
-        "repository": "example/one", "repositoryId": 123, "origin": "https://api.github.com",
-        "readRoots": [["id": "123:0000000000000001:00000001", "pid": 123, "executable": "/bin/zsh"]],
-        "peer": ["cdHash": String(repeating: "1", count: 40)],
-        "authorization": [
-            "purpose": "quartermaster.read-grant",
-            "grant": [
-                "id": String(repeating: "a", count: 32), "uid": 501,
-                "codeHash": String(repeating: "1", count: 40),
-                "effects": ["effects": ["listIssues", "readIssue"]],
-                "root": ["id": "123:0000000000000001:00000001", "pid": 123, "executable": "/bin/zsh"],
-                "repository": "example/one", "role": "github-write", "expiresUnix": 4600,
+private func displayRequest(allowsReadScope: Bool = true) throws -> Data {
+    try JSONSerialization.data(withJSONObject: [
+        "method": "POST", "path": "/unfamiliar",
+        "readRoots": [["id": "backend-root", "pid": 123, "executable": "/bin/zsh"]],
+        "presentation": [
+            "intent": [
+                "kind": "readGrant",
+                "grant": [
+                    "id": "backend-grant", "repository": "example/project",
+                    "root": ["id": "backend-root", "pid": 123, "executable": "/bin/zsh"],
+                    "expiresUnix": 4600, "permission": ["kind": "issueReads"],
+                ],
             ],
+            "repository": "example/project", "additionalEffects": ["closeIssue"],
+            "understandingNotice": "incompleteRequest", "allowsReadScope": allowsReadScope,
         ],
-    ]
-    change(&request)
-    return try JSONSerialization.data(withJSONObject: request)
+    ])
 }
 
-@Test func readGrantReviewDescribesTheCompletePermission() throws {
-    let grant = try ReadGrantReview(
-        request: grantRequest(), role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
-    #expect(grant.repository == "example/one")
-    #expect(grant.repositoryID == 123)
+@Test func approvalDecodesTypedScopeWithoutReconstructingPermissions() throws {
+    let display = try ApprovalDisplay.parse(request: displayRequest())
+    #expect(display.repository == "example/project")
+    #expect(display.additionalEffects == [.closeIssue])
+    #expect(display.understandingNotice == .incompleteRequest)
+    let grant = try #require(display.grant)
+    guard case .issueReads = grant.permission else {
+        Issue.record("Expected issue read permission")
+        return
+    }
     #expect(grant.expires == Date(timeIntervalSince1970: 4600))
 }
 
-@Test func readGrantReviewRejectsTheRetiredSimulationDestination() throws {
-    let url = try #require(
-        Bundle.module.url(forResource: "simulation-read-grant", withExtension: "json", subdirectory: "Fixtures"))
-    let bytes = try Data(contentsOf: url)
-    #expect(throws: ReadGrantReview.Failure.self) {
-        try ReadGrantReview(request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
+@Test(arguments: [true, false])
+func scopeAvailabilityUsesTheBackendChoice(_ allowed: Bool) throws {
+    let scope = try ReadScopeReview.parse(request: displayRequest(allowsReadScope: allowed))
+    #expect((scope != nil) == allowed)
+    if allowed { #expect(scope?.roots.first?.id == "backend-root") }
+}
+
+@Test func activeGrantDecodesTheTypedScope() throws {
+    let request = try #require(JSONSerialization.jsonObject(with: displayRequest()) as? [String: Any])
+    let display = try #require(request["presentation"] as? [String: Any])
+    let intent = try #require(display["intent"] as? [String: Any])
+    let bytes = try JSONSerialization.data(withJSONObject: intent["grant"]!)
+    let grant = try JSONDecoder().decode(ActiveReadGrant.self, from: bytes)
+    #expect(grant.id == "backend-grant")
+    guard case .issueReads = grant.permission else {
+        Issue.record("Expected issue read permission")
+        return
     }
+}
+
+@Test func approvalDecodesTypedIntentWithoutRenderedEnglish() throws {
+    let bytes = Data(
+        #"{"presentation":{"intent":{"kind":"issue","action":"closeIssue","number":42},"repository":"example/project","additionalEffects":[],"allowsReadScope":false}}"#
+            .utf8)
+    let display = try ApprovalDisplay.parse(request: bytes)
+    #expect(display.repository == "example/project")
+    guard case .issue(let action, let number) = display.intent else {
+        Issue.record("Expected an issue action")
+        return
+    }
+    #expect(action == .closeIssue)
+    #expect(number == 42)
 }
 
 @Test(arguments: [
-    "purpose", "effects", "root", "readRoots", "repository", "role", "codeHash", "uid", "expiresUnix", "method",
-    "origin", "path",
-    "repositoryId",
+    #"{"kind":"futureIntent"}"#,
+    #"{"kind":"issue","action":"futureAction","number":42}"#,
+    #"{"kind":"readGrant"}"#,
 ])
-func readGrantReviewRejectsMisrepresentedOrUnboundedPermissions(_ field: String) throws {
-    let bytes = try grantRequest { request in
-        var authorization = request["authorization"] as! [String: Any]
-        var grant = authorization["grant"] as! [String: Any]
-        switch field {
-        case "purpose": authorization[field] = "approve-write"
-        case "effects": grant[field] = ["effects": ["closeIssue"]]
-        case "root": grant[field] = ["id": "999:0000000000000001:00000001", "pid": 999, "executable": "/bin/zsh"]
-        case "readRoots": request[field] = []
-        case "repository": grant[field] = "example/two"
-        case "role": grant[field] = "github-read"
-        case "codeHash": grant[field] = String(repeating: "2", count: 40)
-        case "uid": grant[field] = 502
-        case "expiresUnix": grant[field] = 100000
-        case "method": request[field] = "PATCH"
-        case "origin": request[field] = "https://elsewhere.invalid"
-        case "path": request[field] = "/user"
-        case "repositoryId": request[field] = 0
-        default: break
-        }
-        authorization["grant"] = grant
-        request["authorization"] = authorization
-    }
-    #expect(throws: ReadGrantReview.Failure.self) {
-        try ReadGrantReview(request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
-    }
+func unknownOrIncompleteIntentFailsDecoding(_ intent: String) {
+    let bytes = Data(
+        "{\"presentation\":{\"intent\":\(intent),\"additionalEffects\":[],\"allowsReadScope\":false}}".utf8)
+    #expect(throws: DecodingError.self) { try ApprovalDisplay.parse(request: bytes) }
 }
 
-@Test func requestOnceRetainsValidatedRootChoices() throws {
-    let bytes = try grantRequest { $0.removeValue(forKey: "authorization") }
-    #expect(
-        try ReadGrantReview.parse(
-            request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000)) == nil)
-    let scope = try #require(try ReadScopeReview.parse(request: bytes))
-    #expect(scope.roots.count == 1)
-    #expect(scope.roots[0].pid == 123)
+@Test func missingPresentationFailsDecoding() {
+    #expect(throws: DecodingError.self) { try ApprovalDisplay.parse(request: Data("{}".utf8)) }
 }
 
-@Test(arguments: ["unknownEffect", "duplicateEffect", "unknownRoot", "duplicateRoot", "malformedRoot"])
-func rootClaimsRejectIncompatibleOrAmbiguousScope(_ change: String) throws {
-    let bytes = try grantRequest { request in
-        var authorization = request["authorization"] as! [String: Any]
-        var grant = authorization["grant"] as! [String: Any]
-        switch change {
-        case "unknownEffect":
-            grant["effects"] = ["effects": ["listIssues", "readIssue", "readPullRequest"]]
-        case "duplicateEffect": grant["effects"] = ["effects": ["readIssue", "readIssue"]]
-        case "unknownRoot": request["readRoots"] = []
-        case "duplicateRoot": request["readRoots"] = [grant["root"]!, grant["root"]!]
-        case "malformedRoot": request["readRoots"] = [["id": "123", "pid": 123, "executable": "/bin/zsh"]]
-        default: break
-        }
-        authorization["grant"] = grant
-        request["authorization"] = authorization
+@Test func approvalWireMatchesTheRustPresentationFixture() throws {
+    let url = try #require(
+        Bundle.module.url(forResource: "approval-presentation", withExtension: "json", subdirectory: "Fixtures"))
+    let display = try ApprovalDisplay.parse(request: Data(contentsOf: url))
+    guard case .issue(let action, let number) = display.intent else {
+        Issue.record("Expected an issue action")
+        return
     }
-    #expect(throws: (any Error).self) {
-        _ = try ReadScopeReview.parse(request: bytes)
-        _ = try ReadGrantReview(request: bytes, role: "github-write", uid: 501, now: Date(timeIntervalSince1970: 1000))
-    }
+    #expect(action == .closeIssue)
+    #expect(number == 42)
+    #expect(display.repository == "example/one")
+    #expect(display.additionalEffects.isEmpty)
+    #expect(display.understandingNotice == nil)
+    #expect(!display.allowsReadScope)
 }

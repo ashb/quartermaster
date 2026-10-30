@@ -56,7 +56,33 @@ pub(super) struct ReadGrantClaims {
     grant: GrantRule,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReadGrantDisplay {
+    id: String,
+    repository: String,
+    root: RootDescription,
+    expires_unix: i64,
+    permission: ReadPermission,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ReadPermission {
+    IssueReads,
+}
+
 impl ReadGrantClaims {
+    pub(super) fn display(&self) -> ReadGrantDisplay {
+        ReadGrantDisplay {
+            id: self.grant.id.0.clone(),
+            repository: self.grant.repository.clone(),
+            root: self.grant.root.clone(),
+            expires_unix: self.grant.expires_unix.unix_timestamp(),
+            permission: ReadPermission::IssueReads,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn role(&self) -> &str {
         &self.grant.role

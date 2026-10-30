@@ -68,75 +68,38 @@ public struct DialogRequest: Codable, Equatable {
     public var origin: String? = nil
     public var peer: DialogPeer? = nil
 
-    public func canDisplay(root: ReadRootChoice) -> Bool {
-        peer?.processes?.contains {
-            !$0.limited && $0.pid == root.pid && $0.executable == root.executable
-        } == true
-    }
-
-    public var validProcessTree: Bool {
-        guard let peer, let processes = peer.processes else { return true }
-        return !processes.isEmpty && processes.count <= 32
-            && Set(processes.map(\.pid)).count == processes.count
-            && processes.last?.pid == peer.pid && processes.last?.executable == peer.executable
-            && processes.last?.limited == false
-    }
 }
 
 public struct ApprovalPresentation {
     let request: DialogRequest
     let provider: ApprovalProviderIdentity
-    let readGrant: ReadGrantReview?
+    let display: ApprovalDisplay
+    var readGrant: ReadGrantReview? { display.grant }
     let apiRequest: APIRequestReview?
     let readScope: ReadScopeReview?
 
     public init(
-        request: DialogRequest, provider: ApprovalProviderIdentity, readGrant: ReadGrantReview?,
+        request: DialogRequest, provider: ApprovalProviderIdentity, display: ApprovalDisplay,
         apiRequest: APIRequestReview? = nil, readScope: ReadScopeReview? = nil
     ) {
         self.request = request
         self.provider = provider
-        self.readGrant = readGrant
+        self.display = display
         self.apiRequest = apiRequest
         self.readScope = readScope
     }
 
-    private var describesClose: Bool {
-        readGrant == nil && apiRequest?.complete == true && apiRequest?.effects == ["Close issue"]
-            && request.issue != nil
-    }
-
-    var repository: String? {
-        request.repository.isEmpty ? apiRequest?.requestedRepository : request.repository
-    }
-
-    var additionalEffects: [String] {
-        guard !describesClose, let apiRequest else { return [] }
-        if readScope != nil, apiRequest.complete,
-            apiRequest.effects.allSatisfy({ ["List issues", "Read issue"].contains($0) })
-        {
-            return []
-        }
-        return apiRequest.effects
-    }
+    var repository: String? { display.repository }
+    var additionalEffects: [String] { display.additionalEffects.map(\.label) }
+    var understandingNotice: String? { display.understandingNotice?.text }
+    var operationTitle: String { display.title }
+    var authenticationReason: String { display.authenticationReason }
 
     var ancestryNotice: String? {
         guard let peer = request.peer, !peer.ancestryComplete else { return nil }
         return peer.ancestryNote ?? "Earlier ancestors could not be inspected."
     }
 
-    var operationTitle: String {
-        if describesClose, let issue = request.issue {
-            return "Close issue #\(issue)"
-        }
-        return readGrant == nil ? "Approve GitHub request" : "Allow issue reads"
-    }
-
-    var authenticationReason: String {
-        return readGrant == nil
-            ? "approve this GitHub request once"
-            : "allow issue reads in \(request.repository)"
-    }
 }
 
 @MainActor
@@ -229,6 +192,9 @@ struct ApprovalDialogView: View {
                     Text("Repository")
                         .font(.caption).foregroundStyle(.secondary)
                     Text(verbatim: repository).font(.headline)
+                    if let title = presentation.display.resourceTitle {
+                        Text(verbatim: title).font(.subheadline).lineLimit(3)
+                    }
                     if let grant = presentation.readGrant {
                         Text(
                             "Until \(grant.expires.formatted(date: .abbreviated, time: .shortened)) or backend restart"
@@ -265,26 +231,24 @@ struct ApprovalDialogView: View {
                 }
                 if presentation.readScope != nil {
                     Text(
-                        presentation.readGrant == nil
-                            ? "This issue read only. Later requests need approval."
-                            : "List and read issues from this shell's descendants using the same caller executable."
+                        presentation.readGrant?.summary ?? "This request only. Later requests need approval."
                     )
-                    .font(.caption).frame(height: 28, alignment: .topLeading)
+                    .font(.caption).fixedSize(horizontal: false, vertical: true)
+                    .frame(minHeight: 28, alignment: .topLeading)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if let api = presentation.apiRequest, presentation.readGrant == nil,
-                !api.complete || !presentation.additionalEffects.isEmpty
+            if presentation.apiRequest != nil, presentation.readGrant == nil,
+                presentation.understandingNotice != nil || !presentation.additionalEffects.isEmpty
             {
                 VStack(alignment: .leading, spacing: 12) {
                     if !presentation.additionalEffects.isEmpty {
                         Text("Requested actions: \(presentation.additionalEffects.joined(separator: ", "))").font(
                             .caption)
                     }
-                    if !api.complete {
-                        Text("This request isn't fully understood. Review the HTTP details before approving.").font(
-                            .caption)
+                    if let notice = presentation.understandingNotice {
+                        Text(notice).font(.caption)
                     }
                 }
             }
@@ -374,10 +338,6 @@ struct ApprovalDialogView: View {
                                 Text(verbatim: showsRawHTTP ? api.text : api.readableText ?? api.text)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }.frame(height: 180)
-                            Text(
-                                "Authentication is replaced with the selected credential. HTTP framing uses a fixed body length and closes the connection. Byte escapes are shown literally."
-                            )
-                            .foregroundStyle(.secondary)
                         } else {
                             Text(presentation.request.body ?? "")
                         }

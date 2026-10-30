@@ -252,7 +252,6 @@ public enum BrokerReply: Decodable, Sendable {
         case .readGrantsRevoked: self = .readGrantsRevoked
         case .readGrants:
             let grants = try fields.decode([ActiveReadGrant].self, forKey: .grants)
-            guard grants.count <= 64, grants.allSatisfy(\.valid) else { throw BrokerControlError.invalidMessage }
             self = .readGrants(grants)
         case .error: self = .error(try fields.decode(BrokerControlError.self, forKey: .code))
         case .vaultStatus: self = .vaultStatus(try BrokerVaultStatus(from: decoder))

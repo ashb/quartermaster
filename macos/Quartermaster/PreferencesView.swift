@@ -293,7 +293,9 @@ struct PreferencesView: View {
                         VStack(alignment: .leading) {
                             Text(verbatim: grant.repository)
                             Text(verbatim: "\(grant.root.executable) · PID \(grant.root.pid)")
-                            Text("Issue reads until \(grant.expires.formatted(date: .abbreviated, time: .shortened))")
+                            Text(
+                                "\(grant.scopeName) until \(grant.expires.formatted(date: .abbreviated, time: .shortened))"
+                            )
                         }.font(.caption)
                         Spacer()
                         Button("Revoke") { application.revokeRead(grant.id) }
