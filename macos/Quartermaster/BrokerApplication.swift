@@ -5,7 +5,10 @@ import QuartermasterSecurity
 
 @MainActor
 final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject {
-    private enum ConnectionPhase { case disconnected, connecting, connected }
+    private enum ConnectionPhase {
+        case disconnected, connecting, connected
+        case failed(String)
+    }
     enum VaultActivity: Equatable {
         case idle, locking, syncing, unlocking, locked, synced, unlocked
         case failed(String)
@@ -42,9 +45,18 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private var settingsIsOpen = false
     private weak var settingsWindow: NSWindow?
     private var operationEnrolled = false
-    private var connectionPhase: ConnectionPhase = .disconnected
+    @Published private var connectionPhase: ConnectionPhase = .disconnected
+    var connectionFailure: String? {
+        if case .failed(let message) = connectionPhase { return message }
+        return nil
+    }
+    var connected: Bool {
+        if case .connected = connectionPhase { return true }
+        return false
+    }
     private let setActivationPolicy: (NSApplication.ActivationPolicy) -> Void
     private let openConnection: () async throws -> any BrokerClient
+    private let recoveryDelays: [Duration]
     private let loadApprovalKey: () throws -> Data
     private let acquirePresentation: () throws -> Int32
     private let makeUnlockWindow: (VaultUnlockReview, any VaultUnlockBackend, Bool) -> any VaultUnlockWindow
@@ -61,6 +73,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     init(
         setActivationPolicy: @escaping (NSApplication.ActivationPolicy) -> Void,
         openConnection: @escaping () async throws -> any BrokerClient = { try await BrokerConnection.connect() },
+        recoveryDelays: [Duration] = [.milliseconds(250), .seconds(1), .seconds(2)],
         loadApprovalKey: @escaping () throws -> Data = { try ApprovalKeyStore().loadOrCreate() },
         acquirePresentation: @escaping () throws -> Int32 = { try DialogPresentationLease.acquire() },
         makeUnlockWindow: @escaping (VaultUnlockReview, any VaultUnlockBackend, Bool) -> any VaultUnlockWindow = {
@@ -69,6 +82,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     ) {
         self.setActivationPolicy = setActivationPolicy
         self.openConnection = openConnection
+        self.recoveryDelays = recoveryDelays
         self.loadApprovalKey = loadApprovalKey
         self.acquirePresentation = acquirePresentation
         self.makeUnlockWindow = makeUnlockWindow
@@ -92,7 +106,11 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
 
     private func connectIfNeeded() {
-        if connectionPhase == .disconnected || client?.disconnected == true { reconnect() }
+        switch connectionPhase {
+        case .disconnected: reconnect()
+        case .connected: if client?.disconnected == true { reconnect() }
+        case .connecting, .failed: break
+        }
     }
 
     func reconnect() {
@@ -109,49 +127,86 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         client = nil
         operationEnrolled = false
         task = Task {
-            do {
-                let connection = try await openConnection()
-                try Task.checkCancellation()
-                client = connection
-                guard case .hello("development", let build) = try await connection.call(.hello) else {
-                    throw BrokerFailure.invalidMessage
-                }
-                backendBuild = build
-                let key = try loadApprovalKey()
-                guard case .settingsStatus = try await connection.call(.settingsRegister(publicKey: key)) else {
-                    throw BrokerFailure.invalidMessage
-                }
-                await reloadPreferences()
-                try Task.checkCancellation()
-                connectionPhase = .connected
-                while !Task.isCancelled {
-                    guard !connection.disconnected else { throw BrokerFailure.disconnected }
-                    if active == nil && !controls.busy && !preferences.busy && !vaultActivity.busy,
-                        preferences.snapshot?.provider != nil, preferences.snapshot?.settings?.github != nil
-                    {
-                        do { try await poll(connection, key: key) } catch let error as BrokerControlError
-                            where [.denied, .sessionEnded, .expired, .busy, .providerChanged].contains(error)
-                        {
-                            operationEnrolled = false
-                        }
+            var retries = recoveryDelays.makeIterator()
+            while !Task.isCancelled {
+                do {
+                    try await runConnection { retries = recoveryDelays.makeIterator() }
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    active?.cancel()
+                    vaultTask?.cancel()
+                    if vaultActivity.busy {
+                        vaultActivity = .failed("The backend disconnected. Try the operation again after recovery.")
                     }
-                    try await Task.sleep(for: .milliseconds(200))
+                    client?.cancel()
+                    client = nil
+                    operationEnrolled = false
+                    backendBuild = nil
+                    vaultStatus = nil
+                    status = "Backend unavailable: \(error)"
+                    preferences.connectionLost(error)
+                    guard let failure = error as? BrokerFailure,
+                        failure == .disconnected || failure == .timeout,
+                        let delay = retries.next()
+                    else {
+                        connectionPhase = .failed(connectionFailureDescription(error))
+                        return
+                    }
+                    connectionPhase = .connecting
+                    do { try await Task.sleep(for: delay) } catch { return }
                 }
-            } catch {
-                guard !Task.isCancelled else { return }
-                active?.cancel()
-                vaultTask?.cancel()
-                if vaultActivity.busy {
-                    vaultActivity = .failed("The backend disconnected. Reconnect and try again.")
-                }
-                client?.cancel()
-                client = nil
-                backendBuild = nil
-                vaultStatus = nil
-                status = "Backend unavailable: \(error)"
-                connectionPhase = .disconnected
-                preferences.connectionLost(error)
             }
+        }
+    }
+
+    private func runConnection(healthy: () -> Void) async throws {
+        let connection = try await openConnection()
+        if Task.isCancelled {
+            connection.cancel()
+            throw CancellationError()
+        }
+        client = connection
+        guard case .hello("development", let build) = try await connection.call(.hello) else {
+            throw BrokerFailure.invalidMessage
+        }
+        backendBuild = build
+        let key = try loadApprovalKey()
+        guard case .settingsStatus = try await connection.call(.settingsRegister(publicKey: key)) else {
+            throw BrokerFailure.invalidMessage
+        }
+        await reloadPreferences()
+        try Task.checkCancellation()
+        guard !connection.disconnected else { throw BrokerFailure.disconnected }
+        guard preferences.available else { throw BrokerFailure.settingsUnavailable }
+        connectionPhase = .connected
+        while !Task.isCancelled {
+            guard !connection.disconnected else { throw BrokerFailure.disconnected }
+            if active == nil && !controls.busy && !preferences.busy && !vaultActivity.busy,
+                preferences.snapshot?.provider != nil, preferences.snapshot?.settings?.github != nil
+            {
+                do { try await poll(connection, key: key) } catch let error as BrokerControlError
+                    where [.denied, .sessionEnded, .expired, .busy, .providerChanged].contains(error)
+                {
+                    operationEnrolled = false
+                }
+            }
+            healthy()
+            try await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
+    private func connectionFailureDescription(_ error: any Error) -> String {
+        switch error {
+        case BrokerFailure.disconnected: "The connection was interrupted. Check that the backend can start, then retry."
+        case BrokerFailure.timeout: "The backend did not respond. Retry, or restart Quartermaster if this continues."
+        case BrokerFailure.invalidCode: "The backend identity could not be verified. Restart Quartermaster."
+        case BrokerFailure.invalidMessage:
+            "The app and backend could not communicate. Restart both from the same build."
+        case BrokerFailure.settingsUnavailable:
+            "Protected settings could not be loaded. Retry or open Settings for details."
+        case BrokerControlError.denied: "The backend refused this app. Restart both from the same build."
+        default: error.localizedDescription
         }
     }
 

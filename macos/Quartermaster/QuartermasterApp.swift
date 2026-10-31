@@ -36,15 +36,32 @@ struct QuartermasterApp: App {
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
         MenuBarExtra("Quartermaster", systemImage: "key.horizontal") {
-            Text(application.status)
+            QuartermasterMenu(application: application)
+        }
+    }
+}
+
+struct QuartermasterMenu: View {
+    @ObservedObject var application: BrokerApplication
+
+    var body: some View {
+        Group {
+            if let failure = application.connectionFailure {
+                Text("Quartermaster backend unavailable")
+                Text(failure)
+                Button("Retry", action: application.reconnect)
+                Divider()
+            }
             SettingsMenuItem()
             Divider()
-            Button("Revoke read access", action: application.revokeReads)
-            Button("Lock vault") { application.vault(.vaultLock) }
-            Button("Sync vault") { application.vault(.vaultSync) }
-            Button("Reconnect", action: application.reconnect)
+            Group {
+                Button("Revoke read access", action: application.revokeReads)
+                Button("Lock vault") { application.vault(.vaultLock) }
+                Button("Sync vault") { application.vault(.vaultSync) }
+            }.disabled(!application.connected)
             #if DEBUG
                 Divider()
+                Text("Debug status: \(application.status)")
                 BuildMenuItems(component: "App", build: application.frontendBuild)
                 BuildMenuItems(component: "Backend", build: application.backendBuild)
             #endif

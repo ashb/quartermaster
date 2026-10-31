@@ -8,7 +8,7 @@ import QuartermasterSecurity
 import Security
 import Synchronization
 
-enum BrokerFailure: Error { case invalidCode, invalidMessage, disconnected, timeout }
+enum BrokerFailure: Error { case invalidCode, invalidMessage, disconnected, timeout, settingsUnavailable }
 enum VaultOperationFailure: Error { case reported(BrokerVaultStatus) }
 
 protocol BrokerClient: AnyObject, Sendable {

@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import LocalAuthentication
 import QuartermasterSecurity
+import SwiftUI
 import Synchronization
 import Testing
 
@@ -19,6 +20,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
     private let suspension: Suspension?
     private let pauseVault: Bool
     private let build: BrokerBuildInfo?
+    private let settingsReply: BrokerReply?
     @MainActor private(set) var registrationKeys: [Data] = []
     @MainActor private(set) var enrolmentKeys: [Data] = []
     @MainActor private(set) var polls = 0
@@ -30,13 +32,15 @@ private final class RecoveryClient: BrokerClient, Sendable {
 
     init(
         rejectsRegistration: Bool = false, suspension: Suspension? = nil,
-        vaultOutcome: VaultOutcome? = nil, pauseVault: Bool = false, build: BrokerBuildInfo? = nil
+        vaultOutcome: VaultOutcome? = nil, pauseVault: Bool = false, build: BrokerBuildInfo? = nil,
+        settingsReply: BrokerReply? = nil
     ) throws {
         self.rejectsRegistration = rejectsRegistration
         self.suspension = suspension
         self.vaultOutcome = vaultOutcome
         self.pauseVault = pauseVault
         self.build = build
+        self.settingsReply = settingsReply
         snapshot = try JSONDecoder().decode(
             SettingsSnapshot.self,
             from: Data(
@@ -70,7 +74,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
             registrationKeys.append(key)
             if rejectsRegistration { throw BrokerControlError.denied }
             return .settingsStatus(snapshot)
-        case .settingsStatus: return .settingsStatus(snapshot)
+        case .settingsStatus: return settingsReply ?? .settingsStatus(snapshot)
         case .vaultStatus:
             return .vaultStatus(synchronized ? syncedVault : vault)
         case .vaultLock, .vaultSync:
@@ -122,11 +126,54 @@ private final class RecoveryClient: BrokerClient, Sendable {
         Notification(name: NSApplication.didBecomeActiveNotification))
 }
 
-@MainActor private func eventually(_ condition: () -> Bool) async throws {
+@MainActor private func eventually(sourceLocation: SourceLocation = #_sourceLocation, _ condition: () -> Bool)
+    async throws
+{
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: .seconds(2))
     while !condition(), clock.now < deadline { try await clock.sleep(for: .milliseconds(10)) }
-    try #require(condition())
+    try #require(condition(), sourceLocation: sourceLocation)
+}
+
+@Test @MainActor func menuFollowsConnectionAndReconnectResults() async throws {
+    let client = try RecoveryClient()
+    defer { client.cancel() }
+    var attempts = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in },
+        openConnection: {
+            attempts += 1
+            if attempts == 1 { throw BrokerFailure.invalidCode }
+            return client
+        },
+        loadApprovalKey: { Data([1, 2, 3]) })
+    let host = NSHostingView(rootView: VStack { QuartermasterMenu(application: application) })
+    let window = NSWindow(
+        contentRect: NSRect(x: -10000, y: -10000, width: 500, height: 400), styleMask: [.borderless],
+        backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+    window.contentView = host
+    host.setFrameSize(NSSize(width: 500, height: 400))
+    host.layoutSubtreeIfNeeded()
+    window.orderFront(nil)
+    func rendered() throws -> Data {
+        host.layoutSubtreeIfNeeded()
+        let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        return try #require(bitmap.representation(using: .png, properties: [:]))
+    }
+    let disconnected = try rendered()
+    #expect(try rendered() == disconnected)
+    application.reconnect()
+    try await eventually { application.status.hasPrefix("Backend unavailable:") }
+    try await eventually { (try? rendered()) != disconnected }
+    let failed = try rendered()
+    application.reconnect()
+    try await eventually { client.polls > 0 }
+    #expect(application.status == "Connected")
+    try await eventually { (try? rendered()) != failed }
+    #expect(attempts == 2)
 }
 
 @Test(arguments: RecoveryClient.Suspension.allCases, [true, false]) @MainActor
@@ -196,6 +243,32 @@ func activationReRegistersAfterThePreviousTransportWasInvalidated(_ afterPolling
     approval.close()
 }
 
+@Test @MainActor func interruptedConnectionRecoversWithoutActivation() async throws {
+    let first = try RecoveryClient()
+    let second = try RecoveryClient()
+    var opens = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in },
+        openConnection: {
+            opens += 1
+            return opens == 1 ? first : second
+        },
+        loadApprovalKey: { Data([1, 2, 3]) })
+    defer { _ = application.applicationShouldTerminate(NSApplication.shared) }
+    application.reconnect()
+    try await eventually { first.polls > 0 }
+    let approval = InertApprovalWindow()
+    application.present(approval)
+    first.cancel()
+    try await eventually { second.polls > 0 }
+    #expect(opens == 2)
+    #expect(application.connectionFailure == nil)
+    #expect(second.registrationKeys.count == 1)
+    #expect(second.enrolmentKeys.count == 1)
+    #expect(approval.cancelled)
+    #expect(second.vaultOperations == 0)
+}
+
 @Test @MainActor func failedRegistrationCannotResumeApprovalPolling() async throws {
     let rejected = try RecoveryClient(rejectsRegistration: true)
     let application = BrokerApplication(
@@ -206,6 +279,122 @@ func activationReRegistersAfterThePreviousTransportWasInvalidated(_ afterPolling
     #expect(rejected.registrationKeys.count == 1)
     #expect(rejected.enrolmentKeys.isEmpty)
     #expect(rejected.polls == 0)
+    #expect(application.connectionFailure != nil)
+}
+
+@Test(arguments: ["invalid", "unavailable", "unconfigured"]) @MainActor
+func settingsInitializationMustSucceedBeforeHidingRecovery(_ state: String) async throws {
+    let snapshot = try JSONDecoder().decode(
+        SettingsSnapshot.self,
+        from: JSONSerialization.data(withJSONObject: [
+            "state": state, "revision": 0, "session": Data([1, 2, 3]).base64EncodedString(),
+        ]))
+    let client = try RecoveryClient(settingsReply: state == "invalid" ? .idle : .settingsStatus(snapshot))
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { client }, recoveryDelays: [],
+        loadApprovalKey: { Data([1, 2, 3]) })
+    defer { _ = application.applicationShouldTerminate(NSApplication.shared) }
+    application.reconnect()
+    if state == "unconfigured" {
+        try await eventually { application.connected }
+        #expect(application.connectionFailure == nil)
+        #expect(application.preferences.available)
+    } else {
+        try await eventually { application.connectionFailure != nil }
+        #expect(!application.connected)
+        #expect(!application.preferences.available)
+        #expect(client.polls == 0)
+    }
+}
+
+@Test @MainActor func recoveryStopsAfterItsBudgetAndManualRetryClearsTheFailure() async throws {
+    let client = try RecoveryClient()
+    var attempts = 0
+    var available = false
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in },
+        openConnection: {
+            attempts += 1
+            if !available { throw BrokerFailure.timeout }
+            return client
+        },
+        recoveryDelays: [.zero, .zero],
+        loadApprovalKey: { Data([1, 2, 3]) })
+    defer { _ = application.applicationShouldTerminate(NSApplication.shared) }
+    application.reconnect()
+    try await eventually { application.connectionFailure != nil }
+    #expect(attempts == 3)
+    #expect(!application.connected)
+    #expect(application.connectionFailure?.contains("did not respond") == true)
+    available = true
+    application.reconnect()
+    #expect(application.connectionFailure == nil)
+    try await eventually { client.polls > 0 }
+    #expect(attempts == 4)
+    #expect(application.connected)
+}
+
+@Test(arguments: [BrokerFailure.invalidCode, .invalidMessage]) @MainActor
+func identityAndProtocolFailuresDoNotRetry(_ failure: BrokerFailure) async throws {
+    var attempts = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in },
+        openConnection: {
+            attempts += 1
+            throw failure
+        },
+        recoveryDelays: [.zero, .zero])
+    defer { _ = application.applicationShouldTerminate(NSApplication.shared) }
+    application.reconnect()
+    try await eventually { application.connectionFailure != nil }
+    #expect(attempts == 1)
+}
+
+@Test @MainActor func aLateConnectionCannotReplaceTheSuccessfulRetry() async throws {
+    let obsolete = try RecoveryClient()
+    let current = try RecoveryClient()
+    var pending: CheckedContinuation<any BrokerClient, Never>?
+    var attempts = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in },
+        openConnection: {
+            attempts += 1
+            if attempts == 1 { return await withCheckedContinuation { pending = $0 } }
+            return current
+        },
+        loadApprovalKey: { Data([1, 2, 3]) })
+    defer {
+        _ = application.applicationShouldTerminate(NSApplication.shared)
+        pending?.resume(returning: obsolete)
+    }
+    application.reconnect()
+    try await eventually { pending != nil }
+    application.reconnect()
+    try await eventually { current.polls > 0 }
+    pending?.resume(returning: obsolete)
+    pending = nil
+    try await eventually { obsolete.disconnected }
+    #expect(obsolete.registrationKeys.isEmpty)
+    #expect(!current.disconnected)
+    #expect(application.connected)
+    #expect(attempts == 2)
+}
+
+@Test @MainActor func quittingDuringRecoveryCancelsTheScheduledRetry() async throws {
+    var attempts = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in },
+        openConnection: {
+            attempts += 1
+            throw BrokerFailure.disconnected
+        },
+        recoveryDelays: [.seconds(1)])
+    application.reconnect()
+    try await eventually { application.status.hasPrefix("Backend unavailable:") }
+    #expect(application.connectionFailure == nil)
+    _ = application.applicationShouldTerminate(NSApplication.shared)
+    try await Task.sleep(for: .milliseconds(1100))
+    #expect(attempts == 1)
 }
 
 @Test @MainActor func repeatedActivationKeepsOnePendingConnectionAttempt() async throws {
