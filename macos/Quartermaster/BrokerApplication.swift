@@ -26,6 +26,10 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     }
     private enum VaultAction { case lock, sync, unlock }
     @Published private(set) var status = "Disconnected"
+    let frontendBuild: BrokerBuildInfo? = Bundle.main.url(forResource: "BuildInfo", withExtension: "json")
+        .flatMap { try? Data(contentsOf: $0) }
+        .flatMap { try? JSONDecoder().decode(BrokerBuildInfo.self, from: $0) }
+    @Published private(set) var backendBuild: BrokerBuildInfo?
     @Published private(set) var readGrants: [ActiveReadGrant] = []
     @Published private(set) var refreshingGrants = false
     @Published private(set) var vaultStatus: BrokerVaultStatus?
@@ -95,6 +99,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         connectionPhase = .connecting
         preferences.connecting()
         status = "Starting Quartermaster…"
+        backendBuild = nil
         vaultStatus = nil
         vaultTask?.cancel()
         vaultActivity = .idle
@@ -108,9 +113,10 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 let connection = try await openConnection()
                 try Task.checkCancellation()
                 client = connection
-                guard case .hello("development") = try await connection.call(.hello) else {
+                guard case .hello("development", let build) = try await connection.call(.hello) else {
                     throw BrokerFailure.invalidMessage
                 }
+                backendBuild = build
                 let key = try loadApprovalKey()
                 guard case .settingsStatus = try await connection.call(.settingsRegister(publicKey: key)) else {
                     throw BrokerFailure.invalidMessage
@@ -140,6 +146,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 }
                 client?.cancel()
                 client = nil
+                backendBuild = nil
                 vaultStatus = nil
                 status = "Backend unavailable: \(error)"
                 connectionPhase = .disconnected

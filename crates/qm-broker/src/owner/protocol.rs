@@ -174,11 +174,21 @@ pub(super) struct VaultUnlockReview {
     pub(super) provider: super::settings::ProviderPin,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BuildInfo {
+    pub(super) revision: String,
+    pub(super) built_at: u64,
+    pub(super) modified: bool,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(super) enum Reply {
     Hello {
         profile: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        build: Option<BuildInfo>,
     },
     Enrolled,
     Idle,
@@ -375,6 +385,7 @@ mod tests {
             let reply = match fixture["kind"].as_str().unwrap() {
                 "hello" => Reply::Hello {
                     profile: "development",
+                    build: None,
                 },
                 "enrolled" => Reply::Enrolled,
                 "idle" => Reply::Idle,

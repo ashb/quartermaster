@@ -7,7 +7,7 @@ def _quartermaster_app_impl(ctx):
     archive = frontend[AppleBundleInfo].archive
     app = ctx.actions.declare_directory("Quartermaster.app")
     ctx.actions.run_shell(
-        inputs = [archive, ctx.executable.backend, ctx.file.backend_info, ctx.executable.cli],
+        inputs = [archive, ctx.executable.backend, ctx.file.backend_info, ctx.executable.cli, ctx.info_file, ctx.version_file],
         outputs = [app],
         arguments = [
             archive.path,
@@ -15,6 +15,8 @@ def _quartermaster_app_impl(ctx):
             ctx.file.backend_info.path,
             app.path,
             ctx.executable.cli.path,
+            ctx.info_file.path,
+            ctx.version_file.path,
         ],
         command = """
 set -eu
@@ -33,6 +35,11 @@ mkdir -p "$backend/Contents/MacOS"
 /usr/bin/install -m 755 "$2" "$backend/Contents/MacOS/quartermasterd"
 /usr/bin/install -m 644 "$3" "$backend/Contents/Info.plist"
 /usr/bin/install -m 755 "$5" "$4/Contents/MacOS/qm"
+revision=$(/usr/bin/awk '$1 == "STABLE_QM_REVISION" {print $2}' "$6")
+modified=$(/usr/bin/awk '$1 == "STABLE_QM_MODIFIED" {print $2}' "$6")
+built_at=$(/usr/bin/awk '$1 == "QM_BUILD_TIMESTAMP" {print $2}' "$7")
+mkdir -p "$4/Contents/Resources"
+printf '{"revision":"%s","modified":%s,"builtAt":%s}\\n' "$revision" "$modified" "$built_at" > "$4/Contents/Resources/BuildInfo.json"
 /usr/bin/codesign --remove-signature "$4"
 rm -rf "$4/Contents/_CodeSignature"
 """,

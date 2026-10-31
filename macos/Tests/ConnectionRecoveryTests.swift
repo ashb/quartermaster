@@ -18,6 +18,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
     private let rejectsRegistration: Bool
     private let suspension: Suspension?
     private let pauseVault: Bool
+    private let build: BrokerBuildInfo?
     @MainActor private(set) var registrationKeys: [Data] = []
     @MainActor private(set) var enrolmentKeys: [Data] = []
     @MainActor private(set) var polls = 0
@@ -29,12 +30,13 @@ private final class RecoveryClient: BrokerClient, Sendable {
 
     init(
         rejectsRegistration: Bool = false, suspension: Suspension? = nil,
-        vaultOutcome: VaultOutcome? = nil, pauseVault: Bool = false
+        vaultOutcome: VaultOutcome? = nil, pauseVault: Bool = false, build: BrokerBuildInfo? = nil
     ) throws {
         self.rejectsRegistration = rejectsRegistration
         self.suspension = suspension
         self.vaultOutcome = vaultOutcome
         self.pauseVault = pauseVault
+        self.build = build
         snapshot = try JSONDecoder().decode(
             SettingsSnapshot.self,
             from: Data(
@@ -63,7 +65,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
         guard !disconnected else { throw BrokerFailure.disconnected }
         #expect(context == nil)
         switch command {
-        case .hello: return .hello(profile: "development")
+        case .hello: return .hello(profile: "development", build: build)
         case .settingsRegister(let key):
             registrationKeys.append(key)
             if rejectsRegistration { throw BrokerControlError.denied }
@@ -147,7 +149,10 @@ private func cancelledControlCallsRejectLateReplies(_ suspension: RecoveryClient
 
 @Test(arguments: [true, false]) @MainActor
 func activationReRegistersAfterThePreviousTransportWasInvalidated(_ afterPollingStops: Bool) async throws {
-    let first = try RecoveryClient()
+    let build = try JSONDecoder().decode(
+        BrokerBuildInfo.self,
+        from: Data(#"{"revision":"a0b936c","builtAt":1793448000,"modified":true}"#.utf8))
+    let first = try RecoveryClient(build: build)
     let second = try RecoveryClient()
     defer {
         first.cancel()
@@ -165,13 +170,18 @@ func activationReRegistersAfterThePreviousTransportWasInvalidated(_ afterPolling
 
     activate(application)
     try await eventually { first.polls > 0 }
+    #expect(application.backendBuild == build)
     #expect(first.registrationKeys == [key])
     #expect(first.enrolmentKeys == [key])
     first.cancel()
-    if afterPollingStops { try await eventually { application.status.hasPrefix("Backend unavailable:") } }
+    if afterPollingStops {
+        try await eventually { application.status.hasPrefix("Backend unavailable:") }
+        #expect(application.backendBuild == nil)
+    }
 
     activate(application)
     try await eventually { second.polls > 0 }
+    #expect(application.backendBuild == nil)
     #expect(opens == 2)
     #expect(second.registrationKeys == [key])
     #expect(second.enrolmentKeys == [key])

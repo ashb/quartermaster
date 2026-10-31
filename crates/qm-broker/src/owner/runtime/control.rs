@@ -114,7 +114,10 @@ pub(super) fn handle(
         | Client::SettingsPresence { .. }
         | Client::SettingsProof { .. }
         | Client::SettingsCancel { .. } => Err(Error::Protocol(ControlError::Denied)),
-        Client::Hello {} => Ok(Reply::Hello { profile: PROFILE }),
+        Client::Hello {} => Ok(Reply::Hello {
+            profile: PROFILE,
+            build: state.build.clone(),
+        }),
         Client::Enroll { public_key } => {
             let key = BASE64.decode(public_key).map_err(Error::from)?;
             if state.ui.is_some() {
@@ -524,6 +527,24 @@ mod tests {
         sync::{Condvar, Mutex, mpsc},
         thread,
     };
+
+    #[test]
+    fn hello_reports_the_backends_startup_build_metadata() {
+        let mut state = OwnerState::new().unwrap();
+        let build = serde_json::json!({
+            "revision": "a0b936c", "builtAt": 1793448000_u64, "modified": true,
+        });
+        state.build = Some(serde_json::from_value(build.clone()).unwrap());
+        let reply = handle(
+            Client::Hello {},
+            &mut state,
+            &Err(crate::owner::policy::AuthorizationError::InvalidPolicy),
+        )
+        .unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&encode_reply(&reply).unwrap()).unwrap();
+        assert_eq!(wire["build"], build);
+    }
 
     #[test]
     fn root_selection_and_grant_listing_load_policy_over_native_ipc() {

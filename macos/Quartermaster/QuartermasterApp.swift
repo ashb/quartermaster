@@ -43,8 +43,29 @@ struct QuartermasterApp: App {
             Button("Lock vault") { application.vault(.vaultLock) }
             Button("Sync vault") { application.vault(.vaultSync) }
             Button("Reconnect", action: application.reconnect)
+            #if DEBUG
+                Divider()
+                BuildMenuItems(component: "App", build: application.frontendBuild)
+                BuildMenuItems(component: "Backend", build: application.backendBuild)
+            #endif
             Divider()
             Button("Quit Quartermaster") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
+        }
+    }
+}
+
+private struct BuildMenuItems: View {
+    let component: String
+    let build: BrokerBuildInfo?
+
+    var body: some View {
+        if let build {
+            Text("\(component): \(build.revision)\(build.modified ? " (modified)" : "")")
+            Text(
+                "Built \(Date(timeIntervalSince1970: TimeInterval(build.builtAt)).formatted(date: .abbreviated, time: .standard))"
+            )
+        } else {
+            Text("\(component) build: unavailable")
         }
     }
 }

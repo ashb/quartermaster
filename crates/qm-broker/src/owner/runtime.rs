@@ -139,6 +139,9 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let mut state = OwnerState::for_service()?;
+    state.build = fs::read(paths.app.join("Contents/Resources/BuildInfo.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     match paths.settings.as_ref().map(|store| store.load()) {
         Some(Ok(Some(manager))) => {
             state.approval_public_key = Some(manager.record().public_key().to_vec());

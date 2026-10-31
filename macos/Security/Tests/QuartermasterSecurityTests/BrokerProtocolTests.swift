@@ -3,6 +3,27 @@ import Testing
 
 @testable import QuartermasterSecurity
 
+@Test
+func helloReportsBuildAndAcceptsOlderBackendsWithoutMetadata() throws {
+    let reply = try BrokerReply.decodeSuccess(
+        Data(
+            #"{"kind":"hello","profile":"development","build":{"revision":"a0b936c","builtAt":1793448000,"modified":true}}"#
+                .utf8))
+    guard case .hello("development", let build) = reply else {
+        Issue.record("Expected backend hello")
+        return
+    }
+    #expect(build?.revision == "a0b936c")
+    #expect(build?.builtAt == 1_793_448_000)
+    #expect(build?.modified == true)
+    let legacy = try BrokerReply.decodeSuccess(Data(#"{"kind":"hello","profile":"development"}"#.utf8))
+    guard case .hello("development", let missing) = legacy else {
+        Issue.record("Expected legacy backend hello")
+        return
+    }
+    #expect(missing == nil)
+}
+
 @Test(arguments: [
     #"{"kind":"unknown"}"#,
     #"{"kind":"hello"}"#,
@@ -67,7 +88,7 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
         let reply = try decoder.decode(BrokerReply.self, from: bytes)
         let kind: String
         switch reply {
-        case .hello(let profile):
+        case .hello(let profile, _):
             kind = "hello"
             #expect(profile == "development")
         case .enrolled: kind = "enrolled"

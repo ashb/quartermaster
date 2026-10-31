@@ -197,8 +197,14 @@ public struct BrokerVaultStatus: Decodable, Sendable {
     public let observation: Observation?
 }
 
+public struct BrokerBuildInfo: Decodable, Equatable, Sendable {
+    public let revision: String
+    public let builtAt: UInt64
+    public let modified: Bool
+}
+
 public enum BrokerReply: Decodable, Sendable {
-    case hello(profile: String)
+    case hello(profile: String, build: BrokerBuildInfo? = nil)
     case enrolled
     case idle
     case review(ApprovalReview)
@@ -234,13 +240,16 @@ public enum BrokerReply: Decodable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, profile, approval, authorization, code, settings, review, ticket, provider, revision, grants
+        case kind, profile, build, approval, authorization, code, settings, review, ticket, provider, revision, grants
     }
 
     public init(from decoder: any Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
         switch try fields.decode(Kind.self, forKey: .kind) {
-        case .hello: self = .hello(profile: try fields.decode(String.self, forKey: .profile))
+        case .hello:
+            self = .hello(
+                profile: try fields.decode(String.self, forKey: .profile),
+                build: try fields.decodeIfPresent(BrokerBuildInfo.self, forKey: .build))
         case .enrolled: self = .enrolled
         case .idle: self = .idle
         case .review: self = .review(try fields.decode(ApprovalReview.self, forKey: .approval))

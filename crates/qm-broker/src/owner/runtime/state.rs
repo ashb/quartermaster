@@ -28,6 +28,7 @@ type ConsoleCapture =
     Box<dyn FnMut() -> Result<ConsoleObservation, qm_macos::console_session::Error> + Send>;
 
 pub(super) struct OwnerState {
+    pub(super) build: Option<crate::owner::protocol::BuildInfo>,
     pub(super) administration: super::settings::Administration,
     pub(super) ui: Option<UiSession>,
     pub(super) frontend_requirement: Option<String>,
@@ -72,6 +73,7 @@ impl OwnerState {
 
     fn with_console(console_capture: Option<ConsoleCapture>, interactive: bool) -> Result<Self> {
         Ok(Self {
+            build: None,
             administration: super::settings::Administration::default(),
             ui: None,
             frontend_requirement: None,
