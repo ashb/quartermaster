@@ -5,6 +5,7 @@ load("@gazelle//:def.bzl", "gazelle", "gazelle_binary")
 # gazelle:rust_cargo_lockfile Cargo.lock
 # gazelle:rust_crates_prefix @crates//:
 # gazelle:resolve swift QuartermasterIPC //macos/Security/Sources/QuartermasterIPC:QuartermasterIPC
+# gazelle:resolve swift Luminare @luminare//:Luminare
 
 exports_files([
     "Cargo.toml",

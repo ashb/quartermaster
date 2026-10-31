@@ -23,6 +23,11 @@ public struct EnrollmentDraft: Equatable, Sendable {
 
 @MainActor
 public final class SettingsEditor: ObservableObject {
+    public enum VaultLoginState: Equatable {
+        case idle, loggingIn, ready
+        case failed(String)
+    }
+    private enum Action { case change, vaultLogin }
     private enum Selection {
         case keep, forget
         case staged(ticket: String, provider: SettingsProvider)
@@ -40,7 +45,7 @@ public final class SettingsEditor: ObservableObject {
         case unverifiedEnrollment, noChanges
         public var errorDescription: String? {
             switch self {
-            case .unverifiedEnrollment: "Enrolment details changed. Verify Vault before reviewing changes."
+            case .unverifiedEnrollment: "Vault details changed. Log in again before reviewing changes."
             case .noChanges: "There are no changes to review."
             }
         }
@@ -59,6 +64,7 @@ public final class SettingsEditor: ObservableObject {
     @Published public private(set) var snapshot: SettingsSnapshot?
     @Published private var selection: Selection = .keep
     @Published public private(set) var busy = false
+    @Published public private(set) var vaultLoginState = VaultLoginState.idle
     @Published public private(set) var message = "Connecting to Quartermaster…"
     private let call: @MainActor (BrokerCommand) async throws -> BrokerReply
     private var generation = UUID()
@@ -67,6 +73,16 @@ public final class SettingsEditor: ObservableObject {
 
     public var available: Bool {
         snapshot?.session != nil && ["configured", "unconfigured", "migrationRequired"].contains(snapshot?.state ?? "")
+    }
+
+    public var isLoggingIn: Bool { vaultLoginState == .loggingIn }
+    public var vaultLoginError: String? {
+        if case .failed(let error) = vaultLoginState { return error }
+        return nil
+    }
+
+    public func clearVaultLoginError() {
+        if case .failed = vaultLoginState { vaultLoginState = .idle }
     }
 
     public var enrollmentNeedsVerification: Bool {
@@ -99,6 +115,14 @@ public final class SettingsEditor: ObservableObject {
         !busy && (hasChanges || enrollment != EnrollmentDraft(provider: snapshot?.provider))
     }
 
+    public var githubEnabled: Bool {
+        get { draft.github?.enabled == true }
+        set {
+            if draft.github == nil && newValue { draft.github = GitHubSettings() }
+            draft.github?.enabled = newValue
+        }
+    }
+
     public func load() async {
         await perform {
             let generation = generation
@@ -111,14 +135,15 @@ public final class SettingsEditor: ObservableObject {
                 ? "Protected settings are unavailable. Reconnect to retry."
                 : snapshot.migration != nil
                     ? "Import your previous settings or discard them before configuring Quartermaster."
-                    : "Changes take effect only after you review and approve them with Touch ID."
+                    : ""
         }
     }
 
-    public func enroll(password: String) async {
-        await perform {
+    public func enroll(password: String, replacement: EnrollmentDraft? = nil) async {
+        await perform(.vaultLogin) {
             guard available else { throw BrokerControlError.unavailable }
-            let inputs = enrollment.normalized
+            let original = enrollment.normalized
+            let inputs = (replacement ?? enrollment).normalized
             let generation = generation
             selection = .keep
             guard
@@ -131,9 +156,11 @@ public final class SettingsEditor: ObservableObject {
                 _ = try? await call(.settingsCancel(id: nil))
                 throw CancellationError()
             }
-            guard enrollment.normalized == inputs else { throw Failure.unverifiedEnrollment }
+            guard enrollment.normalized == original else { throw Failure.unverifiedEnrollment }
+            enrollment = inputs
             selection = .staged(ticket: ticket, provider: provider)
-            message = "Vault verified. Review and approve to select this enrolment."
+            message = ""
+            vaultLoginState = .ready
         }
     }
 
@@ -193,13 +220,14 @@ public final class SettingsEditor: ObservableObject {
 
     public func discardDraft() {
         generation = UUID()
+        vaultLoginState = .idle
         draft = snapshot?.settings ?? BrokerSettings()
         enrollment = EnrollmentDraft(provider: snapshot?.provider)
         selection = .keep
         pendingRepositories = []
         message =
             snapshot?.migration == nil
-            ? "Changes discarded." : "Import postponed. Your previous settings are unchanged."
+            ? "" : "Import postponed. Your previous settings are unchanged."
     }
 
     public func cancel() async {
@@ -274,6 +302,7 @@ public final class SettingsEditor: ObservableObject {
 
     private func invalidateSession() {
         generation = UUID()
+        vaultLoginState = .idle
         if let snapshot {
             self.snapshot = SettingsSnapshot(
                 state: "unavailable", revision: snapshot.revision, session: nil,
@@ -281,13 +310,33 @@ public final class SettingsEditor: ObservableObject {
         }
     }
 
-    private func perform(_ operation: () async throws -> Void) async {
+    private func perform(_ action: Action = .change, operation: () async throws -> Void) async {
         guard !busy else { return }
         busy = true
+        if action == .vaultLogin {
+            vaultLoginState = .loggingIn
+            message = ""
+        }
         let generation = generation
-        defer { busy = false }
+        defer {
+            busy = false
+            if vaultLoginState == .loggingIn { vaultLoginState = .idle }
+        }
         do { try await operation() } catch is CancellationError {} catch {
-            if generation == self.generation { report(error) }
+            if generation == self.generation {
+                switch action {
+                case .change: report(error)
+                case .vaultLogin:
+                    let detail: String
+                    switch error as? BrokerControlError {
+                    case .denied:
+                        detail = "Could not log in. Quartermaster refused the request; reconnect and try again."
+                    default:
+                        detail = "Could not log in to the vault. Check the server and account details, then try again."
+                    }
+                    vaultLoginState = .failed(detail)
+                }
+            }
         }
     }
 }

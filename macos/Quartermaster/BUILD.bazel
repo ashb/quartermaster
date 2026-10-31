@@ -20,6 +20,7 @@ swift_library(
         "PreferencesWindowLifecycle.swift",
         "QuartermasterApp.swift",
         "SettingsMigrationView.swift",
+        "VaultLoginForm.swift",
     ],
     copts = [
         "-swift-version",
@@ -30,5 +31,6 @@ swift_library(
         "//macos/ApprovalUI:QuartermasterApprovalUI",
         "//macos/Security/Sources/QuartermasterIPC",
         "//macos/Security/Sources/QuartermasterSecurity",
+        "@luminare//:Luminare",
     ],
 )

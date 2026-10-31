@@ -51,6 +51,33 @@ register_toolchains("@rust_toolchains//:all")
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 
+http_archive(
+    name = "luminare",
+    build_file = "//build:luminare.BUILD.bazel",
+    sha256 = "da2d674c340b6e6cd4618e1bc03dc22d797b1da85a6ab9f3b8ddee3f2e38e80a",
+    strip_prefix = "Luminare-7958d31278ad054abf0a7cf19e5ae700399a812f",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/MrKai77/Luminare/tar.gz/7958d31278ad054abf0a7cf19e5ae700399a812f"],
+)
+
+http_archive(
+    name = "variadic_views",
+    build_file = "//build:variadic_views.BUILD.bazel",
+    sha256 = "abd44d931d70c1183055649bee64e81ec464ad11a2b11a415bb3447dfbd1e8f5",
+    strip_prefix = "swiftui-variadic-views-af67d0e85bd2b499fbfb4cda834117e7c52b12b0",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/lorenzofiamingo/swiftui-variadic-views/tar.gz/af67d0e85bd2b499fbfb4cda834117e7c52b12b0"],
+)
+
+http_archive(
+    name = "swiftui_introspect",
+    build_file = "//build:swiftui_introspect.BUILD.bazel",
+    sha256 = "ba527fe6e55f4242a37de5bb03f8f9cf342f4c52d14ab4e591451ab321d9f667",
+    strip_prefix = "swiftui-introspect-807f73ce09a9b9723f12385e592b4e0aaebd3336",
+    type = "tar.gz",
+    urls = ["https://codeload.github.com/siteline/swiftui-introspect/tar.gz/807f73ce09a9b9723f12385e592b4e0aaebd3336"],
+)
+
 http_file(
     name = "github_rest_schema",
     dev_dependency = True,

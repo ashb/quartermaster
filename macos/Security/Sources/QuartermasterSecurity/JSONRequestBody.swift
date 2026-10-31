@@ -25,16 +25,14 @@ enum JSONRequestBody {
     }
 
     static func readable(_ data: Data) -> String? {
-        guard String(data: data, encoding: .utf8) != nil, let tokens = tokenize(data),
-            (try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)) != nil
-        else { return nil }
+        guard let tokens = validatedTokens(data) else { return nil }
         guard tokens.first?.mark == 123, tokens.count > 2 else { return pretty(tokens[...]) }
         var fields: [String] = []
         var index = 1
         while index < tokens.count - 1 {
             guard case .string(let key, let name) = tokens[index],
                 index + 2 < tokens.count,
-                let end = valueEnd(tokens, from: index + 2)
+                let end = valueEnd(tokens[...], from: index + 2)
             else { return nil }
             let value = tokens[(index + 2)..<end]
             let text: String
@@ -43,7 +41,7 @@ enum JSONRequestBody {
                 case .string(_, let query) = value.first, !query.isEmpty
             {
                 label = "\(key) (decoded string)"
-                text = query
+                text = GraphQLDisplayFormat.readable(query) ?? query
             } else {
                 guard let formatted = pretty(value) else { return nil }
                 label = key
@@ -56,10 +54,58 @@ enum JSONRequestBody {
         return text.utf8.count <= BrokerLimits.reviewBytes ? text : nil
     }
 
-    private static func valueEnd(_ tokens: [Token], from start: Int) -> Int? {
+    static func graphQLSummary(_ data: Data) -> String? {
+        guard let tokens = validatedTokens(data), let fields = objectFields(tokens[...]),
+            let query = fields.first(where: { $0.0 == "query" })?.1,
+            query.count == 1, case .string(_, let source) = query.first
+        else { return nil }
+        var operationName: String?
+        if let value = fields.first(where: { $0.0 == "operationName" })?.1 {
+            guard value.count == 1 else { return nil }
+            switch value.first {
+            case .string(_, let name): operationName = name
+            case .atom("null"): break
+            default: return nil
+            }
+        }
+        guard let operation = GraphQLDisplayFormat.operationSummary(source, operationName: operationName) else {
+            return nil
+        }
+        guard let variables = fields.first(where: { $0.0 == "variables" })?.1,
+            let parameters = objectFields(variables), !parameters.isEmpty
+        else { return operation }
+        let preview = parameters.prefix(3).map { name, value in
+            name + ": " + value.map(\.raw).joined()
+        }.joined(separator: ", ")
+        return operation + " · " + preview + (parameters.count > 3 ? ", …" : "")
+    }
+
+    private static func validatedTokens(_ data: Data) -> [Token]? {
+        guard data.count <= BrokerLimits.reviewBytes, String(data: data, encoding: .utf8) != nil,
+            let tokens = tokenize(data),
+            (try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)) != nil
+        else { return nil }
+        return tokens
+    }
+
+    private static func objectFields(_ tokens: ArraySlice<Token>) -> [(String, ArraySlice<Token>)]? {
+        guard tokens.first?.mark == 123, tokens.last?.mark == 125 else { return nil }
+        var fields: [(String, ArraySlice<Token>)] = []
+        var index = tokens.startIndex + 1
+        while index < tokens.endIndex - 1 {
+            guard case .string(_, let name) = tokens[index], index + 2 < tokens.endIndex,
+                let end = valueEnd(tokens, from: index + 2)
+            else { return nil }
+            fields.append((name, tokens[(index + 2)..<end]))
+            index = end + 1
+        }
+        return fields
+    }
+
+    private static func valueEnd(_ tokens: ArraySlice<Token>, from start: Int) -> Int? {
         guard tokens[start].mark == 123 || tokens[start].mark == 91 else { return start + 1 }
         var depth = 0
-        for index in start..<tokens.count {
+        for index in start..<tokens.endIndex {
             switch tokens[index].mark {
             case 123, 91: depth += 1
             case 125, 93:

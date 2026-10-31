@@ -79,6 +79,23 @@ private func approvalPresentation(
     #expect(presentation.ancestryNotice == nil)
 }
 
+@Test func callerDetailsShowCapturedStartTimesAndExplicitlyMarkUnavailableAncestors() throws {
+    let base = try approvalPresentation(ancestryComplete: false)
+    var request = base.request
+    request.peer = try JSONDecoder().decode(
+        DialogPeer.self,
+        from: Data(
+            #"{"pid":30,"executable":"/bin/gh","signingIdentifier":"gh","cdHash":"dummy","adHoc":true,"ancestryComplete":false,"startedUnixMicros":1700000000123456,"processes":[{"pid":20,"name":"login","executable":"/usr/bin/login","limited":true},{"pid":30,"name":"gh","executable":"/bin/gh","limited":false,"startedUnixMicros":1700000000123456}]}"#
+                .utf8))
+    let presentation = ApprovalPresentation(request: request, provider: base.provider, display: base.display)
+    #expect(request.peer?.startedUnixMicros == 1_700_000_000_123_456)
+    #expect(request.peer?.processes?.last?.startedUnixMicros == 1_700_000_000_123_456)
+    #expect(presentation.callerDetails.contains("/usr/bin/login\nStarted: Unavailable"))
+    #expect(!presentation.callerDetails.contains("Started\nUnavailable"))
+    #expect(presentation.callerDetails.contains("2023"))
+    #expect(presentation.fullDetails.contains(presentation.callerDetails))
+}
+
 @Test func processRootIsSelectableWithoutReplacingItWithSingleRequestApproval() throws {
     let roots = try JSONDecoder().decode(
         [ReadRootChoice].self,
@@ -100,7 +117,7 @@ private func approvalPresentation(
         from: Data(
             #"{"id":"20:0000000000000001:00000001","pid":20,"executable":"/bin/zsh","scope":"descendants"}"#.utf8))
     let processes = [
-        DialogProcess(pid: 10, name: "login", executable: "/usr/bin/login", limited: true),
+        DialogProcess(pid: 10, name: "rex", executable: "/Applications/Rex.app/Contents/MacOS/rex", limited: true),
         DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false),
         DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false),
     ]
@@ -108,7 +125,7 @@ private func approvalPresentation(
     #expect(rows.map(\.choice) == [nil, .root(root.id), .request])
     #expect(rows.map(\.label) == ["", "This shell", "This request"])
     #expect(rows[0].help.contains("Limited process information."))
-    #expect(rows[0].help.contains("/usr/bin/login"))
+    #expect(rows[0].help.contains("/Applications/Rex.app/Contents/MacOS/rex"))
     #expect(!rows[1].help.contains("Limited process information."))
     for process in [
         DialogProcess(pid: 20, name: "zsh", executable: "/other/zsh", limited: false),
@@ -124,24 +141,62 @@ private func approvalPresentation(
         })
 }
 
-@Test @MainActor func deepProcessTreesScrollWithoutGrowingTheDialog() {
-    func tree(count: UInt32) -> NSHostingView<some View> {
+@MainActor private func waitForHeight(_ height: CGFloat, in host: NSView) async throws {
+    for _ in 0..<50 {
+        host.layoutSubtreeIfNeeded()
+        if abs(host.fittingSize.height - height) < 0.5 { return }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+@Test @MainActor func processTreeFitsShortAncestryAndCapsLongAncestry() async throws {
+    func tree(count: UInt32) -> some View {
         let processes = (1...count).map {
             DialogProcess(pid: $0, name: "zsh", executable: "/bin/zsh", limited: false)
         }
-        return NSHostingView(
-            rootView: ProcessScopeTree(
-                rows: ProcessTreeRow.make(processes: processes, peerPID: count, roots: [], allowsSelection: true),
-                selection: .request, enabled: true, choose: { _ in }
-            ).frame(width: 492))
+        return ProcessScopeTree(
+            rows: ProcessTreeRow.make(processes: processes, peerPID: count, roots: [], allowsSelection: true),
+            selection: .request, enabled: true, choose: { _ in }
+        ).frame(width: 492)
     }
-    #expect(tree(count: 4).fittingSize == tree(count: 32).fittingSize)
+    let host = NSHostingView(rootView: tree(count: 3))
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 492, height: 148),
+        styleMask: [], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = host
+    defer { window.close() }
+    for (count, expected): (UInt32, CGFloat) in [(3, 108), (32, 148), (1, 32)] {
+        host.rootView = tree(count: count)
+        try await waitForHeight(expected, in: host)
+        #expect(abs(host.fittingSize.height - expected) < 0.5)
+    }
+}
+
+@Test @MainActor func scrollViewportTracksContentGrowthAndShrinkageUpToItsLimit() async throws {
+    func view(height: CGFloat) -> some View {
+        ContentSizedScrollView(maxHeight: 148) {
+            Color.clear.frame(height: height)
+        }.frame(width: 492)
+    }
+    let host = NSHostingView(rootView: view(height: 70))
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 492, height: 148),
+        styleMask: [], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = host
+    defer { window.close() }
+    for (content, expected): (CGFloat, CGFloat) in [(70, 70), (260, 148), (36, 36)] {
+        host.rootView = view(height: content)
+        try await waitForHeight(expected, in: host)
+        #expect(abs(host.fittingSize.height - expected) < 0.5)
+    }
 }
 
 @Test func perRequestTreesDoNotDescribeProcessesAsIneligibleForGrants() {
     let rows = ProcessTreeRow.make(
         processes: [
-            DialogProcess(pid: 10, name: "login", executable: "/usr/bin/login", limited: true),
+            DialogProcess(pid: 10, name: "rex", executable: "/Applications/Rex.app/Contents/MacOS/rex", limited: true),
             DialogProcess(pid: 20, name: "zsh", executable: "/bin/zsh", limited: false),
             DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false),
         ], peerPID: 30, roots: [], allowsSelection: false)
@@ -171,11 +226,48 @@ private func approvalPresentation(
 
 @MainActor private final class ScopeReviewBackend: ApprovalBackend {
     let reviewCreated = MonotonicTimestamp.now
+    var cancellations = 0
     func challenge(authenticated: MonotonicTimestamp, context: LAContext) async throws -> Data {
         throw CancellationError()
     }
     func submit(_ signature: Data) async throws { throw CancellationError() }
-    func cancel() {}
+    func cancel() { cancellations += 1 }
+}
+
+@Test @MainActor func rejectedScopeChangeLeavesAnExplanationInsteadOfClosingTheDialog() async throws {
+    let backend = ScopeReviewBackend()
+    let dialog = ApprovalDialog(
+        presentation: try approvalPresentation(read: true), backend: backend,
+        selectRoot: { _ in throw CancellationError() })
+    var closed = false
+    dialog.onClose = { closed = true }
+
+    await dialog.choose("process")
+
+    #expect(!closed)
+    #expect(dialog.controller.phase == .stopped)
+    #expect(dialog.controller.detail == "Could not change approval scope. Run the command again.")
+    #expect(!dialog.controller.canChangeScope)
+    #expect(backend.cancellations == 1)
+    dialog.cancel()
+}
+
+@Test @MainActor func stoppedApprovalIgnoresScopeChanges() async throws {
+    var selections = 0
+    let presentation = try approvalPresentation(read: true)
+    let dialog = ApprovalDialog(
+        presentation: presentation, backend: ScopeReviewBackend(),
+        selectRoot: { _ in
+            selections += 1
+            return presentation
+        })
+    dialog.controller.cancel()
+    let detail = dialog.controller.detail
+    await dialog.choose("process")
+    #expect(selections == 0)
+    #expect(dialog.controller.phase == .stopped)
+    #expect(dialog.controller.detail == detail)
+    dialog.cancel()
 }
 
 @Test @MainActor func refreshingTheScopePreservesTheHostingView() throws {
@@ -325,6 +417,12 @@ func typedReadScopesRenderOnlyTheirSelectedDescriptions(
     #expect(grant.summary.contains(summary))
     #expect(grant.summary.contains("logs") == categories.contains("output"))
     #expect(grant.scopeName == name)
+    #expect(presentation.scopeDetails.contains("Permission: \(name)"))
+    #expect(presentation.scopeDetails.contains("Root: zsh · PID 123"))
+    #expect(presentation.fullDetails.contains(grant.summary))
+    #expect(presentation.fullDetails.contains("Item: dummy"))
+    #expect(grant.permission.compactSummary.contains("build output") == categories.contains("output"))
+    #expect(grant.permission.compactSummary.contains("Writes need separate approval."))
     #expect(presentation.authenticationReason == "\(title) in example/project")
 }
 
@@ -343,4 +441,93 @@ func grantDescriptionDistinguishesProcessFromShellLifetime(_ scope: String) thro
     #expect(grant.summary.contains("shell's descendants") == (scope == "descendants"))
     #expect(grant.summary.contains("Writes need separate approval"))
     #expect(grant.lifetimeDescription.contains(scope == "process" ? "process exits" : "shell exits"))
+}
+
+@Test(arguments: ["/usr/bin/login", "/Applications/Quartermaster.app/Contents/MacOS/qm"])
+func intermediaryProcessesAreHiddenUnlessTheyAreThePeerOrAGrantRoot(_ intermediary: String) throws {
+    let shim = "/Applications/Quartermaster.app/Contents/MacOS/qm"
+    let name = URL(fileURLWithPath: intermediary).lastPathComponent
+    let processes = [
+        DialogProcess(pid: 10, name: name, executable: "/other/\(name)", limited: false),
+        DialogProcess(pid: 20, name: name, executable: intermediary, limited: false),
+        DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false),
+    ]
+    let rows = ProcessTreeRow.make(
+        processes: processes, peerPID: 30, roots: [], allowsSelection: true, shimExecutable: shim)
+    #expect(rows.map(\.id) == [10, 30])
+    #expect(
+        ProcessTreeRow.make(
+            processes: processes, peerPID: 20, roots: [], allowsSelection: true, shimExecutable: shim
+        ).map(\.id) == [10, 20, 30])
+    let root = try JSONDecoder().decode(
+        ReadRootChoice.self,
+        from: JSONSerialization.data(withJSONObject: [
+            "id": "root", "pid": 20, "executable": intermediary, "scope": "process",
+        ]))
+    #expect(
+        ProcessTreeRow.make(
+            processes: processes, peerPID: 30, roots: [root], allowsSelection: true, shimExecutable: shim
+        ).map(\.id) == [10, 20, 30])
+}
+
+@Test(arguments: [true, false])
+func loginIsHiddenFromTheCompactTreeButRetainedInFullAncestry(_ allowsSelection: Bool) throws {
+    let presentation = try approvalPresentation(ancestryComplete: false)
+    var request = presentation.request
+    let processes = [
+        DialogProcess(pid: 10, name: "rex", executable: "/Applications/Rex.app/Contents/MacOS/rex", limited: true),
+        DialogProcess(pid: 20, name: "login", executable: "/usr/bin/login", limited: true),
+        DialogProcess(pid: 25, name: "zsh", executable: "/bin/zsh", limited: false),
+        DialogProcess(pid: 30, name: "gh", executable: "/bin/gh", limited: false),
+    ]
+    request.peer?.processes = processes
+    let details = ApprovalPresentation(request: request, provider: presentation.provider, display: presentation.display)
+    let rows = ProcessTreeRow.make(processes: processes, peerPID: 30, roots: [], allowsSelection: allowsSelection)
+    #expect(rows.map(\.id) == [10, 25, 30])
+    #expect(details.callerDetails.contains("login · PID 20 · limited information\n/usr/bin/login"))
+    #expect(details.fullDetails.contains("login · PID 20 · limited information\n/usr/bin/login"))
+}
+
+@Test func incompleteRequestsNeverAcquireAReadOnlyBadgeFromTheirCommand() throws {
+    let presentation = try approvalPresentation(intent: ["kind": "request"], notice: "incompleteRequest")
+    #expect(!presentation.isReadOnly)
+    #expect(presentation.accessLabel == "Review request")
+    #expect(presentation.fullDetails.contains(presentation.understandingNotice!))
+    #expect(presentation.fullDetails.contains("Item: dummy"))
+    #expect(presentation.fullDetails.contains("PATCH https://example.invalid/unfamiliar"))
+}
+
+@Test @MainActor func approvalWindowFloatsWithoutTitlebarControls() throws {
+    let dialog = ApprovalDialog(presentation: try approvalPresentation(), backend: ScopeReviewBackend())
+    #expect(dialog.window.level == .floating)
+    #expect(dialog.window.standardWindowButton(.closeButton)?.isHidden != false)
+    #expect(!dialog.window.hidesOnDeactivate)
+    dialog.cancel()
+}
+
+@Test @MainActor func settingsReviewIncludesTheFingerprintWithoutAnExtraSaveStep() throws {
+    let record: [String: Any] = [
+        "version": 1, "profile": "development", "revision": 1, "publicKey": [1],
+        "settings": ["mutations": "deny"], "provider": NSNull(),
+    ]
+    let bytes = try JSONSerialization.data(withJSONObject: [
+        "version": "quartermaster.settings-review.v1", "previous": record, "proposed": record,
+    ])
+    let document = try JSONDecoder().decode(SettingsDocument.self, from: bytes)
+    let review = try JSONDecoder().decode(
+        SettingsReview.self,
+        from: JSONSerialization.data(withJSONObject: [
+            "id": "review", "created": 1, "session": "AQ==", "nonce": "AQ==", "revision": 1,
+            "document": bytes.base64EncodedString(), "digest": "AQ==", "approvalKey": "AQ==",
+        ]))
+    let dialog = SettingsApprovalDialog(review: review, document: document, backend: ScopeReviewBackend())
+    defer { dialog.cancel() }
+    let content = try #require(dialog.window.contentView)
+    content.layoutSubtreeIfNeeded()
+    func containsFingerprint(_ view: NSView) -> Bool {
+        view is EmbeddedAuthenticationHost || view.subviews.contains(where: containsFingerprint)
+    }
+    #expect(!dialog.window.isVisible)
+    #expect(containsFingerprint(content))
+    #expect(dialog.controller.phase == .review)
 }

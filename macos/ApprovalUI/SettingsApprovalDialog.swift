@@ -1,4 +1,5 @@
 import AppKit
+import Luminare
 import QuartermasterSecurity
 import SwiftUI
 
@@ -8,7 +9,6 @@ private struct SettingsApprovalView: View {
     let migration: SettingsMigrationAction?
     @ObservedObject var controller: ApprovalController
     let close: () -> Void
-    @State private var saving = false
     private var importing: Bool { migration == .importSettings }
     private var discarding: Bool { migration == .discard }
 
@@ -43,8 +43,8 @@ private struct SettingsApprovalView: View {
                         }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding()
-            }.frame(height: 330).background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
-            Text("This selects the vault and rules. API requests still require their own applicable authorization.")
+            }.frame(height: 330).luminareSurface()
+            Text("This selects the vault and rules. API requests still require their own applicable authorisation.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button(controller.phase == .stopped ? "Close" : "Cancel") {
@@ -53,22 +53,18 @@ private struct SettingsApprovalView: View {
                 }
                 .keyboardShortcut(.cancelAction)
                 Spacer()
-                if saving {
-                    Text(controller.detail.isEmpty ? "Save with Touch ID" : controller.detail).font(.callout)
-                    EmbeddedAuthentication(
-                        context: controller.context, onVisible: { Task { await controller.approve() } }
-                    )
-                    .frame(width: 32, height: 32)
-                } else {
-                    Button(importing ? "Import and Trust" : discarding ? "Discard and Start Afresh" : "Save Changes") {
-                        saving = true
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(controller.phase != .review)
-                }
+                Text(controller.detail.isEmpty ? "Save with Touch ID" : controller.detail).font(.callout)
+                EmbeddedAuthentication(
+                    context: controller.context, onVisible: { Task { await controller.approve() } }
+                )
+                .frame(width: 32, height: 32)
             }
         }
         .padding(24).frame(width: 600)
+        .buttonStyle(CompactButtonStyle())
+        .luminareTint(overridingWith: ApprovalAppearance.accent)
+        .luminareCornerRadius(12)
+        .luminareMinHeight(28)
         .onChange(of: controller.phase) { _, phase in if phase == .approved { close() } }
     }
 
@@ -86,7 +82,9 @@ private struct SettingsApprovalView: View {
                 Text("No vault selected")
             }
             if let github = record.settings?.github {
-                Text("GitHub enabled · \(github.repositories.count + additions.count) repositories")
+                Text(
+                    "GitHub \(github.enabled ? "enabled" : "disabled") · \(github.repositories.count + additions.count) repositories"
+                )
                 ForEach(github.repositories) { repo in
                     Text(verbatim: "\(repo.owner)/\(repo.name)").font(.caption.monospaced())
                 }
@@ -103,9 +101,14 @@ private struct SettingsApprovalView: View {
             }
             Text(
                 record.settings?.mutations == .deny
-                    ? "Recognized mutations: denied" : "Recognized mutations: fingerprint per use")
+                    ? "Recognised writes: denied" : "Recognised writes: fingerprint per use")
         }.textSelection(.enabled)
     }
+}
+
+@MainActor private final class SettingsDialogDismissal {
+    weak var window: NSWindow?
+    func close() { window?.performClose(nil) }
 }
 
 @MainActor
@@ -118,16 +121,21 @@ public final class SettingsApprovalDialog: NSObject, NSWindowDelegate, ApprovalW
         review: SettingsReview, document: SettingsDocument, backend: any ApprovalBackend,
         migration: SettingsMigrationAction? = nil
     ) {
-        controller = ApprovalController(
+        let controller = ApprovalController(
             backend: backend,
             reason: migration == .importSettings
                 ? "import and trust these Quartermaster settings"
                 : migration == .discard
                     ? "discard these previous Quartermaster settings"
                     : "approve these Quartermaster preferences")
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 648, height: 530), styleMask: [.titled, .closable],
-            backing: .buffered, defer: false)
+        self.controller = controller
+        let dismissal = SettingsDialogDismissal()
+        window = LuminareWindow(titleBarButtonConfiguration: nil) {
+            SettingsApprovalView(
+                review: review, document: document, migration: migration, controller: controller,
+                close: dismissal.close)
+        }
+        dismissal.window = window
         super.init()
         window.title =
             switch migration {
@@ -136,12 +144,11 @@ public final class SettingsApprovalDialog: NSObject, NSWindowDelegate, ApprovalW
             case nil: "Quartermaster preferences approval"
             }
         window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.isMovableByWindowBackground = true
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         window.delegate = self
-        let window = window
-        window.contentView = NSHostingView(
-            rootView: SettingsApprovalView(
-                review: review, document: document, migration: migration, controller: controller,
-                close: { [weak window] in window?.performClose(nil) }))
     }
 
     public func show(centred: Bool) {

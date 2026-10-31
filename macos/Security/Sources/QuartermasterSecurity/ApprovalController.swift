@@ -191,6 +191,13 @@ import LocalAuthentication
 
     public func cancel() { finish(.stopped, detail: "Request cancelled.") }
 
+    public func scopeChangeFailed() {
+        guard phase == .superseded else { return }
+        operation.cancel()
+        detail = "Could not change approval scope. Run the command again."
+        phase = .stopped
+    }
+
     private func finish(_ phase: Phase, detail: String) {
         guard self.phase != .approved, self.phase != .stopped, self.phase != .superseded else { return }
         timeout?.cancel()

@@ -8,10 +8,13 @@ swift_binary(
     testonly = True,
     srcs = ["DocumentationScreenshots.swift"],
     copts = ["-swift-version", "6"],
+    data = ["//macos/ApprovalUI:assets"],
     deps = [
         "//macos/ApprovalUI:QuartermasterApprovalUI",
         "//macos/Quartermaster:Quartermaster",
         "//macos/Security/Sources/QuartermasterSecurity",
+        "@luminare//:Luminare",
+        "@rules_swift//swift/runfiles",
     ],
 )
 

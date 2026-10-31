@@ -1,0 +1,16 @@
+load("@rules_swift//swift:swift_library.bzl", "swift_library")
+
+package(default_visibility = ["//visibility:public"])
+
+swift_library(
+    name = "VariadicViews",
+    srcs = glob(["Sources/**/*.swift"]),
+    module_name = "VariadicViews",
+)
+
+genrule(
+    name = "license",
+    srcs = ["LICENSE.md"],
+    outs = ["VariadicViews-LICENSE.txt"],
+    cmd = "cp $(<) $(@)",
+)

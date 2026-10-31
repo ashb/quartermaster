@@ -23,7 +23,7 @@ dedicated development vault account.
    The UUID can be omitted only when the vault contains exactly one entry, which
    must be a supported personal Login.
 4. Open **Vault**, enter the server URL, account email and master password, then
-   choose **Verify Vault…** and **Review Changes…**. Check the account,
+   choose **Log in** and **Review Changes…**. Check the account,
    item and proposed rules, then choose **Save Changes** and approve with Touch ID. Verification alone
    does not replace the active enrolment.
 

@@ -157,7 +157,7 @@ pub(super) fn request_approval(
             },
         )
     };
-    peer.observe_command_line();
+    peer.observe_display_context();
     let context = ReviewContext {
         provider: ProviderPresentation::new(&frozen.identity, frozen.generation),
         operation_id: id.to_string(),

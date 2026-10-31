@@ -27,10 +27,20 @@ pub(in crate::owner) struct Repository {
 #[derive(Clone, Serialize, PartialEq, Eq)]
 pub(in crate::owner) struct GitHubConfig {
     version: u8,
+    #[serde(skip_serializing_if = "is_enabled")]
+    enabled: bool,
     mode: Mode,
     repositories: Vec<Repository>,
     #[serde(rename = "approveUnverifiedRequests")]
     approve_unverified_requests: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+fn is_enabled(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +55,8 @@ impl GitHubConfig {
         #[serde(deny_unknown_fields)]
         struct Document {
             version: u8,
+            #[serde(default = "enabled_by_default")]
+            enabled: bool,
             mode: Mode,
             repositories: Vec<Repository>,
             #[serde(default, rename = "approveUnverifiedRequests")]
@@ -53,6 +65,7 @@ impl GitHubConfig {
         let document: Document = serde_json::from_slice(bytes).map_err(|_| Error)?;
         Self {
             version: document.version,
+            enabled: document.enabled,
             mode: document.mode,
             repositories: document.repositories,
             approve_unverified_requests: document.approve_unverified_requests,
@@ -84,6 +97,10 @@ impl GitHubConfig {
             )
         });
         Ok(self)
+    }
+
+    pub(in crate::owner) fn enabled(&self) -> bool {
+        self.enabled
     }
 
     pub(in crate::owner) fn mode(&self) -> Mode {

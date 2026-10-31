@@ -1,3 +1,4 @@
+import Foundation
 import QuartermasterSecurity
 
 extension ApprovalDisplay {
@@ -48,6 +49,14 @@ extension ReadGrantReview {
 }
 
 extension ReadPermission {
+    var compactSummary: String {
+        switch self {
+        case .issueReads: "Read issues. Writes need separate approval."
+        case .githubCategories(let categories):
+            "Read \(categories.map(\.compactName).formatted(.list(type: .and))). Writes need separate approval."
+        }
+    }
+
     var title: String {
         switch self {
         case .issueReads: "Allow issue reads"
@@ -108,6 +117,14 @@ extension GitHubEffect {
 }
 
 extension GitHubReadCategory {
+    var compactName: String {
+        switch self {
+        case .repository: "repository metadata"
+        case .issues: "issues and pull requests"
+        case .actions: "Actions metadata"
+        case .output: "build output"
+        }
+    }
     var name: String {
         switch self {
         case .repository: "Repository"

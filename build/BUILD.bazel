@@ -2,5 +2,8 @@ exports_files([
     "apollo_parser_ignored_commas.patch",
     "apple_support_clt.patch",
     "gazelle_rust_extension.patch",
+    "luminare.BUILD.bazel",
     "swift_gazelle_sdk_modules.patch",
+    "swiftui_introspect.BUILD.bazel",
+    "variadic_views.BUILD.bazel",
 ])

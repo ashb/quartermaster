@@ -1,6 +1,8 @@
 import AppKit
+import BazelRunfiles
 import Foundation
 import LocalAuthentication
+import Luminare
 import ScreenCaptureKit
 import SwiftUI
 
@@ -27,6 +29,9 @@ private final class DocumentationClient: BrokerClient, Sendable {
     @MainActor func call(_ command: BrokerCommand, context: LAContext?) async throws -> BrokerReply {
         switch command {
         case .hello: return .hello(profile: "development")
+        case .enroll: return .enrolled
+        case .next: return .idle
+        case .readGrants: return .readGrants([])
         case .settingsRegister, .settingsStatus: return .settingsStatus(try Self.snapshot())
         case .settingsCancel: return .canceled
         case .vaultStatus:
@@ -54,7 +59,14 @@ private final class DocumentationClient: BrokerClient, Sendable {
             from: JSONSerialization.data(withJSONObject: [
                 "state": "configured", "revision": 5,
                 "session": Data(repeating: 1, count: 16).base64EncodedString(),
-                "settings": ["github": NSNull(), "mutations": "requireApproval"],
+                "settings": [
+                    "github": [
+                        "version": 1, "mode": "github",
+                        "repositories": [["id": 123, "owner": "example", "name": "project", "writes": false]],
+                        "approveUnverifiedRequests": true,
+                    ],
+                    "mutations": "requireApproval",
+                ],
                 "provider": [
                     "slot": String(repeating: "a", count: 32), "scope": String(repeating: "b", count: 32),
                     "deviceKey": Array(repeating: 7, count: 32), "binding": binding,
@@ -64,38 +76,57 @@ private final class DocumentationClient: BrokerClient, Sendable {
     }
 }
 
-@MainActor private func approval() throws -> ApprovalPresentation {
-    let path = "/repos/example/project/issues/42"
-    let root: [String: Any] = [
+@MainActor private func approval(graphQL: Bool = false) throws -> ApprovalPresentation {
+    let path = graphQL ? "/graphql" : "/repos/example/project/issues/42"
+    let body =
+        graphQL
+        ? #"{"query":"query IssueByNumber($number: Int!) { repository(owner: \"example\", name: \"project\") { issue(number: $number) { title } } }","variables":{"number":42}}"#
+        : ""
+    let wireRequest =
+        graphQL
+        ? "POST \(path) HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+        : "GET \(path) HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
+    let shell: [String: Any] = [
         "id": "1200:0000000000000001:00000001", "pid": 1200, "executable": "/bin/zsh", "scope": "descendants",
+    ]
+    let root: [String: Any] = [
+        "id": "1201:0000000000000001:00000001", "pid": 1201, "executable": "/usr/local/bin/gh", "scope": "process",
     ]
     let request: [String: Any] = [
         "repository": "example/project", "repositoryId": 123, "issue": 42,
-        "method": "GET", "path": path, "body": "", "origin": "https://api.github.com",
-        "processChain": ["Terminal", "login", "zsh", "gh"], "readRoots": [root],
+        "method": graphQL ? "POST" : "GET", "path": path, "body": body, "origin": "https://api.github.com",
+        "processChain": ["Terminal", "login", "zsh", "gh"], "readRoots": [root, shell],
         "peer": [
             "pid": 1201, "executable": "/usr/local/bin/gh", "signingIdentifier": "gh",
             "cdHash": String(repeating: "1", count: 40), "adHoc": true, "ancestryComplete": true,
-            "commandLine": "gh api -H 'Accept: application/vnd.github+json' repos/example/project/issues/42",
+            "commandLine": graphQL
+                ? "gh issue view 42 --repo example/project"
+                : "gh api -H 'Accept: application/vnd.github+json' repos/example/project/issues/42",
+            "workingDirectory": "/Users/example/code/project",
+            "startedUnixMicros": 1_793_188_700_123_456,
             "processes": [
                 [
                     "pid": 1100, "name": "Terminal",
                     "executable": "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
                     "limited": false,
+                    "startedUnixMicros": 1_793_188_000_000_000,
                 ],
                 ["pid": 1199, "name": "login", "executable": "/usr/bin/login", "limited": true],
-                ["pid": 1200, "name": "zsh", "executable": "/bin/zsh", "limited": false],
-                ["pid": 1201, "name": "gh", "executable": "/usr/local/bin/gh", "limited": false],
+                [
+                    "pid": 1200, "name": "zsh", "executable": "/bin/zsh", "limited": false,
+                    "startedUnixMicros": 1_793_188_500_000_000,
+                ],
+                [
+                    "pid": 1201, "name": "gh", "executable": "/usr/local/bin/gh", "limited": false,
+                    "startedUnixMicros": 1_793_188_700_123_456,
+                ],
             ],
         ],
         "application": [
             "version": "quartermaster.github-request.v1", "complete": true, "effects": ["Read issue"],
             "requestedRepository": "example/project",
             "originalDigest": Data(repeating: 1, count: 32).base64EncodedString(),
-            "request": Data(
-                "GET \(path) HTTP/1.1\r\nHost: api.github.com\r\nAccept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n"
-                    .utf8
-            ).base64EncodedString(),
+            "request": Data(wireRequest.utf8).base64EncodedString(),
         ],
         "presentation": [
             "intent": [
@@ -130,25 +161,35 @@ private final class DocumentationClient: BrokerClient, Sendable {
 
 @MainActor private func render(
     _ view: some View, size: NSSize?, title: String, to output: URL,
-    settling: Duration = .milliseconds(500), validate: () throws -> Void = {}
+    floating: Bool = false, settling: Duration = .milliseconds(500), prepare: () -> Void = {},
+    validate: () throws -> Void = {}
 ) async throws {
-    let host = NSHostingView(rootView: view.environment(\.locale, Locale(identifier: "en_GB")))
-    let dimensions = size ?? host.fittingSize
-    host.setFrameSize(dimensions)
-    let window = NSWindow(
-        contentRect: NSRect(origin: .zero, size: dimensions), styleMask: [.titled, .closable], backing: .buffered,
-        defer: false)
+    let content = view.environment(\.locale, Locale(identifier: "en_GB"))
+    let window: NSWindow
+    if floating {
+        window = LuminareWindow(titleBarButtonConfiguration: nil) { content }
+        window.level = .floating
+    } else {
+        let host = NSHostingView(rootView: content)
+        let dimensions = size ?? host.fittingSize
+        host.setFrameSize(dimensions)
+        window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: dimensions), styleMask: [.titled, .closable], backing: .buffered,
+            defer: false)
+        window.contentView = host
+    }
     window.isReleasedWhenClosed = false
     window.title = title
-    window.contentView = host
     defer { window.close() }
     window.center()
     window.makeKeyAndOrderFront(nil)
     NSApplication.shared.activate(ignoringOtherApps: true)
     try await Task.sleep(for: settling)
-    host.layoutSubtreeIfNeeded()
-    let content = try await SCShareableContent.currentProcess
-    guard let captured = content.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else {
+    prepare()
+    try await Task.sleep(for: .milliseconds(100))
+    window.contentView?.layoutSubtreeIfNeeded()
+    let shareable = try await SCShareableContent.currentProcess
+    guard let captured = shareable.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else {
         throw CaptureFailure.rendering
     }
     let configuration = SCStreamConfiguration()
@@ -185,6 +226,11 @@ private final class DocumentationClient: BrokerClient, Sendable {
         }
         let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let runfiles = try Runfiles.create()
+        let iconURL = try runfiles.rlocation("_main/macos/ApprovalUI/Assets.xcassets/GitHub.imageset/github.svg")
+        guard let icon = NSImage(contentsOf: iconURL) else { throw CaptureFailure.rendering }
+        icon.isTemplate = true
+        icon.setName("GitHub")
         UserDefaults.standard.setVolatileDomain(
             ["AppleLocale": "en_GB", "AppleLanguages": ["en-GB"], "AppleAccentColor": 4],
             forName: UserDefaults.argumentDomain)
@@ -205,13 +251,27 @@ private final class DocumentationClient: BrokerClient, Sendable {
             }
             try await render(
                 ApprovalDialogView(
-                    presentation: try approval(), controller: controller, close: {}, selectRoot: { _ in }),
+                    presentation: try approval(graphQL: true), controller: controller, close: {}, selectRoot: { _ in }),
                 size: nil, title: "Quartermaster approval", to: output.appendingPathComponent("approval-dialog.png"),
-                settling: .seconds(2),
+                floating: true, settling: .seconds(2),
                 validate: {
                     guard controller.phase == .authenticating else { throw CaptureFailure.authenticationNotPending }
                 })
         }
+        let details = try approval(graphQL: true)
+        try await render(
+            ApprovalRequestDetails(presentation: details),
+            size: NSSize(width: 660, height: 520), title: "Full request",
+            to: output.appendingPathComponent("request-approval.png"))
+        try await render(
+            ApprovalRequestDetails(presentation: details, tab: .caller),
+            size: NSSize(width: 660, height: 520), title: "Full request",
+            to: output.appendingPathComponent("request-caller.png"))
+        try await render(
+            ApprovalInlineDetails(presentation: details).padding(24)
+                .frame(width: 540).fixedSize(horizontal: false, vertical: true),
+            size: NSSize(width: 540, height: 260), title: "Request details",
+            to: output.appendingPathComponent("request-details.png"))
         let application = BrokerApplication(
             setActivationPolicy: { _ in }, openConnection: { DocumentationClient() },
             loadApprovalKey: { Data(repeating: 1, count: 65) },
@@ -226,7 +286,26 @@ private final class DocumentationClient: BrokerClient, Sendable {
         }
         try await render(
             PreferencesView(editor: application.preferences, application: application),
-            size: NSSize(width: 920, height: 700), title: "Vault",
+            size: NSSize(width: 880, height: 540), title: "Quartermaster",
             to: output.appendingPathComponent("settings-vault.png"))
+        await application.reloadPreferences()
+        try await render(
+            PreferencesView(editor: application.preferences, application: application, pane: .tools),
+            size: NSSize(width: 880, height: 540), title: "Quartermaster",
+            to: output.appendingPathComponent("settings-tools.png"))
+        await application.reloadPreferences()
+        try await render(
+            PreferencesView(
+                editor: application.preferences, application: application, pane: .tools, showingGitHub: true),
+            size: NSSize(width: 880, height: 540), title: "Quartermaster",
+            to: output.appendingPathComponent("settings-github.png"))
+        await application.reloadPreferences()
+        try await render(
+            PreferencesView(
+                editor: application.preferences, application: application, pane: .vault,
+                editingVault: true),
+            size: NSSize(width: 880, height: 660), title: "Quartermaster",
+            to: output.appendingPathComponent("settings-vault-edit.png"),
+            prepare: { application.preferences.draft.mutations = .deny })
     }
 }

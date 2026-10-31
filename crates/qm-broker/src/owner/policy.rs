@@ -79,7 +79,7 @@ impl Policy {
     }
 
     pub(super) fn with_github(mut self, config: GitHubConfig) -> Self {
-        self.github = Some(config);
+        self.github = config.enabled().then_some(config);
         self
     }
 

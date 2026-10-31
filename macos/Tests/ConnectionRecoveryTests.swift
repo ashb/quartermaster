@@ -282,6 +282,49 @@ func activationReRegistersAfterThePreviousTransportWasInvalidated(_ afterPolling
     #expect(application.connectionFailure != nil)
 }
 
+@Test(arguments: [true, false]) @MainActor
+func foregroundRetriesRegistrationAfterRecoveryWasRefused(_ reopen: Bool) async throws {
+    let first = try RecoveryClient()
+    let refused = try RecoveryClient(rejectsRegistration: true)
+    let recovered = try RecoveryClient()
+    let clients = [first, refused, recovered]
+    var opens = 0
+    let key = Data([1, 2, 3])
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in },
+        openConnection: {
+            let client = clients[min(opens, clients.count - 1)]
+            opens += 1
+            return client
+        },
+        recoveryDelays: [.zero], loadApprovalKey: { key })
+    defer { _ = application.applicationShouldTerminate(NSApplication.shared) }
+
+    application.reconnect()
+    try await eventually { first.polls > 0 }
+    let approval = InertApprovalWindow()
+    application.present(approval)
+    first.cancel()
+    try await eventually { application.connectionFailure != nil }
+    #expect(opens == 2)
+    #expect(approval.cancelled)
+    #expect(refused.disconnected)
+    #expect(refused.enrolmentKeys.isEmpty && refused.polls == 0)
+
+    if reopen {
+        _ = application.applicationShouldHandleReopen(NSApplication.shared, hasVisibleWindows: false)
+    } else {
+        activate(application)
+    }
+    try await eventually { recovered.polls > 0 }
+    #expect(opens == 3)
+    #expect(application.connected && application.connectionFailure == nil)
+    #expect(recovered.registrationKeys == [key])
+    #expect(recovered.enrolmentKeys == [key])
+    #expect(recovered.vaultOperations == 0)
+    #expect(approval.cancelled)
+}
+
 @Test(arguments: ["invalid", "unavailable", "unconfigured"]) @MainActor
 func settingsInitializationMustSucceedBeforeHidingRecovery(_ state: String) async throws {
     let snapshot = try JSONDecoder().decode(
@@ -441,9 +484,9 @@ private func vaultActionsKeepTheLastSuccessfulSyncTime(_ outcome: RecoveryClient
         case .synced: "Vault: online_unlocked"
         }
     #expect(application.status == expectedStatus)
-    let expectedFeedback =
+    let expectedFeedback: String? =
         switch outcome {
-        case .locked: "Vault locked."
+        case .locked: nil
         case .synced: "Vault synced."
         case .syncFailed: "Could not contact Vaultwarden. Try again when it is available."
         }

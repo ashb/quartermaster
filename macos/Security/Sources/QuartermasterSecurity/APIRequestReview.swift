@@ -3,6 +3,7 @@ import Foundation
 public struct APIRequestReview: Sendable {
     public let text: String
     public let readableText: String?
+    public let graphQLSummary: String?
 
     private struct Envelope: Decodable {
         struct Capture: Decodable { let request: Data }
@@ -11,10 +12,31 @@ public struct APIRequestReview: Sendable {
 
     public static func parse(request: Data) throws -> Self? {
         guard let capture = try JSONDecoder().decode(Envelope.self, from: request).application else { return nil }
-        return Self(text: escaped(capture.request), readableText: readable(capture.request))
+        let parts = jsonParts(capture.request)
+        let readable = parts.flatMap { head, body -> String? in
+            guard let body = JSONRequestBody.readable(body) else { return nil }
+            let text = escaped(head) + "\n\n" + escaped(Data(body.utf8), tabs: true)
+            return text.utf8.count <= BrokerLimits.reviewBytes ? text : nil
+        }
+        let summary = parts.flatMap { head, body -> String? in
+            let line = String(decoding: head, as: UTF8.self).components(separatedBy: "\r\n")[0]
+                .split(separator: " ")
+            guard line.count == 3, line[0] == "POST", line[1].split(separator: "?").first == "/graphql",
+                let preview = JSONRequestBody.graphQLSummary(body)
+            else { return nil }
+            let safe = preview.unicodeScalars.map { scalar in
+                switch scalar.properties.generalCategory {
+                case .control, .format, .lineSeparator, .paragraphSeparator:
+                    String(format: "\\u{%04x}", scalar.value)
+                default: String(scalar)
+                }
+            }.joined()
+            return String(safe.prefix(240)) + (safe.count > 240 ? "…" : "")
+        }
+        return Self(text: escaped(capture.request), readableText: readable, graphQLSummary: summary)
     }
 
-    private static func readable(_ data: Data) -> String? {
+    private static func jsonParts(_ data: Data) -> (head: Data, body: Data)? {
         guard let boundary = data.range(of: Data("\r\n\r\n".utf8)),
             let head = String(data: data[..<boundary.lowerBound], encoding: .utf8)
         else { return nil }
@@ -23,11 +45,9 @@ public struct APIRequestReview: Sendable {
             guard field.count == 2, field[0].lowercased() == "content-type" else { return nil }
             return field[1].prefix { $0 != ";" }.trimmingCharacters(in: .whitespaces).lowercased()
         }
-        guard types.count == 1, types[0] == "application/json" || types[0].hasSuffix("+json"),
-            let body = JSONRequestBody.readable(Data(data[boundary.upperBound...]))
+        guard types.count == 1, types[0] == "application/json" || types[0].hasSuffix("+json")
         else { return nil }
-        let text = escaped(Data(data[..<boundary.lowerBound])) + "\n\n" + escaped(Data(body.utf8), tabs: true)
-        return text.utf8.count <= BrokerLimits.reviewBytes ? text : nil
+        return (Data(data[..<boundary.lowerBound]), Data(data[boundary.upperBound...]))
     }
 
     private static func escaped(_ data: Data, tabs: Bool = false) -> String {

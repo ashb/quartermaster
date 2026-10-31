@@ -23,7 +23,13 @@ macos_application(
     executable_name = "Quartermaster",
     infoplists = ["//macos/Quartermaster:Info.plist"],
     minimum_os_version = "26.0",
-    resources = ["//macos/Quartermaster:AppIcon.icns"],
+    resources = [
+        "//macos/ApprovalUI:assets",
+        "//macos/Quartermaster:AppIcon.icns",
+        "@luminare//:license",
+        "@swiftui_introspect//:license",
+        "@variadic_views//:license",
+    ],
     deps = ["//macos/Quartermaster"],
 )
 

@@ -23,7 +23,7 @@ struct SettingsMigrationView: View {
             }
             PreferencesGroup(title: "Previous access settings") {
                 if let github = migration.settings.github {
-                    Text("GitHub request mediation enabled")
+                    Text(github.enabled ? "GitHub request mediation enabled" : "GitHub request mediation disabled")
                     ForEach(github.repositories) { repository in
                         Text(verbatim: "\(repository.owner)/\(repository.name)")
                     }

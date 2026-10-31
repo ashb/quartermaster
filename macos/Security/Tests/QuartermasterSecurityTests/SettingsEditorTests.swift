@@ -24,6 +24,52 @@ private func editorProvider(
         scope: "0123456789abcdef0123456789abcdef", deviceKey: Array(repeating: 7, count: 32))
 }
 
+@Test @MainActor func initialVaultLoginFailureDoesNotClaimThereAreApprovedSettingsToRecover() async {
+    let snapshot = SettingsSnapshot(
+        state: "unconfigured", revision: 0, session: Data(repeating: 1, count: 16),
+        settings: nil, provider: nil, migration: nil)
+    let editor = SettingsEditor { command in
+        if case .stageEnrollment = command { throw BrokerControlError.denied }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    await editor.enroll(password: "dummy-password")
+    #expect(editor.vaultLoginError?.contains("log in") == true)
+    #expect(editor.message.isEmpty)
+    #expect(editor.vaultLoginError?.contains("dummy-password") == false)
+    #expect(editor.snapshot?.provider == nil)
+    #expect(editor.stagedProvider == nil)
+    #expect(!editor.busy)
+}
+
+@Test @MainActor func failedVaultLoginCanBeRetriedWithoutDiscardingTheDraft() async {
+    let snapshot = editorSnapshot()
+    let provider = editorProvider()
+    var attempts = 0
+    let editor = SettingsEditor { command in
+        if case .stageEnrollment(_, _, let password, _) = command {
+            #expect(password == "dummy-password")
+            attempts += 1
+            if attempts == 1 { throw BrokerControlError.denied }
+            return .enrollmentStaged(ticket: "retry-ticket", provider: provider)
+        }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    editor.draft.mutations = .requireApproval
+    await editor.enroll(password: "dummy-password")
+    #expect(editor.vaultLoginError != nil)
+    #expect(!editor.busy)
+    await editor.enroll(password: "dummy-password")
+    #expect(attempts == 2)
+    #expect(editor.vaultLoginState == .ready)
+    #expect(editor.vaultLoginError == nil)
+    #expect(editor.message.isEmpty)
+    #expect(editor.stagedProvider == provider)
+    #expect(editor.draft.mutations == .requireApproval)
+    #expect(!editor.busy)
+}
+
 @Test(arguments: ["settings", "enrolment", "whitespace", "forget", "staged"])
 @MainActor func discardIsAvailableOnlyWhileThereAreDraftChanges(_ change: String) async throws {
     let provider = editorProvider()
@@ -233,7 +279,8 @@ private func editorProvider(
     #expect(editor.snapshot?.provider == snapshot.provider)
 }
 
-@Test @MainActor func anEnrollmentReplyForChangedInputsCannotRestoreItsTicket() async throws {
+@Test(arguments: [Optional<String>.none, "replacement-item"])
+@MainActor func anEnrollmentReplyForChangedInputsCannotRestoreItsTicket(_ itemID: String?) async throws {
     let snapshot = editorSnapshot(provider: editorProvider())
     let provider = try #require(snapshot.provider)
     var reply: CheckedContinuation<BrokerReply, Never>?
@@ -242,7 +289,9 @@ private func editorProvider(
         return .settingsStatus(snapshot)
     }
     await editor.load()
-    let verification = Task { await editor.enroll(password: "dummy-password") }
+    var candidate = editor.enrollment
+    if let itemID { candidate.itemID = itemID }
+    let verification = Task { await editor.enroll(password: "dummy-password", replacement: candidate) }
     while reply == nil { await Task.yield() }
     editor.enrollment.itemID = "changed-while-verifying"
     #expect(!editor.canDiscard)
@@ -408,7 +457,7 @@ private func editorProvider(
     #expect(editor.stagedProvider == nil)
     #expect(cancellations == 1)
     #expect(!editor.canReview)
-    #expect(editor.message == "Changes discarded.")
+    #expect(editor.message.isEmpty)
 }
 
 @Test @MainActor func aDelayedStatusReplyCannotRestoreADisconnectedSession() async throws {
@@ -455,4 +504,69 @@ func lateCancellationRepliesCannotRestoreASessionOrEraseItsConnectionError(_ alr
     await pending.value
     #expect(!editor.available)
     #expect(editor.message == failure)
+}
+
+@Test(arguments: [true, false])
+@MainActor func credentialEditsAreStagedOnlyAfterSuccessfulVerification(_ succeeds: Bool) async throws {
+    let approved = editorProvider()
+    let replacement = editorProvider(itemID: "replacement-item")
+    let snapshot = editorSnapshot(provider: approved)
+    var requestedItem: String?
+    let editor = SettingsEditor { command in
+        if case .stageEnrollment(let server, let email, _, let itemID) = command {
+            #expect(server == approved.binding.server)
+            #expect(email == approved.binding.email)
+            requestedItem = itemID
+            if succeeds { return .enrollmentStaged(ticket: "replacement-ticket", provider: replacement) }
+            throw BrokerControlError.unavailable
+        }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    editor.draft.mutations = .requireApproval
+    var candidate = editor.enrollment
+    candidate.itemID = " replacement-item "
+    await editor.enroll(password: "dummy-password", replacement: candidate)
+
+    #expect(requestedItem == "replacement-item")
+    #expect(editor.snapshot?.provider == approved)
+    #expect(editor.draft.mutations == .requireApproval)
+    #expect(editor.enrollment.itemID == (succeeds ? replacement.binding.itemID : approved.binding.itemID))
+    #expect(editor.stagedProvider == (succeeds ? replacement : nil))
+    #expect(!editor.enrollmentNeedsVerification)
+    if !succeeds { #expect(editor.vaultLoginError?.contains("Could not log in") == true) }
+}
+
+@Test @MainActor func disablingGitHubPreservesRulesAndPendingRepositoriesAcrossToggles() async throws {
+    var settings = BrokerSettings()
+    var github = GitHubSettings()
+    github.repositories = [RepositorySetting(id: 123, owner: "example", name: "project")]
+    github.approveUnverifiedRequests = true
+    settings.github = github
+    settings.mutations = .deny
+    let snapshot = SettingsSnapshot(
+        state: "configured", revision: 4, session: Data(repeating: 1, count: 16),
+        settings: settings, provider: nil, migration: nil)
+    let editor = SettingsEditor { _ in .settingsStatus(snapshot) }
+    await editor.load()
+    #expect(editor.addRepository("example/pending"))
+    editor.githubEnabled = false
+    #expect(!editor.githubEnabled)
+    #expect(editor.pendingRepositories.map(\.fullName) == ["example/pending"])
+    let persisted = try JSONDecoder().decode(BrokerSettings.self, from: JSONEncoder().encode(editor.draft))
+    #expect(persisted.github?.enabled == false)
+    #expect(persisted.github?.repositories == github.repositories)
+    #expect(persisted.github?.approveUnverifiedRequests == true)
+    #expect(persisted.mutations == .deny)
+    editor.githubEnabled = true
+    #expect(editor.draft == settings)
+    #expect(editor.pendingRepositories.map(\.fullName) == ["example/pending"])
+}
+
+@Test func olderGitHubSettingsStayEnabledAndKeepTheirSerializedShape() throws {
+    let original = Data(#"{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true}"#.utf8)
+    let settings = try JSONDecoder().decode(GitHubSettings.self, from: original)
+    #expect(settings.enabled)
+    let encoded = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)) as? NSDictionary)
+    #expect(encoded == (try JSONSerialization.jsonObject(with: original) as? NSDictionary))
 }

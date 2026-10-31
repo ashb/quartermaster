@@ -57,6 +57,7 @@ pub struct ProcessPresentation {
     pub name: String,
     pub executable: Option<String>,
     pub limited: bool,
+    pub started_unix_micros: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +71,7 @@ pub struct PeerIdentity {
     ad_hoc: bool,
     ancestry: ObservedAncestry,
     command_line: Option<String>,
+    working_directory: Option<String>,
     #[serde(skip)]
     started: (u64, u64),
     #[serde(skip)]
@@ -80,6 +82,7 @@ pub struct PeerIdentity {
 #[serde(rename_all = "camelCase")]
 pub struct PeerPresentation {
     pub pid: u32,
+    pub started_unix_micros: Option<u64>,
     pub executable: String,
     pub signing_identifier: String,
     pub team_identifier: Option<String>,
@@ -88,6 +91,7 @@ pub struct PeerPresentation {
     pub ancestry_complete: bool,
     pub ancestry_note: Option<String>,
     pub command_line: Option<String>,
+    pub working_directory: Option<String>,
     pub processes: Vec<ProcessPresentation>,
 }
 
@@ -139,6 +143,7 @@ impl PeerIdentity {
     pub fn presentation(&self) -> PeerPresentation {
         PeerPresentation {
             pid: self.pid,
+            started_unix_micros: started_unix_micros(self.started),
             executable: self.executable.clone(),
             signing_identifier: self.signing_identifier.clone(),
             team_identifier: self.team_identifier.clone(),
@@ -147,6 +152,7 @@ impl PeerIdentity {
             ancestry_complete: self.ancestry.complete,
             ancestry_note: self.ancestry.note.clone(),
             command_line: self.command_line.clone(),
+            working_directory: self.working_directory.clone(),
             processes: self.ancestry.processes.clone(),
         }
     }
@@ -287,14 +293,22 @@ impl PeerIdentity {
             ad_hoc,
             ancestry,
             command_line: None,
+            working_directory: None,
             started,
             audit_token: token,
         })
     }
 
-    /// Observed arguments provide display context, never authority.
-    pub fn observe_command_line(&mut self) {
+    /// Observed arguments and directory provide display context, never authority.
+    pub fn observe_display_context(&mut self) {
         self.command_line = self.read_command_line();
+        self.working_directory = observed_working_directory_with(
+            self.pid,
+            self.started,
+            &self.executable,
+            &mut observed_process,
+            &mut working_directory,
+        );
     }
 
     fn read_command_line(&self) -> Option<String> {
@@ -430,6 +444,67 @@ fn observed_process(pid: u32) -> io::Result<ObservedProcess> {
     observed_process_with(pid, &mut bsd_info, &mut process_path)
 }
 
+fn working_directory(pid: u32) -> io::Result<String> {
+    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+    let size = size_of::<libc::proc_vnodepathinfo>() as i32;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if result <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if result != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete working directory metadata",
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|byte| *byte as u8)
+        .collect();
+    working_directory_path(&bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid working directory"))
+}
+
+fn working_directory_path(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > libc::MAXPATHLEN as usize || bytes.first() != Some(&b'/') {
+        return None;
+    }
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    let path = std::str::from_utf8(&bytes[..end]).ok()?;
+    Some(crate::process_display::argument(path))
+}
+
+fn observed_working_directory_with(
+    pid: u32,
+    started: (u64, u64),
+    executable: &str,
+    observe: &mut impl FnMut(u32) -> io::Result<ObservedProcess>,
+    path: &mut impl FnMut(u32) -> io::Result<String>,
+) -> Option<String> {
+    let before = observe(pid).ok()?;
+    if before.started != started || before.executable != executable {
+        return None;
+    }
+    let directory = path(pid).ok()?;
+    let after = observe(pid).ok()?;
+    if after.started != before.started || after.executable != before.executable {
+        return None;
+    }
+    Some(directory)
+}
+
 fn process_path(pid: u32) -> io::Result<String> {
     let mut bytes = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let size =
@@ -500,7 +575,7 @@ fn ancestry_with_short(
     let pid = peer.pid;
     let mut result = vec![peer];
     let mut complete = false;
-    let mut limited_ancestors = Vec::new();
+    let mut fallback_ancestors = Vec::new();
     let mut note = Some("Earlier ancestors could not be inspected.".to_owned());
     while result.len() < ANCESTRY_LIMIT {
         let parent = result.last().unwrap().parent_pid;
@@ -533,11 +608,12 @@ fn ancestry_with_short(
                     .and_then(|path| Path::new(path).file_name())
                     .and_then(|name| name.to_str())
                     .unwrap_or("Process");
-                limited_ancestors.push(ProcessPresentation {
+                fallback_ancestors.push(ProcessPresentation {
                     pid: parent,
                     name: name.into(),
                     executable,
                     limited: true,
+                    started_unix_micros: None,
                 });
                 note = Some(
                     if error.kind() == io::ErrorKind::PermissionDenied {
@@ -551,17 +627,18 @@ fn ancestry_with_short(
                 );
                 if error.kind() == io::ErrorKind::PermissionDenied {
                     let excluded: Vec<_> = result.iter().map(|p| p.pid).collect();
-                    let extended = short_ancestry(parent, &excluded, &mut short, &mut path);
+                    let extended =
+                        fallback_ancestry(parent, &excluded, &mut short, &mut info, &mut path);
                     if !extended.is_empty() {
                         let Ok(current) = info(child.pid) else {
-                            limited_ancestors.clear();
+                            fallback_ancestors.clear();
                             break;
                         };
                         if !child_link_is_current(child, &current) {
-                            limited_ancestors.clear();
+                            fallback_ancestors.clear();
                             break;
                         }
-                        limited_ancestors = extended;
+                        fallback_ancestors = extended;
                         note = Some("Some ancestors have limited process information.".into());
                     }
                 }
@@ -578,8 +655,8 @@ fn ancestry_with_short(
         result.push(process);
     }
     result.reverse();
-    limited_ancestors.reverse();
-    let processes: Vec<_> = limited_ancestors
+    fallback_ancestors.reverse();
+    let processes: Vec<_> = fallback_ancestors
         .into_iter()
         .chain(result.iter().map(|p| {
             let name = if p.pid == pid {
@@ -592,6 +669,7 @@ fn ancestry_with_short(
                 name: name.into(),
                 executable: Some(p.executable.clone()),
                 limited: false,
+                started_unix_micros: started_unix_micros(p.started),
             }
         }))
         .collect();
@@ -660,14 +738,17 @@ fn short_info(pid: u32) -> io::Result<ShortProcessInfo> {
     Ok(info)
 }
 
-fn short_ancestry(
-    mut pid: u32,
+fn fallback_ancestry(
+    denied_pid: u32,
     excluded: &[u32],
     info: &mut impl FnMut(u32) -> io::Result<ShortProcessInfo>,
+    full_info: &mut impl FnMut(u32) -> io::Result<libc::proc_bsdinfo>,
     path: &mut impl FnMut(u32) -> io::Result<String>,
 ) -> Vec<ProcessPresentation> {
+    let mut pid = denied_pid;
     let mut rows = Vec::new();
     let mut snapshots = Vec::new();
+    let mut full_snapshots = Vec::new();
     while pid > 1 && rows.len() + excluded.len() < ANCESTRY_LIMIT {
         if excluded.contains(&pid) || snapshots.iter().any(|p: &ShortProcessInfo| p.pid == pid) {
             break;
@@ -678,7 +759,26 @@ fn short_ancestry(
         if before.pid != pid {
             break;
         }
-        let executable = path(pid).ok();
+        let observed = if pid == denied_pid {
+            None
+        } else {
+            match observed_process_with(pid, full_info, path) {
+                Ok(process) if process.parent_pid == before.parent => Some(process),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
+                _ => return Vec::new(),
+            }
+        };
+        let executable = observed
+            .as_ref()
+            .map(|p| p.executable.clone())
+            .or_else(|| path(pid).ok());
+        let limited = observed.is_none();
+        let started_unix_micros = observed
+            .as_ref()
+            .and_then(|p| started_unix_micros(p.started));
+        if let Some(process) = observed {
+            full_snapshots.push(process);
+        }
         let end = before
             .name
             .iter()
@@ -697,7 +797,8 @@ fn short_ancestry(
                 name
             },
             executable,
-            limited: true,
+            limited,
+            started_unix_micros,
         });
         snapshots.push(before);
         pid = before.parent;
@@ -712,7 +813,19 @@ fn short_ancestry(
             return Vec::new();
         }
     }
+    for process in full_snapshots {
+        let Ok(current) = full_info(process.pid) else {
+            return Vec::new();
+        };
+        if !child_link_is_current(&process, &current) {
+            return Vec::new();
+        }
+    }
     rows
+}
+
+fn started_unix_micros((seconds, micros): (u64, u64)) -> Option<u64> {
+    seconds.checked_mul(1_000_000)?.checked_add(micros)
 }
 
 fn parent_link_is_current(
@@ -825,37 +938,102 @@ mod tests {
     }
 
     #[test]
-    fn short_metadata_extends_display_above_login_without_verifying_those_rows() {
-        let ancestry = ancestry_with_short(
-            fixture_peer(),
-            fixture_info,
-            |pid| {
-                if pid == 5 {
-                    Ok("/Applications/Rex Server.app/Contents/MacOS/rex".into())
+    fn full_metadata_is_retried_above_login_without_completing_the_ancestry() {
+        for full_available in [false, true] {
+            let ancestry = ancestry_with_short(
+                fixture_peer(),
+                |pid| {
+                    if pid != 5 {
+                        return fixture_info(pid);
+                    }
+                    if !full_available {
+                        return Err(io::Error::from_raw_os_error(libc::EPERM));
+                    }
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    info.pbi_ppid = 1;
+                    info.pbi_start_tvsec = 100;
+                    Ok(info)
+                },
+                |pid| {
+                    if pid == 5 {
+                        Ok("/Applications/Rex Server.app/Contents/MacOS/rex".into())
+                    } else {
+                        fixture_path(pid)
+                    }
+                },
+                |pid| {
+                    Ok(ShortProcessInfo {
+                        pid,
+                        parent: if pid == 10 { 5 } else { 1 },
+                        ..Default::default()
+                    })
+                },
+            );
+            assert_eq!(
+                ancestry.processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                [5, 10, 20, 30]
+            );
+            assert_eq!(ancestry.processes[0].limited, !full_available);
+            let serialized = serde_json::to_value(&ancestry.processes).unwrap();
+            assert_eq!(
+                serialized[0]["startedUnixMicros"],
+                if full_available {
+                    serde_json::json!(100_000_000)
                 } else {
-                    fixture_path(pid)
+                    serde_json::Value::Null
                 }
-            },
-            |pid| {
-                Ok(ShortProcessInfo {
-                    pid,
-                    parent: if pid == 10 { 5 } else { 1 },
-                    ..Default::default()
-                })
-            },
-        );
-        assert_eq!(
-            ancestry.processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
-            [5, 10, 20, 30]
-        );
-        assert!(ancestry.processes[0].limited);
-        assert!(ancestry.processes[1].limited);
-        assert!(!ancestry.processes[2].limited);
-        assert_eq!(
-            ancestry.processes[0].executable.as_deref(),
-            Some("/Applications/Rex Server.app/Contents/MacOS/rex")
-        );
-        assert!(!ancestry.complete);
+            );
+            assert!(serialized[1]["startedUnixMicros"].is_null());
+            assert_eq!(serialized[2]["startedUnixMicros"], 200_000_000);
+            assert!(ancestry.processes[1].limited);
+            assert!(!ancestry.processes[2].limited);
+            assert_eq!(
+                ancestry.processes[0].executable.as_deref(),
+                Some("/Applications/Rex Server.app/Contents/MacOS/rex")
+            );
+            assert!(!ancestry.complete);
+            assert!(ancestry.note.is_some());
+        }
+    }
+
+    #[test]
+    fn changed_full_metadata_above_login_discards_the_extension() {
+        for changed_after in [0, 1, 2] {
+            let mut reads = 0;
+            let ancestry = ancestry_with_short(
+                fixture_peer(),
+                |pid| {
+                    if pid != 5 {
+                        return fixture_info(pid);
+                    }
+                    reads += 1;
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    info.pbi_ppid = if changed_after == 0 { 99 } else { 1 };
+                    info.pbi_start_tvsec = if reads > changed_after { 101 } else { 100 };
+                    Ok(info)
+                },
+                |pid| {
+                    if pid == 5 {
+                        Ok("/rex".into())
+                    } else {
+                        fixture_path(pid)
+                    }
+                },
+                |pid| {
+                    Ok(ShortProcessInfo {
+                        pid,
+                        parent: if pid == 10 { 5 } else { 1 },
+                        ..Default::default()
+                    })
+                },
+            );
+            assert_eq!(
+                ancestry.processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                [10, 20, 30]
+            );
+            assert!(ancestry.processes[0].limited);
+            assert!(!ancestry.complete);
+        }
     }
 
     #[test]
@@ -863,7 +1041,13 @@ mod tests {
         let mut reads = 0;
         let ancestry = ancestry_with_short(
             fixture_peer(),
-            fixture_info,
+            |pid| {
+                if pid == 5 {
+                    Err(io::Error::from_raw_os_error(libc::EPERM))
+                } else {
+                    fixture_info(pid)
+                }
+            },
             |pid| {
                 if pid == 5 {
                     Ok("/rex".into())
@@ -892,7 +1076,7 @@ mod tests {
     #[test]
     fn short_metadata_walk_is_bounded_and_cannot_cycle_into_the_verified_leaf() {
         for cycle in [false, true] {
-            let rows = short_ancestry(
+            let rows = fallback_ancestry(
                 100,
                 &[20, 30],
                 &mut |pid| {
@@ -902,6 +1086,7 @@ mod tests {
                         ..Default::default()
                     })
                 },
+                &mut |_| Err(io::Error::from_raw_os_error(libc::EPERM)),
                 &mut |_| Err(io::Error::from_raw_os_error(libc::EPERM)),
             );
             assert_eq!(rows.len(), if cycle { 1 } else { ANCESTRY_LIMIT - 2 });
@@ -1097,6 +1282,103 @@ mod tests {
     fn failed_native_metadata_queries_preserve_the_os_error() {
         let error = bsd_info(u32::MAX).err().unwrap();
         assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn working_directory_paths_preserve_controls_as_visible_escapes() {
+        assert_eq!(
+            working_directory_path(b"/Users/example/project\0ignored"),
+            Some("/Users/example/project".into())
+        );
+        assert_eq!(
+            working_directory_path("/tmp/line\n\u{202e}\u{1b}\0".as_bytes()),
+            Some("$'/tmp/line\\n\\xe2\\x80\\xae\\x1b'".into())
+        );
+        for bytes in [
+            b"".as_slice(),
+            b"\0",
+            b"relative\0",
+            b"/unterminated",
+            b"/invalid\xff\0",
+        ] {
+            assert!(working_directory_path(bytes).is_none());
+        }
+        let mut oversized = vec![b'/'; libc::MAXPATHLEN as usize];
+        oversized.push(0);
+        assert!(working_directory_path(&oversized).is_none());
+    }
+
+    #[test]
+    fn working_directory_requires_the_captured_execution_before_and_after_observation() {
+        for (before_start, after_start, after_executable, expected) in [
+            ((1, 0), (1, 0), "/process", Some("/directory")),
+            ((2, 0), (2, 0), "/process", None),
+            ((1, 0), (2, 0), "/process", None),
+            ((1, 0), (1, 0), "/replacement", None),
+        ] {
+            let mut reads = 0;
+            let observed = observed_working_directory_with(
+                42,
+                (1, 0),
+                "/process",
+                &mut |pid| {
+                    reads += 1;
+                    let mut process = observation(
+                        pid,
+                        1,
+                        if reads == 1 {
+                            before_start
+                        } else {
+                            after_start
+                        },
+                    );
+                    if reads > 1 {
+                        process.executable = after_executable.into();
+                    }
+                    Ok(process)
+                },
+                &mut |_| Ok("/directory".into()),
+            );
+            assert_eq!(observed.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn unavailable_directory_or_process_observation_omits_working_directory() {
+        for failed_step in 0..3 {
+            let mut step = 0;
+            let observed = observed_working_directory_with(
+                42,
+                (1, 0),
+                "/process",
+                &mut |pid| {
+                    let current = step;
+                    step += 2;
+                    if current == failed_step {
+                        Err(io::Error::from(io::ErrorKind::NotFound))
+                    } else {
+                        Ok(observation(pid, 1, (1, 0)))
+                    }
+                },
+                &mut |_| {
+                    if failed_step == 1 {
+                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                    } else {
+                        Ok("/directory".into())
+                    }
+                },
+            );
+            assert!(observed.is_none());
+        }
+    }
+
+    #[test]
+    fn native_working_directory_observation_matches_the_current_process() {
+        let path = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(
+            working_directory(std::process::id()).unwrap(),
+            crate::process_display::argument(path.to_str().unwrap())
+        );
     }
 
     fn argument_buffer(arguments: &[&str]) -> Vec<u8> {

@@ -1,10 +1,12 @@
 import AppKit
 import Darwin
+import OSLog
 import QuartermasterApprovalUI
 import QuartermasterSecurity
 
 @MainActor
 final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject {
+    private let logger = Logger(subsystem: "dev.quartermaster.phase0", category: "connection")
     private enum ConnectionPhase {
         case disconnected, connecting, connected
         case failed(String)
@@ -16,13 +18,11 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         var busy: Bool { self == .locking || self == .syncing || self == .unlocking }
         var message: String? {
             switch self {
-            case .idle: nil
+            case .idle, .locked, .unlocked: nil
             case .locking: "Locking vault…"
             case .syncing: "Syncing vault…"
             case .unlocking: "Unlocking vault…"
-            case .locked: "Vault locked."
             case .synced: "Vault synced."
-            case .unlocked: "Vault unlocked."
             case .failed(let message): message
             }
         }
@@ -107,9 +107,9 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
 
     private func connectIfNeeded() {
         switch connectionPhase {
-        case .disconnected: reconnect()
+        case .disconnected, .failed: reconnect()
         case .connected: if client?.disconnected == true { reconnect() }
-        case .connecting, .failed: break
+        case .connecting: break
         }
     }
 
@@ -145,6 +145,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     backendBuild = nil
                     vaultStatus = nil
                     status = "Backend unavailable: \(error)"
+                    logger.error("Connection failed: \(self.connectionFailureDescription(error), privacy: .public)")
                     preferences.connectionLost(error)
                     guard let failure = error as? BrokerFailure,
                         failure == .disconnected || failure == .timeout,
@@ -180,10 +181,11 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         guard !connection.disconnected else { throw BrokerFailure.disconnected }
         guard preferences.available else { throw BrokerFailure.settingsUnavailable }
         connectionPhase = .connected
+        logger.info("Backend connection registered; protected settings loaded")
         while !Task.isCancelled {
             guard !connection.disconnected else { throw BrokerFailure.disconnected }
             if active == nil && !controls.busy && !preferences.busy && !vaultActivity.busy,
-                preferences.snapshot?.provider != nil, preferences.snapshot?.settings?.github != nil
+                preferences.snapshot?.provider != nil, preferences.snapshot?.settings?.github?.enabled == true
             {
                 do { try await poll(connection, key: key) } catch let error as BrokerControlError
                     where [.denied, .sessionEnded, .expired, .busy, .providerChanged].contains(error)
@@ -205,7 +207,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             "The app and backend could not communicate. Restart both from the same build."
         case BrokerFailure.settingsUnavailable:
             "Protected settings could not be loaded. Retry or open Settings for details."
-        case BrokerControlError.denied: "The backend refused this app. Restart both from the same build."
+        case BrokerControlError.denied: "The backend refused registration. Unlock this Mac, then retry."
         default: error.localizedDescription
         }
     }
@@ -216,6 +218,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 throw BrokerFailure.invalidMessage
             }
             operationEnrolled = true
+            logger.info("Approval connection enrolled; polling for requests")
         }
         switch try await connection.call(.next) {
         case .idle: break
@@ -286,11 +289,11 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         }
     }
 
-    func stageEnrollment(password: String) {
+    func stageEnrollment(password: String, replacement: EnrollmentDraft? = nil) {
         guard active == nil, !controls.busy, !vaultActivity.busy else { return }
         Task {
             await controls.perform {
-                await preferences.enroll(password: password)
+                await preferences.enroll(password: password, replacement: replacement)
             }
         }
     }

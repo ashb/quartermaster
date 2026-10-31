@@ -106,7 +106,11 @@ impl Settings {
     }
 
     pub(super) fn policy(&self) -> Result<Policy, AuthorizationError> {
-        let config = self.github.clone().ok_or(AuthorizationError::Denied)?;
+        let config = self
+            .github
+            .clone()
+            .filter(GitHubConfig::enabled)
+            .ok_or(AuthorizationError::Denied)?;
         Ok(Policy::default()
             .with_github(config)
             .with_mutation_rule(match self.mutations {
@@ -321,6 +325,26 @@ mod tests {
         ] {
             assert!(Settings::decode(bytes).is_err());
         }
+    }
+
+    #[test]
+    fn disabling_github_retains_configuration_but_cannot_create_policy() {
+        let original = rules();
+        let encoded = serde_json::to_value(&original).unwrap();
+        assert!(encoded["github"].get("enabled").is_none());
+        let mut disabled = encoded.clone();
+        disabled["github"]["enabled"] = serde_json::json!(false);
+        let settings = Settings::decode(&serde_json::to_vec(&disabled).unwrap()).unwrap();
+        assert!(settings.policy().is_err());
+        let persisted = serde_json::to_vec(&settings).unwrap();
+        let restored = Settings::decode(&persisted).unwrap();
+        assert!(restored.policy().is_err());
+        assert_eq!(serde_json::to_value(&restored).unwrap(), disabled);
+        disabled["github"]["enabled"] = serde_json::json!(true);
+        let enabled = Settings::decode(&serde_json::to_vec(&disabled).unwrap()).unwrap();
+        assert!(enabled == original);
+        assert!(enabled.policy().is_ok());
+        assert_eq!(serde_json::to_value(&enabled).unwrap(), encoded);
     }
 
     #[test]

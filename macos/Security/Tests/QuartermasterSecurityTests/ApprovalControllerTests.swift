@@ -355,6 +355,23 @@ func changingScopeWhileWaitingForTouchIDRejectsTheOldAuthentication(_ fails: Boo
     #expect(backend.cancellations == 0)
 }
 
+@Test @MainActor func failedScopeChangeCannotReviveAuthenticationOrCancelTwice() async {
+    let now = MonotonicTimestamp.now
+    let authentication = AuthenticationFixture(timestamp: now)
+    let backend = UnlockBackendFixture(created: now)
+    let controller = ApprovalController(unlock: backend, reason: "test", authentication: authentication, now: { now })
+    #expect(controller.supersedeReview())
+    controller.scopeChangeFailed()
+    controller.scopeChangeFailed()
+    await controller.approve()
+    #expect(!controller.supersedeReview())
+    #expect(controller.phase == .stopped)
+    #expect(authentication.requests == 0)
+    #expect(authentication.invalidations == 1)
+    #expect(backend.cancellations == 1)
+    #expect(backend.unlocks == 0)
+}
+
 @Test @MainActor func completedAuthenticationPreventsChangingTheReviewedScope() async throws {
     let storage = MemoryKeyStorage()
     let keys = ApprovalKeyStore(storage: storage)

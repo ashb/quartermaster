@@ -1325,6 +1325,7 @@ mod tests {
             process_chain: vec!["dummy test process · PID 1".into()],
             peer: qm_macos::peer_identity::PeerPresentation {
                 pid: 1,
+                started_unix_micros: None,
                 executable: "/dummy/test".into(),
                 signing_identifier: "dummy.test".into(),
                 team_identifier: None,
@@ -1333,6 +1334,7 @@ mod tests {
                 ancestry_complete: true,
                 ancestry_note: None,
                 command_line: None,
+                working_directory: None,
                 processes: Vec::new(),
             },
         };

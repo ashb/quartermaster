@@ -7,6 +7,7 @@ struct DialogProcess: Codable, Equatable {
     let name: String
     let executable: String?
     let limited: Bool
+    var startedUnixMicros: UInt64? = nil
 }
 
 enum ProcessChoice: Equatable {
@@ -23,33 +24,48 @@ struct ProcessTreeRow: Identifiable {
     let process: DialogProcess
     let choice: ProcessChoice?
     let label: String
+    let duration: String
     let scopeOffered: Bool
     var id: UInt32 { process.pid }
     var dimmed: Bool { process.limited || (scopeOffered && choice == nil) }
 
     static func make(
-        processes: [DialogProcess], peerPID: UInt32, roots: [ReadRootChoice], allowsSelection: Bool
+        processes: [DialogProcess], peerPID: UInt32, roots: [ReadRootChoice], allowsSelection: Bool,
+        shimExecutable: String? = Bundle.main.url(forAuxiliaryExecutable: "qm")?.path
     ) -> [Self] {
-        processes.map { process in
+        processes.compactMap { process in
             let root = roots.first { $0.pid == process.pid && $0.executable == process.executable }
+            if let executable = process.executable,
+                executable == "/usr/bin/login" || executable == shimExecutable,
+                process.pid != peerPID, root == nil
+            {
+                return nil
+            }
             let choice: ProcessChoice?
             let label: String
+            let duration: String
             if allowsSelection, !process.limited, let root {
                 choice = .root(root.id)
                 switch root.scope {
-                case .process: label = "This process"
+                case .process:
+                    label = "This process"
+                    duration = "until it exits"
                 case .descendants:
                     label =
                         root.id == roots.first(where: { $0.scope == .descendants })?.id ? "This shell" : "Parent shell"
+                    duration = "up to 1 hour"
                 }
             } else if allowsSelection, process.pid == peerPID, !process.limited {
                 choice = .request
                 label = "This request"
+                duration = ""
             } else {
                 choice = nil
                 label = ""
+                duration = ""
             }
-            return Self(process: process, choice: choice, label: label, scopeOffered: allowsSelection)
+            return Self(
+                process: process, choice: choice, label: label, duration: duration, scopeOffered: allowsSelection)
         }
     }
 
@@ -95,10 +111,10 @@ struct ProcessScopeTree: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 2) {
+            ContentSizedScrollView(maxHeight: 148) {
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(rows.enumerated()), id: \.element.id) { depth, row in
-                        let indent = CGFloat(min(depth, 6)) * 32
+                        let indent = CGFloat(min(depth, 6)) * 18
                         processRow(row, first: depth == 0)
                             .padding(.leading, indent)
                             .overlay(alignment: .topLeading) {
@@ -108,8 +124,8 @@ struct ProcessScopeTree: View {
                                             .tertiary,
                                             style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round)
                                         )
-                                        .frame(width: 9, height: 28)
-                                        .offset(x: indent - 12.5)
+                                        .frame(width: 9, height: 32)
+                                        .offset(x: indent - 10)
                                         .allowsHitTesting(false)
                                         .accessibilityHidden(true)
                                 }
@@ -142,35 +158,39 @@ struct ProcessScopeTree: View {
                 }
             }
         }
-        .frame(height: 148, alignment: .top)
     }
 
     private func processRow(_ row: ProcessTreeRow, first: Bool) -> some View {
         let selected = row.choice == selection
         let application = ProcessApplication(executable: row.process.executable)
         let content = HStack(spacing: 9) {
-            if let application {
+            if row.process.name == "gh", ApprovalAppearance.githubIcon != nil {
+                GitHubIcon(size: 19).foregroundStyle(selected ? ApprovalAppearance.accent : .secondary)
+            } else if let application {
                 Image(nsImage: application.icon).resizable().renderingMode(.original)
                     .scaledToFit().frame(width: 19, height: 19)
             } else {
                 Image(systemName: row.process.name == "login" ? "lock" : "terminal")
                     .font(.system(size: 15)).frame(width: 19)
-                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                    .foregroundStyle(selected ? ApprovalAppearance.accent : .secondary)
             }
             Text(verbatim: application?.name ?? row.process.name)
-                .font(.system(.body, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                .font(.system(size: 13, weight: .medium, design: .monospaced)).lineLimit(1).truncationMode(.middle)
                 .foregroundStyle(.primary)
             Text(String(row.id)).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
             Spacer(minLength: 4)
-            Text(row.label).font(.caption).fixedSize()
-                .foregroundStyle(selected ? Color.accentColor : .secondary)
+            ViewThatFits(in: .horizontal) {
+                Text(row.duration.isEmpty ? row.label : "\(row.label) · \(row.duration)")
+                Text(row.label)
+            }.font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                .foregroundStyle(selected ? ApprovalAppearance.accent : .secondary)
             Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                .foregroundStyle(selected ? ApprovalAppearance.accent : .secondary)
                 .opacity(row.choice == nil ? 0 : 1).frame(width: 15)
         }
-        .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 28)
-        .background(background(for: row), in: RoundedRectangle(cornerRadius: 7))
-        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(selected ? Color.accentColor : .clear))
+        .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 32)
+        .background(background(for: row), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(selected ? ApprovalAppearance.accent : .clear))
         .contentShape(Rectangle())
         return Group {
             if row.scopeOffered {
@@ -188,31 +208,44 @@ struct ProcessScopeTree: View {
         .opacity(row.dimmed ? 0.5 : 1)
         .help([row.help, first && !row.process.limited ? ancestryNote : nil].compactMap { $0 }.joined(separator: "\n"))
         .focused($focusedRow, equals: row.id)
-        .accessibilityLabel("\(application?.name ?? row.process.name), PID \(row.id), \(row.label)")
+        .accessibilityLabel("\(application?.name ?? row.process.name), PID \(row.id), \(row.label), \(row.duration)")
         .accessibilityValue(row.scopeOffered ? (selected ? "Selected" : "Not selected") : "")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func background(for row: ProcessTreeRow) -> Color {
-        if row.choice == selection { return .accentColor.opacity(0.12) }
+        if row.choice == selection { return ApprovalAppearance.accent.opacity(0.12) }
         guard case .root = selection,
             let selected = rows.firstIndex(where: { $0.choice == selection }),
             let index = rows.firstIndex(where: { $0.id == row.id }), index > selected
         else { return .clear }
-        return .accentColor.opacity(0.035)
+        return ApprovalAppearance.accent.opacity(0.035)
+    }
+}
+
+struct ContentSizedScrollView<Content: View>: View {
+    let maxHeight: CGFloat
+    @ViewBuilder let content: Content
+    @State private var contentHeight: CGFloat?
+
+    var body: some View {
+        ScrollView(.vertical) {
+            content.onGeometryChange(for: CGFloat.self) { geometry in
+                geometry.size.height
+            } action: { height in
+                contentHeight = height
+            }
+        }.frame(height: min(contentHeight ?? maxHeight, maxHeight), alignment: .top)
     }
 }
 
 private struct ProcessBranch: Shape {
     func path(in rect: CGRect) -> Path {
         Path { path in
-            path.move(to: CGPoint(x: 0, y: rect.midY - 9))
+            path.move(to: CGPoint(x: 0, y: -6))
             path.addLine(to: CGPoint(x: 0, y: rect.midY - 4))
             path.addQuadCurve(to: CGPoint(x: 4, y: rect.midY), control: CGPoint(x: 0, y: rect.midY))
             path.addLine(to: CGPoint(x: 8, y: rect.midY))
-            path.move(to: CGPoint(x: 5, y: rect.midY - 3))
-            path.addLine(to: CGPoint(x: 8, y: rect.midY))
-            path.addLine(to: CGPoint(x: 5, y: rect.midY + 3))
         }
     }
 }

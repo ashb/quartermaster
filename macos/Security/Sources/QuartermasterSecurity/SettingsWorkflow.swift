@@ -15,12 +15,36 @@ public struct RepositorySetting: Codable, Equatable, Sendable, Identifiable {
 }
 
 public struct GitHubSettings: Codable, Equatable, Sendable {
+    public var enabled = true
     public var version = 1
     public var mode = "github"
     public var repositories: [RepositorySetting] = []
     public var approveUnverifiedRequests = false
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case version, enabled, mode, repositories, approveUnverifiedRequests
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(Int.self, forKey: .version)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        mode = try values.decode(String.self, forKey: .mode)
+        repositories = try values.decode([RepositorySetting].self, forKey: .repositories)
+        approveUnverifiedRequests = try values.decode(Bool.self, forKey: .approveUnverifiedRequests)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(version, forKey: .version)
+        if !enabled { try values.encode(false, forKey: .enabled) }
+        try values.encode(mode, forKey: .mode)
+        try values.encode(repositories, forKey: .repositories)
+        try values.encode(approveUnverifiedRequests, forKey: .approveUnverifiedRequests)
+    }
+
 }
 
 public struct BrokerSettings: Codable, Equatable, Sendable {

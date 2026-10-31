@@ -130,3 +130,39 @@ import Testing
     #expect(!application.preferences.canReview)
     #expect(commands == 1)
 }
+
+@Test @MainActor func preferencesWindowKeepsNativeControlsAndForwardsLifecycleWithoutOpeningOnAttachment() {
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 900, height: 625),
+        styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: true)
+    window.isReleasedWhenClosed = false
+    var openedWindows: [NSWindow] = []
+    var closes = 0
+    let observer = PreferencesWindowObserver(opened: { openedWindows.append($0) }, closed: { closes += 1 })
+    window.contentView = observer
+
+    #expect(window.styleMask.contains([.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]))
+    #expect(window.level == .normal)
+    #expect(window.title == "Quartermaster")
+    #expect(window.titleVisibility == .hidden)
+    #expect(window.titlebarAppearsTransparent)
+    #expect(window.titlebarAccessoryViewControllers.isEmpty)
+    let titleBar = window.standardWindowButton(.closeButton)?.superview
+    func titles() -> [NSView] {
+        titleBar?.subviews.filter { $0.identifier?.rawValue == "QuartermasterTitle" } ?? []
+    }
+    #expect(titles().count == 1)
+    #expect(openedWindows.isEmpty)
+
+    observer.viewDidMoveToWindow()
+    #expect(titles().count == 1)
+    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+    #expect(openedWindows == [window])
+    NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: window)
+    #expect(closes == 1)
+
+    observer.removeFromSuperview()
+    #expect(titles().isEmpty)
+    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+    #expect(openedWindows.count == 1)
+}
