@@ -95,6 +95,9 @@ public final class SettingsEditor: ObservableObject {
         available && !busy && snapshot?.migration == nil && !enrollmentNeedsVerification && hasChanges
     }
     public var canImport: Bool { available && !busy && snapshot?.migration?.source.supported == true }
+    public var canDiscard: Bool {
+        !busy && (hasChanges || enrollment != EnrollmentDraft(provider: snapshot?.provider))
+    }
 
     public func load() async {
         await perform {

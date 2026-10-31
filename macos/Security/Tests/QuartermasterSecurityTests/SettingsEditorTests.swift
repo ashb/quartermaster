@@ -24,6 +24,33 @@ private func editorProvider(
         scope: "0123456789abcdef0123456789abcdef", deviceKey: Array(repeating: 7, count: 32))
 }
 
+@Test(arguments: ["settings", "enrolment", "whitespace", "forget", "staged"])
+@MainActor func discardIsAvailableOnlyWhileThereAreDraftChanges(_ change: String) async throws {
+    let provider = editorProvider()
+    let snapshot = editorSnapshot(provider: provider)
+    let editor = SettingsEditor { command in
+        if case .stageEnrollment = command { return .enrollmentStaged(ticket: "verified", provider: provider) }
+        return .settingsStatus(snapshot)
+    }
+    #expect(!editor.canDiscard)
+    await editor.load()
+    #expect(!editor.canDiscard)
+    switch change {
+    case "settings": editor.draft.mutations = .requireApproval
+    case "enrolment": editor.enrollment.email = "edited@example.invalid"
+    case "whitespace": editor.enrollment.email += " "
+    case "forget": editor.forget()
+    default: await editor.enroll(password: "dummy-password")
+    }
+    #expect(editor.canDiscard)
+    editor.discardDraft()
+    #expect(!editor.canDiscard)
+    #expect(editor.draft == snapshot.settings)
+    #expect(editor.enrollment.email == provider.binding.email)
+    #expect(editor.pendingRepositories.isEmpty)
+    #expect(editor.stagedProvider == nil)
+}
+
 @Test @MainActor func unchangedPreferencesCannotBeReviewed() async throws {
     let snapshot = editorSnapshot(provider: editorProvider())
     var preparations = 0
@@ -218,10 +245,12 @@ private func editorProvider(
     let verification = Task { await editor.enroll(password: "dummy-password") }
     while reply == nil { await Task.yield() }
     editor.enrollment.itemID = "changed-while-verifying"
+    #expect(!editor.canDiscard)
     reply?.resume(returning: .enrollmentStaged(ticket: "obsolete", provider: provider))
     await verification.value
     #expect(editor.stagedProvider == nil)
     #expect(!editor.canReview)
+    #expect(editor.canDiscard)
 }
 
 @Test @MainActor func failedReverificationCannotReuseThePreviousTicket() async throws {
@@ -274,11 +303,13 @@ private func editorProvider(
     #expect(!editor.canReview)
     #expect(editor.addRepository("example/one"))
     #expect(editor.canReview)
+    #expect(editor.canDiscard)
     #expect(!editor.addRepository("EXAMPLE/ONE"))
     #expect(!editor.addRepository("example/../two"))
     #expect(editor.snapshot?.settings?.github?.repositories.isEmpty == true)
     editor.removeRepository(try #require(editor.pendingRepositories.first))
     #expect(!editor.canReview)
+    #expect(!editor.canDiscard)
     editor.addRepository("example/one")
     await editor.cancel()
     #expect(editor.pendingRepositories.isEmpty)

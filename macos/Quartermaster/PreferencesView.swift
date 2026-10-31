@@ -325,7 +325,7 @@ struct PreferencesView: View {
                 HStack {
                     Button("Reconnect", action: application.reconnect)
                     Spacer()
-                    Button("Discard Changes", action: application.discardChanges).disabled(editor.busy)
+                    Button("Discard Changes", action: application.discardChanges).disabled(!editor.canDiscard)
                 }
             }
         }
