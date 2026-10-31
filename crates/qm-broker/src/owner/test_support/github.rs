@@ -125,7 +125,9 @@ pub(crate) fn unauthorized() -> Reply {
         status: 401,
         content_type: "application/json",
         headers: "X-RateLimit-Remaining: 17\r\n".into(),
-        body: b"private upstream authentication detail".to_vec(),
+        body:
+            br#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest"}"#
+                .to_vec(),
         id_bound_body: None,
         gate: None,
     }

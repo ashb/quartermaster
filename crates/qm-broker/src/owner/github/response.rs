@@ -264,6 +264,15 @@ impl WireResponse {
         credential: &[u8],
         log_download: bool,
     ) -> Result<Outcome, Error> {
+        self.public_response(credential, log_download)
+            .map(Outcome::Response)
+    }
+
+    fn public_response(
+        &self,
+        credential: &[u8],
+        log_download: bool,
+    ) -> Result<PublicResponse, Error> {
         self.check_body_secret(credential)?;
         if self.header("location").is_some_and(|target| {
             target.contains('\\')
@@ -285,12 +294,12 @@ impl WireResponse {
             check_header_secret(value, credential)?;
             headers.push((name.clone(), value.to_string()));
         }
-        Ok(Outcome::Response(PublicResponse {
+        Ok(PublicResponse {
             status: self.status,
             headers,
             body: self.body.to_vec(),
             mode: self.mode,
-        }))
+        })
     }
 
     fn header(&self, name: &str) -> Option<&str> {
@@ -378,31 +387,13 @@ impl WireResponse {
         Ok(safe)
     }
 
-    fn error_response(&self, credential: &[u8]) -> Result<PublicResponse, Error> {
-        let (status, message) = match self.status {
-            401 => (401, "GitHub rejected the configured credential"),
-            403 => (403, "GitHub denied this operation"),
-            404 => (404, "GitHub did not find this resource"),
-            429 => (429, "GitHub rate limit exceeded"),
-            _ => (502, "GitHub response could not be confirmed"),
-        };
-        let mut headers = self.safe_headers(credential)?;
-        headers.push(("Content-Type".into(), "application/json".into()));
-        Ok(PublicResponse {
-            status,
-            headers,
-            body: serde_json::to_vec(&serde_json::json!({"message":message})).map_err(|_| Error)?,
-            mode: BodyMode::Content,
-        })
-    }
-
     pub(super) fn metadata_bytes(&self, credential: &[u8]) -> Result<&[u8], MetadataFailure> {
         if self.status != 200 {
             if (300..400).contains(&self.status) {
                 return Err(MetadataFailure::Invalid);
             }
             return Err(MetadataFailure::Public(
-                self.error_response(credential)
+                self.public_response(credential, false)
                     .map_err(|_| MetadataFailure::Invalid)?,
             ));
         }
@@ -434,7 +425,7 @@ impl WireResponse {
             return Ok(Outcome::Redirect(target));
         }
         if self.status != 200 {
-            return Ok(Outcome::Response(self.error_response(credential)?));
+            return self.application(credential, false);
         }
         self.json(credential)?;
         #[derive(Deserialize)]
@@ -968,32 +959,29 @@ mod tests {
     }
 
     #[test]
-    fn github_response_uses_fixed_error_bodies_and_bounded_rate_limit_metadata() {
+    fn github_response_preserves_upstream_errors_and_rate_limit_metadata() {
         let (request, binding) = fixture(false);
         for status in [401, 403, 404, 429, 500] {
+            let body = r#"{"message":"Resource not accessible by personal access token","documentation_url":"https://docs.github.com/rest","status":"403"}"#;
             let upstream = read(&mut Cursor::new(wire(
                 status,
                 "Retry-After: 30\r\nX-RateLimit-Reset: 1792483200\r\n",
-                "upstream private detail quartermaster-dummy-canary",
+                body,
             )))
             .unwrap();
             let Outcome::Response(response) = upstream.issues(&request, &binding, TOKEN).unwrap()
             else {
                 panic!()
             };
-            assert_eq!(response.status, if status == 500 { 502 } else { status });
-            assert!(
-                !std::str::from_utf8(&response.body)
-                    .unwrap()
-                    .contains("private")
-            );
-            assert!(!response.body.windows(TOKEN.len()).any(|part| part == TOKEN));
+            assert_eq!(response.status, status);
+            assert_eq!(response.body, body.as_bytes());
             assert_eq!(response.headers.len(), 3);
             assert!(
                 response
                     .headers
                     .iter()
-                    .any(|(name, value)| name == "Content-Type" && value == "application/json")
+                    .any(|(name, value)| name == "Content-Type"
+                        && value == "application/json; charset=utf-8")
             );
         }
     }
@@ -1042,15 +1030,11 @@ mod tests {
     }
 
     #[test]
-    fn github_response_metadata_authentication_failures_return_fixed_status_and_safe_rate_metadata()
-    {
-        for status in [401, 403, 404, 429] {
-            let upstream = read(&mut Cursor::new(wire(
-                status,
-                "Retry-After: 30\r\n",
-                "private authentication failure quartermaster-dummy-canary",
-            )))
-            .unwrap();
+    fn github_response_metadata_failures_preserve_upstream_status_body_and_rate_metadata() {
+        for status in [401, 403, 404, 429, 500] {
+            let body = r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest"}"#;
+            let upstream =
+                read(&mut Cursor::new(wire(status, "Retry-After: 30\r\n", body))).unwrap();
             let Err(MetadataFailure::Public(response)) = upstream.metadata_bytes(TOKEN) else {
                 panic!()
             };
@@ -1059,20 +1043,44 @@ mod tests {
                 response.headers,
                 [
                     ("Retry-After".to_owned(), "30".to_owned()),
-                    ("Content-Type".to_owned(), "application/json".to_owned())
+                    (
+                        "Content-Type".to_owned(),
+                        "application/json; charset=utf-8".to_owned()
+                    )
                 ]
             );
-            assert!(
-                !std::str::from_utf8(&response.body)
-                    .unwrap()
-                    .contains("private")
-            );
-            assert!(
-                !response
-                    .body
-                    .windows(b"quartermaster-dummy-canary".len())
-                    .any(|part| part == b"quartermaster-dummy-canary")
-            );
+            assert_eq!(response.body, body.as_bytes());
+        }
+    }
+
+    #[test]
+    fn upstream_errors_cannot_echo_the_selected_credential() {
+        let (request, binding) = fixture(false);
+        for status in [401, 403, 500] {
+            for body in [
+                format!(r#"{{"message":"{}"}}"#, std::str::from_utf8(TOKEN).unwrap()),
+                format!(
+                    r#"{{"message":"{}"}}"#,
+                    TOKEN
+                        .iter()
+                        .map(|b| format!("\\u{b:04x}"))
+                        .collect::<String>()
+                ),
+            ] {
+                let bytes = wire(status, "", &body);
+                assert!(
+                    read(&mut Cursor::new(&bytes))
+                        .unwrap()
+                        .issues(&request, &binding, TOKEN)
+                        .is_err()
+                );
+                assert!(matches!(
+                    read(&mut Cursor::new(&bytes))
+                        .unwrap()
+                        .metadata_bytes(TOKEN),
+                    Err(MetadataFailure::Invalid)
+                ));
+            }
         }
     }
 

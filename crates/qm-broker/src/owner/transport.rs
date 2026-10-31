@@ -21,6 +21,7 @@ pub(super) enum OperationResponse {
     IssueOpen,
     IssueClosed,
     Denied,
+    InvalidCredential,
     ApprovalUnavailable,
     FrontendChanged,
     Uncertain,
@@ -48,6 +49,10 @@ impl OperationResponse {
             Self::Denied => (
                 "403 Forbidden".into(),
                 b"{\"message\":\"Quartermaster denied this operation\"}",
+            ),
+            Self::InvalidCredential => (
+                "503 Service Unavailable".into(),
+                b"{\"message\":\"The selected vault value cannot be used as a GitHub token. Check the selected vault field, then sync the vault.\"}",
             ),
             Self::ApprovalUnavailable => (
                 "503 Service Unavailable".into(),

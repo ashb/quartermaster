@@ -39,13 +39,6 @@ original data. **Sync Vault** refreshes the selected cache from Vaultwarden.
 The development enrolment uses the role label `github-write`. It can hold the
 read-only token above; the label does not give that token write permissions.
 
-Fine-grained PATs [cannot access the Checks API](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-tokens-limitations).
-With this token, default `gh pr view` can fail when a PR has Actions checks,
-and `gh run view` cannot display check annotations; log downloads still work.
-Checks require a GitHub App token with **Checks: read** or a classic PAT with
-`repo` scope for private repositories. **Workflows** permission does not enable
-check reads.
-
 ## Select a repository
 
 Choose the repository by name:

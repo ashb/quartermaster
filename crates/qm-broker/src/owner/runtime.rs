@@ -231,7 +231,7 @@ async fn serve_ingress(
                 let paths = paths.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = http::handle_http(&mut stream, &shared, &paths) {
-                        eprintln!("Request denied: {error}");
+                        eprintln!("Request failed: {error}");
                         let _ = http::response(&mut stream, error.http_response());
                     }
                 })
@@ -784,7 +784,7 @@ mod github_tests {
     }
 
     #[test]
-    fn github_runtime_rejects_recreated_repository_and_returns_fixed_credential_errors_before_issue_dispatch()
+    fn github_runtime_rejects_recreated_repository_and_preserves_upstream_errors_before_issue_dispatch()
      {
         for unauthorized in [false, true] {
             let reply = if unauthorized {
@@ -804,8 +804,7 @@ mod github_tests {
             if unauthorized {
                 let response = result.unwrap();
                 assert!(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
-                assert!(response.contains("GitHub rejected the configured credential"));
-                assert!(!response.contains("private upstream"));
+                assert!(response.ends_with(r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest"}"#));
             } else {
                 assert!(result.is_err());
             }

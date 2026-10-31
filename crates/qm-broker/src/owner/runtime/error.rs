@@ -61,6 +61,9 @@ pub(in crate::owner) enum Fault {
 impl Error {
     pub(super) fn http_response(&self) -> OperationResponse {
         match self {
+            Self::Dispatch(dispatch::Error::InvalidCredential) => {
+                OperationResponse::InvalidCredential
+            }
             Self::State(Fault::FrontendChanged) => OperationResponse::FrontendChanged,
             Self::State(Fault::UiDisconnected | Fault::LaunchFailed) => {
                 OperationResponse::ApprovalUnavailable
@@ -200,7 +203,7 @@ impl fmt::Display for Error {
             Self::Authorization(_) => f.write_str("authorization failed"),
             Self::Operation(_) => f.write_str("operation failed"),
             Self::Provider(_) | Self::Vault(_) => f.write_str("provider failed"),
-            Self::Dispatch(_) => f.write_str("dispatch failed"),
+            Self::Dispatch(error) => write!(f, "dispatch failed: {error}"),
             Self::Protocol(code) => code.fmt(f),
             Self::Credential(_) => f.write_str("credential authorization failed"),
             Self::Task(_) => f.write_str("runtime task failed"),
@@ -226,6 +229,35 @@ impl std::error::Error for Error {
 mod tests {
     use super::*;
     use crate::owner::protocol::{Reply, encode_reply};
+
+    #[test]
+    fn dispatch_diagnostics_preserve_failure_reasons() {
+        for (error, reason) in [
+            (dispatch::Error::InvalidCredential, "InvalidCredential"),
+            (dispatch::Error::CredentialMismatch, "CredentialMismatch"),
+            (
+                dispatch::Error::Authorization(AuthorizationError::Expired),
+                "Expired",
+            ),
+        ] {
+            assert_eq!(
+                Error::Dispatch(error).to_string(),
+                format!("dispatch failed: {reason}")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_selected_credential_is_not_reported_as_an_authorization_denial() {
+        let response = Error::Dispatch(dispatch::Error::InvalidCredential).http_response();
+        let (status, body) = response.public_parts();
+        assert_eq!(status, "503 Service Unavailable");
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            body["message"],
+            "The selected vault value cannot be used as a GitHub token. Check the selected vault field, then sync the vault."
+        );
+    }
 
     #[test]
     fn ui_failures_are_distinct_from_denials_without_exposing_internal_errors() {
