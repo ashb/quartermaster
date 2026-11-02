@@ -1,4 +1,6 @@
 #[cfg(target_os = "macos")]
+mod maintenance;
+#[cfg(target_os = "macos")]
 mod persistence;
 #[cfg(any(target_os = "macos", test))]
 mod request;
@@ -71,6 +73,18 @@ pub(super) fn persisted_status(options: ServiceOptions) -> Result<CacheStatus, S
             })?;
         status.observation = Some(crate::StatusObservation::PersistedCache);
         Ok(status)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = options;
+        Err(ServiceError::UnsupportedPlatform)
+    }
+}
+pub(super) fn reset_settings(options: ServiceOptions) -> Result<(), ServiceError> {
+    #[cfg(target_os = "macos")]
+    {
+        validate(&options)?;
+        maintenance::reset_settings(&options.storage_root).map_err(ServiceError::Runtime)
     }
     #[cfg(not(target_os = "macos"))]
     {

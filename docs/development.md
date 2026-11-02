@@ -209,9 +209,10 @@ After disconnecting, select the intended cache under **Retained enrolments** to
 review and reauthorize it without signing in again. Listed metadata grants no
 access; Save authenticates the cache before selecting it.
 
-Approved settings and the UI public-key pin are stored together in the backend's
-Data Protection Keychain access group, under service
-`dev.quartermaster.settings.development.v1`. There is no authoritative JSON copy.
+Approved settings use `dev.quartermaster.settings.development.v1` in the backend's
+Data Protection Keychain access group. The UI public-key pin uses the separate
+`dev.quartermaster.settings-key.development.v1` service. There is no authoritative
+JSON copy.
 Opening the UI reads settings without requesting a fingerprint. Missing or
 unreadable protected state grants no access; **Reconnect** retries registration.
 
@@ -222,8 +223,30 @@ target/macos/signed/Quartermaster.app/Contents/MacOS/Quartermaster --approval-ke
 ```
 
 The CLI cannot reset the approval key. A mismatched key or damaged protected
-settings record fails closed; an authenticated recovery flow is not implemented.
+settings record fails closed.
 Do not delete retained keys as a troubleshooting shortcut.
+
+### Reset settings after an incompatible development format change
+
+Quit Quartermaster, then run from the repository root:
+
+```sh
+just build-signed
+target/macos/signed/Quartermaster.app/Contents/Helpers/QuartermasterBackend.app/Contents/MacOS/quartermasterd reset-settings
+open target/macos/signed/Quartermaster.app
+```
+
+The command stops the backend, waits for it to exit and clears its protected
+settings record. It retains the approval-key pin, Secure Enclave keys and encrypted
+cache files; those files
+cannot select a vault or grant access. It refuses to reset while a backend still
+holds its lock.
+
+In **Settings → Vault**, verify your server, email, master password and selected
+vault item, then save with Touch ID and restore your GitHub rules. If the retained
+cache format is still supported, **Retained enrolments** can instead review and
+reauthorise the previous selection. Source vault items and repositories are
+unaffected.
 
 If signing reports no valid identity, check that the pinned certificate is valid
 and its private key is available. For missing or expired profiles, run

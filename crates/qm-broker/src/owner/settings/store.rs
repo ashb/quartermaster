@@ -5,6 +5,7 @@ trait Storage: Send + Sync {
     fn load(&self) -> Result<Option<Vec<u8>>, Error>;
     fn create(&self, bytes: &[u8]) -> Result<(), Error>;
     fn replace(&self, bytes: &[u8]) -> Result<(), Error>;
+    fn delete(&self) -> Result<(), Error>;
 }
 
 pub(in crate::owner) struct Store {
@@ -13,6 +14,10 @@ pub(in crate::owner) struct Store {
 }
 
 impl Store {
+    pub(in crate::owner) fn reset(&self) -> Result<(), Error> {
+        self.storage.delete()
+    }
+
     #[cfg(target_os = "macos")]
     pub(in crate::owner) fn native() -> Result<Self, Error> {
         use qm_macos::protected_record::ProtectedRecord;
@@ -138,6 +143,9 @@ impl Storage for qm_macos::protected_record::ProtectedRecord {
     fn replace(&self, bytes: &[u8]) -> Result<(), Error> {
         self.replace(bytes).map_err(|_| Error::Storage)
     }
+    fn delete(&self) -> Result<(), Error> {
+        self.delete().map_err(|_| Error::Storage)
+    }
 }
 
 #[cfg(test)]
@@ -152,12 +160,30 @@ pub(super) mod tests {
 
     #[derive(Default)]
     pub(super) struct Memory(Mutex<Option<Vec<u8>>>);
+    struct ReadOnly;
+    impl Storage for ReadOnly {
+        fn load(&self) -> Result<Option<Vec<u8>>, Error> {
+            Ok(Some(b"retained".to_vec()))
+        }
+        fn create(&self, _: &[u8]) -> Result<(), Error> {
+            Err(Error::Storage)
+        }
+        fn replace(&self, _: &[u8]) -> Result<(), Error> {
+            Err(Error::Storage)
+        }
+        fn delete(&self) -> Result<(), Error> {
+            Err(Error::Storage)
+        }
+    }
     pub(super) struct Paused {
         pub(super) memory: Memory,
         pub(super) entered: std::sync::mpsc::SyncSender<()>,
         pub(super) waiting: Mutex<std::sync::mpsc::Receiver<()>>,
     }
     impl Storage for Paused {
+        fn delete(&self) -> Result<(), Error> {
+            self.memory.delete()
+        }
         fn load(&self) -> Result<Option<Vec<u8>>, Error> {
             self.memory.load()
         }
@@ -175,6 +201,10 @@ pub(super) mod tests {
         }
     }
     impl Storage for Memory {
+        fn delete(&self) -> Result<(), Error> {
+            self.0.lock().unwrap().take();
+            Ok(())
+        }
         fn load(&self) -> Result<Option<Vec<u8>>, Error> {
             Ok(self.0.lock().unwrap().clone())
         }
@@ -227,6 +257,39 @@ pub(super) mod tests {
         key[0] = 4;
         assert!(store.load::<()>().is_err());
         assert!(store.register::<()>(&key).is_err());
+    }
+
+    #[test]
+    fn resetting_incompatible_settings_preserves_the_approval_key_pin() {
+        let mut key = vec![1; 65];
+        key[0] = 4;
+        let store = Store {
+            storage: Box::new(Memory(Mutex::new(Some(b"incompatible record".to_vec())))),
+            anchor: Box::new(Memory(Mutex::new(Some(key.clone())))),
+        };
+        assert!(store.load::<()>().is_err());
+        store.reset().unwrap();
+        store.reset().unwrap();
+        assert!(store.load::<()>().unwrap().is_none());
+        assert_eq!(store.anchor.load().unwrap(), Some(key.clone()));
+        let mut other = key.clone();
+        other[1] ^= 1;
+        assert!(store.register::<()>(&other).is_err());
+        let manager = store.register::<()>(&key).unwrap();
+        assert!(manager.record().settings().is_none());
+        assert!(manager.record().provider().is_none());
+    }
+
+    #[test]
+    fn reset_reports_storage_failure_without_replacing_the_record_or_key_pin() {
+        let key = vec![7; 65];
+        let store = Store {
+            storage: Box::new(ReadOnly),
+            anchor: Box::new(Memory(Mutex::new(Some(key.clone())))),
+        };
+        assert!(matches!(store.reset(), Err(Error::Storage)));
+        assert_eq!(store.storage.load().unwrap(), Some(b"retained".to_vec()));
+        assert_eq!(store.anchor.load().unwrap(), Some(key));
     }
 
     pub(in crate::owner) fn use_legacy_format(store: &Store) {

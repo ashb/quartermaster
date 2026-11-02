@@ -5,8 +5,9 @@ use std::{
     io::{self, Write},
     os::fd::AsRawFd,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 const SERVICE: &str = "dev.quartermaster.debug.backend";
@@ -71,11 +72,23 @@ impl Paths {
 
     fn stop(&self) -> io::Result<()> {
         let _lock = exclusive_lock(&self.root.join("startup.lock"))?;
+        self.stop_locked()
+    }
+
+    fn stop_locked(&self) -> io::Result<()> {
         Command::new("/bin/launchctl")
             .args(["bootout", &self.destination()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
+        wait_for_backend_exit(&self.root, Duration::from_secs(5))
+    }
+
+    fn reset_settings(&self) -> io::Result<()> {
+        let _lock = exclusive_lock(&self.root.join("startup.lock"))?;
+        self.stop_locked()?;
+        qm_broker::reset_settings(self.options()).map_err(io::Error::other)?;
+        println!("Settings cleared. Open Quartermaster and enrol your vault again.");
         Ok(())
     }
 
@@ -162,6 +175,28 @@ fn exclusive_lock(path: &std::path::Path) -> io::Result<File> {
     Ok(file)
 }
 
+fn wait_for_backend_exit(root: &Path, timeout: Duration) -> io::Result<()> {
+    let lock = private_file(&root.join("backend.lock"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the backend did not exit after stopping; quit Quartermaster and retry",
+            ));
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
 fn private_write(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = private_file(path)?;
     file.set_len(0)?;
@@ -181,6 +216,7 @@ pub fn run() -> io::Result<()> {
             paths.start()
         }
         [mode] if mode == "stop" => paths.stop(),
+        [mode] if mode == "reset-settings" => paths.reset_settings(),
         [mode] if mode == "cache-status" => {
             let status = qm_broker::persisted_status(paths.options()).map_err(io::Error::other)?;
             println!("{}", serde_json::to_string(&status)?);
@@ -188,7 +224,7 @@ pub fn run() -> io::Result<()> {
         }
         [mode] if mode == "serve" => qm_broker::serve(paths.options()).map_err(io::Error::other),
         _ => Err(failure(
-            "usage: quartermasterd start|restart|stop|serve|cache-status",
+            "usage: quartermasterd start|restart|stop|serve|cache-status|reset-settings",
         )),
     }
 }
@@ -223,6 +259,30 @@ mod tests {
             }
         });
         assert_eq!(registrations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_waits_for_a_daemon_that_releases_its_lock_after_bootout_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = exclusive_lock(&directory.path().join("backend.lock")).unwrap();
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&exited);
+        let daemon = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            observed.store(true, Ordering::SeqCst);
+            drop(backend);
+        });
+        wait_for_backend_exit(directory.path(), std::time::Duration::from_secs(1)).unwrap();
+        assert!(exited.load(Ordering::SeqCst));
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn stop_times_out_without_proceeding_when_the_backend_lock_remains_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let _backend = exclusive_lock(&directory.path().join("backend.lock")).unwrap();
+        let error = wait_for_backend_exit(directory.path(), std::time::Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

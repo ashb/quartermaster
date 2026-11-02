@@ -8,7 +8,7 @@ use core_foundation::{
 use security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
 use security_framework_sys::{
     item::*,
-    keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemUpdate},
+    keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate},
 };
 
 use qm_types::PROTECTED_RECORD_BYTES as LIMIT;
@@ -113,6 +113,16 @@ impl ProtectedRecord {
             )
         }]);
         check(unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) })
+    }
+
+    pub fn delete(&self) -> Result<(), Error> {
+        let query = query(&self.group, &self.service);
+        let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
+        if status == -25300 {
+            Ok(())
+        } else {
+            check(status)
+        }
     }
 }
 

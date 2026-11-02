@@ -125,3 +125,7 @@ pub fn serve(options: ServiceOptions) -> Result<(), ServiceError> {
 pub fn persisted_status(options: ServiceOptions) -> Result<CacheStatus, ServiceError> {
     owner::persisted_status(options)
 }
+
+pub fn reset_settings(options: ServiceOptions) -> Result<(), ServiceError> {
+    owner::reset_settings(options)
+}

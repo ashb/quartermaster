@@ -4,6 +4,18 @@ mod unix {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     #[test]
+    fn settings_reset_rejects_an_unverified_bundle_before_opening_protected_storage() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let result = qm_broker::reset_settings(ServiceOptions {
+            storage_root: root.path().into(),
+            bundle_root: root.path().join("Quartermaster.app"),
+        });
+        assert!(matches!(result, Err(ServiceError::InvalidBundle)));
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
     fn service_rejects_publicly_accessible_storage_before_starting() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
