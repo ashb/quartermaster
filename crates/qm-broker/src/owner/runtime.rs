@@ -1354,6 +1354,8 @@ mod tests {
             .unwrap();
         let (completion, receive) = mpsc::sync_channel(1);
         state.pending = Some(ApprovalDelivery {
+            _queue_ticket: None,
+            authenticated: None,
             id,
             principal,
             request,

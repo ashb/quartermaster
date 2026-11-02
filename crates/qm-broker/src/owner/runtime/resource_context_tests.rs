@@ -116,6 +116,7 @@ fn authenticated_lookup_context_reaches_mutation_review_without_serving_cached_r
         qm_macos::presence_clock::monotonic_raw().unwrap(),
         &shared,
         &paths,
+        &server,
     );
     assert!(
         matches!(result, Err(Error::State(Fault::ProviderChanged))),

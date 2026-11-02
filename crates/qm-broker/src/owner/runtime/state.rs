@@ -34,6 +34,7 @@ pub(super) struct OwnerState {
     pub(super) frontend_requirement: Option<String>,
     pub(super) approval_public_key: Option<Vec<u8>>,
     pub(super) pending: Option<ApprovalDelivery>,
+    pub(super) approval_queue: crate::owner::approval_queue::Queue,
     pub(super) provider: ProviderState,
     pub(super) authorizer: Authorizer,
     pub(super) session_policy: SessionPolicy,
@@ -79,6 +80,7 @@ impl OwnerState {
             frontend_requirement: None,
             approval_public_key: None,
             pending: None,
+            approval_queue: Default::default(),
             provider: ProviderState::default(),
             authorizer: Authorizer::new(random()?),
             session_policy: SessionPolicy::default(),
@@ -115,6 +117,7 @@ impl OwnerState {
         self.policy_stamp = stamp;
         match self.authorizer.install_current(decoded) {
             Ok(true) => {
+                self.approval_queue.clear();
                 self.github_resources.clear();
                 self.cancel_pending();
                 if let Some(ui) = &self.ui {
@@ -230,6 +233,7 @@ impl OwnerState {
     }
 
     fn disconnect_approval_ui(&mut self) {
+        self.approval_queue.clear();
         if let Some(ui) = self.ui.take() {
             self.operations.cancel_interactive_session(ui.session.id());
         }

@@ -41,6 +41,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private var task: Task<Void, Never>?
     private var vaultTask: Task<Void, Never>?
     private var active: (any ApprovalWindow)?
+    private var deferredReview: BrokerReply?
     private var presentation: Int32?
     private var settingsIsOpen = false
     private weak var settingsWindow: NSWindow?
@@ -141,6 +142,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     }
                     client?.cancel()
                     client = nil
+                    deferredReview = nil
                     operationEnrolled = false
                     backendBuild = nil
                     vaultStatus = nil
@@ -168,6 +170,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             throw CancellationError()
         }
         client = connection
+        deferredReview = nil
         guard case .hello("development", let build) = try await connection.call(.hello) else {
             throw BrokerFailure.invalidMessage
         }
@@ -190,6 +193,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 do { try await poll(connection, key: key) } catch let error as BrokerControlError
                     where [.denied, .sessionEnded, .expired, .busy, .providerChanged].contains(error)
                 {
+                    deferredReview = nil
                     operationEnrolled = false
                 }
             }
@@ -220,27 +224,45 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
             operationEnrolled = true
             logger.info("Approval connection enrolled; polling for requests")
         }
-        switch try await connection.call(.next) {
-        case .idle: break
-        case .review(let review):
-            guard active == nil, !controls.busy, !preferences.busy, !vaultActivity.busy else {
-                _ = try await connection.call(.cancel(id: review.id))
-                return
+        let reply: BrokerReply
+        if let deferred = deferredReview {
+            deferredReview = nil
+            reply = deferred
+        } else {
+            reply = try await connection.call(.next)
+        }
+        do {
+            switch reply {
+            case .idle: break
+            case .review(let review):
+                guard active == nil, !controls.busy, !preferences.busy, !vaultActivity.busy else {
+                    deferredReview = reply
+                    return
+                }
+                let pending = try BrokerPending(
+                    client: connection, review: review)
+                do { presentation = try acquirePresentation() } catch DialogPresentationLease.Failure
+                    .alreadyPresented
+                {
+                    deferredReview = reply
+                    return
+                }
+                let dialog = ApprovalDialog(
+                    presentation: ApprovalPresentation(
+                        request: pending.request, provider: pending.provider, display: pending.display,
+                        apiRequest: pending.apiRequest, readScope: pending.readScope), backend: pending,
+                    selectRoot: { root in try await pending.selectRoot(root) })
+                present(dialog)
+            default: throw BrokerFailure.invalidMessage
             }
-            let pending = try BrokerPending(client: connection, review: review)
-            do { presentation = try acquirePresentation() } catch DialogPresentationLease.Failure
-                .alreadyPresented
-            {
-                pending.cancel()
-                return
+        } catch {
+            switch reply {
+            case .review(let review):
+                _ = try? await connection.call(.cancel(id: review.id))
+            default: break
             }
-            let dialog = ApprovalDialog(
-                presentation: ApprovalPresentation(
-                    request: pending.request, provider: pending.provider, display: pending.display,
-                    apiRequest: pending.apiRequest, readScope: pending.readScope), backend: pending,
-                selectRoot: { root in try await pending.selectRoot(root) })
-            present(dialog)
-        default: throw BrokerFailure.invalidMessage
+            if case AuthorizationWorkflow.Failure.expired = error { return }
+            throw error
         }
     }
 
@@ -359,6 +381,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                     else {
                         throw BrokerFailure.disconnected
                     }
+                    self.deferredReview = nil
                     await self.refreshReadGrants()
                 } catch { self.preferences.report(error) }
             }
@@ -371,6 +394,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 do {
                     guard let client = self.client, case .readGrantsRevoked = try await client.call(.revokeReadGrants)
                     else { throw BrokerFailure.disconnected }
+                    self.deferredReview = nil
                     self.operationEnrolled = false
                     self.readGrants = []
                     self.status = "Read access revoked"
@@ -422,6 +446,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                 case .sync: vault = try await syncVault(client)
                 case .unlock: vault = try await requestVaultUnlock(client, forSync: false)
                 }
+                deferredReview = nil
                 operationEnrolled = false
                 await refreshVaultStatus()
                 try Task.checkCancellation()
@@ -550,12 +575,13 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
 
     func present(_ dialog: any ApprovalWindow, settings: Bool = false, completion: (() -> Void)? = nil) {
         dialog.onClose = { [weak self, weak dialog] in
-            guard let self, let dialog else { return }
+            guard let self, let dialog, active === dialog else { return }
             dialog.onClose = nil
             active = nil
             releasePresentation()
             updateActivationPolicy()
             if settings {
+                deferredReview = nil
                 operationEnrolled = false
                 Task { await reloadPreferences() }
             }

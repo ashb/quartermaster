@@ -211,7 +211,7 @@ pub(super) fn handle_verified_http(
     if !interactive {
         return execute_ready(stream, shared, paths, principal, id);
     }
-    let receive = request_approval(id, principal, peer, created, shared, paths)?;
+    let receive = request_approval(id, principal, peer, created, shared, paths, stream)?;
     loop {
         shared
             .0

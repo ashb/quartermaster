@@ -14,15 +14,9 @@ use crate::{
     platform::macos::ipc::{self, Event},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use qm_macos::{
-    peer_identity::requirement_for_path, presence_clock::monotonic_raw as presence_now,
-};
+use qm_macos::peer_identity::requirement_for_path;
 use qm_providers::ApprovalSession;
-use std::{
-    io,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{io, sync::Arc};
 pub(super) fn handle(
     message: Client,
     state: &mut OwnerState,
@@ -85,6 +79,7 @@ pub(super) fn handle(
         Client::RevokeReadGrant { id } => {
             OperationId::parse(&id)?;
             state.authorizer.revoke_read_grant(&id);
+            state.approval_queue.clear();
             state.cancel_pending();
             Ok(Reply::ReadGrantsRevoked)
         }
@@ -163,44 +158,7 @@ pub(super) fn handle(
             })
         }
         Client::Presence { .. } => Err(Error::State(Fault::NativeContextRequired)),
-        Client::Proof { id, signature } => {
-            let id = OperationId::parse(&id)?;
-            let pending = state
-                .pending
-                .as_mut()
-                .filter(|pending| pending.id == id)
-                .ok_or_else(|| Error::State(Fault::PendingMissing))?;
-            let offset = state
-                .operations
-                .authentication_offset(id, &pending.principal)?;
-            let authenticated = pending
-                .created()
-                .checked_add(offset)
-                .ok_or_else(|| Error::State(Fault::InvalidClock))?;
-            if presence_now()?
-                .checked_duration_since(authenticated)
-                .is_none_or(|age| age >= Duration::from_secs(30))
-            {
-                return Err(Error::State(Fault::ApprovalExpired));
-            }
-            let signature = BASE64.decode(signature).map_err(Error::from)?;
-            state.operations.proof(
-                id,
-                &pending.principal,
-                &state.authorizer,
-                &signature,
-                Instant::now(),
-            )?;
-            pending.context_lease.take();
-            pending
-                .completion
-                .send(approval::ApprovalCompletion {
-                    id,
-                    principal: Arc::clone(&pending.principal),
-                })
-                .map_err(|_| Error::State(Fault::Canceled))?;
-            Ok(Reply::Accepted)
-        }
+        Client::Proof { id, signature } => approval::proof(&id, &BASE64.decode(signature)?, state),
         Client::Cancel { id } => {
             let result = match (OperationId::parse(&id), state.ui.as_ref()) {
                 (Ok(id), Some(ui)) => state.operations.cancel_interactive(id, ui.session.id()),
@@ -523,6 +481,7 @@ mod tests {
         owner::{policy::Policy, runtime::tests::fixture},
         platform::macos::ipc::test_support::{Fixture, send, start_send},
     };
+    use std::time::{Duration, Instant};
     use std::{
         sync::{Condvar, Mutex, mpsc},
         thread,

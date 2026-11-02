@@ -14,15 +14,7 @@ struct ApprovalDialogView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Image(systemName: "key.fill").font(.system(size: 18)).foregroundStyle(ApprovalAppearance.accent)
-                Text("Quartermaster").font(.system(size: 14, weight: .semibold))
-                Spacer()
-                #if DEBUG
-                    Text("DEBUG BUILD · Insecure")
-                        .font(.system(size: 10, weight: .semibold)).foregroundStyle(.orange)
-                #endif
-            }
+            ApprovalHeader()
             VStack(alignment: .leading, spacing: 7) {
                 Text(presentation.operationTitle).font(.system(size: 26, weight: .semibold))
                 if let repository = presentation.repository {
@@ -37,41 +29,13 @@ struct ApprovalDialogView: View {
                     Text(verbatim: title).font(.system(size: 13)).lineLimit(3).help(title)
                 }
             }
-            LuminareSection {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(spacing: 8) {
-                        GitHubIcon(size: 20)
-                        Text(presentation.callerName).font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Label(presentation.accessLabel, systemImage: presentation.isReadOnly ? "eye" : "pencil")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(presentation.isReadOnly ? Color.teal : Color.orange)
-                            .padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(
-                                (presentation.isReadOnly ? Color.teal : Color.orange).opacity(0.12),
-                                in: RoundedRectangle(cornerRadius: 7))
-                    }
-                    let command = Text(
-                        verbatim: presentation.request.peer?.commandLine ?? "Command arguments unavailable"
-                    )
-                    .font(.system(size: 14, design: .monospaced)).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    ViewThatFits(in: .vertical) {
-                        command
-                        ScrollView(.vertical) { command }.frame(height: 80)
-                    }.frame(maxHeight: 80).fixedSize(horizontal: false, vertical: true)
-                    if let directory = presentation.request.peer?.workingDirectory {
-                        Label {
-                            Text(verbatim: directory)
-                        } icon: {
-                            Image(systemName: "folder")
-                        }
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                        .lineLimit(2).truncationMode(.middle).help(directory)
-                    }
-                }.padding(12)
-            }
+            ApprovalCommandCard(
+                name: presentation.callerName,
+                command: presentation.request.peer?.commandLine ?? "Command arguments unavailable",
+                directory: presentation.request.peer?.workingDirectory,
+                access: presentation.accessLabel, symbol: presentation.isReadOnly ? "eye" : "pencil",
+                colour: presentation.isReadOnly ? .teal : .orange
+            ) { GitHubIcon(size: 20) }
             if presentation.readScope != nil {
                 Text(
                     presentation.readGrant?.permission.compactSummary
@@ -135,23 +99,7 @@ struct ApprovalDialogView: View {
                 Text(verbatim: presentation.provider.email).lineLimit(1).truncationMode(.middle)
                     .help(presentation.provider.server)
             }.font(.system(size: 12))
-            if !controller.detail.isEmpty {
-                Text(controller.detail).font(.caption).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 12) {
-                Button {
-                    controller.cancel()
-                    close()
-                } label: {
-                    Text(cancelTitle).frame(width: 70)
-                }.buttonStyle(CompactButtonStyle()).luminareMinHeight(36)
-                    .keyboardShortcut(.cancelAction)
-                Spacer()
-                Text(authenticationTitle).font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-                EmbeddedAuthentication(context: controller.context, onVisible: { Task { await controller.approve() } })
-                    .id(ObjectIdentifier(controller.context)).frame(width: 32, height: 32)
-            }
+            ApprovalAuthenticationFooter(controller: controller, close: close)
         }
         .onChange(of: controller.phase) { _, phase in
             if phase == .approved { close() }
@@ -176,8 +124,87 @@ struct ApprovalDialogView: View {
         }
     }
 
-    var cancelTitle: String { controller.phase == .stopped ? "Close" : "Cancel" }
+}
 
+struct ApprovalHeader: View {
+    var body: some View {
+        HStack {
+            Image(systemName: "key.fill").font(.system(size: 18)).foregroundStyle(ApprovalAppearance.accent)
+            Text("Quartermaster").font(.system(size: 14, weight: .semibold))
+            Spacer()
+            #if DEBUG
+                Text("DEBUG BUILD · Insecure")
+                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(.orange)
+            #endif
+        }
+    }
+}
+
+struct ApprovalCommandCard<Icon: View>: View {
+    let name: String
+    let command: String
+    let directory: String?
+    let access: String
+    let symbol: String
+    let colour: Color
+    @ViewBuilder let icon: Icon
+
+    var body: some View {
+        LuminareSection {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    icon
+                    Text(verbatim: name).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    Label(access, systemImage: symbol)
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(colour)
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(colour.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                }
+                let text = Text(verbatim: command)
+                    .font(.system(size: 14, design: .monospaced)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                ViewThatFits(in: .vertical) {
+                    text
+                    ScrollView(.vertical) { text }.frame(height: 80)
+                }.frame(maxHeight: 80).fixedSize(horizontal: false, vertical: true)
+                if let directory {
+                    Label {
+                        Text(verbatim: directory)
+                    } icon: {
+                        Image(systemName: "folder")
+                    }
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .lineLimit(2).truncationMode(.middle).help(directory)
+                }
+            }.padding(12)
+        }
+    }
+}
+
+struct ApprovalAuthenticationFooter: View {
+    @ObservedObject var controller: ApprovalController
+    let close: () -> Void
+
+    var body: some View {
+        if !controller.detail.isEmpty {
+            Text(controller.detail).font(.caption).foregroundStyle(.secondary)
+        }
+        HStack(spacing: 12) {
+            Button {
+                controller.cancel()
+                close()
+            } label: {
+                Text(cancelTitle).frame(width: 70)
+            }.buttonStyle(CompactButtonStyle()).luminareMinHeight(36).keyboardShortcut(.cancelAction)
+            Spacer()
+            Text(authenticationTitle).font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+            EmbeddedAuthentication(context: controller.context, onVisible: { Task { await controller.approve() } })
+                .id(ObjectIdentifier(controller.context)).frame(width: 32, height: 32)
+        }
+    }
+
+    var cancelTitle: String { controller.phase == .stopped ? "Close" : "Cancel" }
     var authenticationTitle: String {
         switch controller.phase {
         case .review, .authenticating, .superseded: "Use Touch ID to authorise"

@@ -281,9 +281,8 @@ private func approvalPresentation(
 }
 
 @Test @MainActor func replacingTheScopeKeepsTheFooterLabelsSteady() throws {
-    let presentation = try approvalPresentation(read: true)
     let controller = ApprovalController(backend: ScopeReviewBackend(), reason: "Test scope layout")
-    let view = ApprovalDialogView(presentation: presentation, controller: controller, close: {})
+    let view = ApprovalAuthenticationFooter(controller: controller, close: {})
     let cancel = view.cancelTitle
     let authentication = view.authenticationTitle
     #expect(controller.supersedeReview())

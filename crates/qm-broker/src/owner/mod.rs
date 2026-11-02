@@ -1,3 +1,4 @@
+mod approval_queue;
 #[cfg(target_os = "macos")]
 mod maintenance;
 #[cfg(target_os = "macos")]
@@ -10,6 +11,7 @@ mod review;
 mod runtime;
 #[cfg(any(target_os = "macos", test))]
 mod settings;
+mod signing;
 #[cfg(target_os = "macos")]
 mod vault;
 

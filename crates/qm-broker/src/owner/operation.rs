@@ -1,4 +1,5 @@
 use super::github::repository::PreparedMetadata;
+use super::signing::Signing;
 use super::{
     deadline::Deadline,
     dispatch::{self, CredentialSelection, PreparedRequest},
@@ -10,7 +11,7 @@ use super::{
     provider_lifecycle::ProviderGeneration,
     request::FrozenOperation,
 };
-use qm_providers::{ApprovalSession, AuthenticatedIntent, PendingApproval, PendingIntent};
+use qm_providers::ApprovalSession;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::BTreeMap,
@@ -116,17 +117,7 @@ struct AwaitingApproval {
     signing: SigningPhase,
 }
 
-enum SigningPhase {
-    Unbound,
-    Reviewing(PendingIntent),
-    Authenticated(AuthenticatedIntent),
-    Challenged(Box<ChallengeAuthority>),
-}
-
-struct ChallengeAuthority {
-    approval: PendingApproval,
-    selection: CredentialSelection,
-}
+type SigningPhase = Signing<CredentialSelection>;
 
 pub(super) struct Preparation {
     pub(super) operation: ExecutableOperation,
@@ -151,12 +142,7 @@ struct Operation {
 impl Phase {
     fn authenticated_at(&self) -> Option<Instant> {
         match self {
-            Self::Awaiting(awaiting) => match &awaiting.signing {
-                SigningPhase::Unbound => None,
-                SigningPhase::Reviewing(_) => None,
-                SigningPhase::Authenticated(intent) => Some(intent.authenticated_at()),
-                SigningPhase::Challenged(challenge) => Some(challenge.approval.authenticated_at()),
-            },
+            Self::Awaiting(awaiting) => awaiting.signing.authenticated_at(),
             Self::Authorized(operation) => operation.authenticated_at(),
             Self::Preparing(preparation) | Self::Ready { preparation, .. } => {
                 preparation.operation.authenticated_at()
@@ -383,11 +369,11 @@ impl OperationRegistry {
             .requirement
             .review_digest()
             .ok_or(OperationError::NotReady)?;
-        let intent = session
-            .begin_intent_at(digest, record.created)
+        awaiting
+            .signing
+            .begin(session, digest, record.created)
             .map_err(|_| OperationError::NotReady)?;
         record.approval_session = Some(session.id());
-        awaiting.signing = SigningPhase::Reviewing(intent);
         Ok(())
     }
 
@@ -399,12 +385,10 @@ impl OperationRegistry {
         let Phase::Awaiting(awaiting) = &self.get(id, principal)?.phase else {
             return Err(OperationError::NotReady);
         };
-        match &awaiting.signing {
-            SigningPhase::Reviewing(intent) => Ok(intent.nonce()),
-            SigningPhase::Authenticated(intent) => Ok(intent.nonce()),
-            SigningPhase::Challenged(challenge) => Ok(challenge.approval.nonce()),
-            SigningPhase::Unbound => Err(OperationError::NotReady),
-        }
+        awaiting
+            .signing
+            .nonce()
+            .map_err(|_| OperationError::NotReady)
     }
 
     pub(super) fn authentication_offset(
@@ -413,13 +397,7 @@ impl OperationRegistry {
         principal: &VerifiedPrincipal,
     ) -> Result<Duration, OperationError> {
         let offset = match &self.get(id, principal)?.phase {
-            Phase::Awaiting(awaiting) => match &awaiting.signing {
-                SigningPhase::Authenticated(intent) => Some(intent.authentication_offset()),
-                SigningPhase::Challenged(challenge) => {
-                    Some(challenge.approval.authentication_offset())
-                }
-                _ => None,
-            },
+            Phase::Awaiting(awaiting) => awaiting.signing.offset(),
             Phase::Preparing(preparation) | Phase::Ready { preparation, .. } => {
                 preparation.operation.authentication_offset()
             }
@@ -451,15 +429,10 @@ impl OperationRegistry {
         let Phase::Awaiting(mut awaiting) = mem::replace(&mut record.phase, Phase::Revoked) else {
             unreachable!()
         };
-        let SigningPhase::Reviewing(intent) =
-            mem::replace(&mut awaiting.signing, SigningPhase::Unbound)
-        else {
-            unreachable!()
-        };
-        let intent = intent
+        awaiting
+            .signing
             .authenticate(authenticated, offset)
             .map_err(|_| OperationError::Authorization(AuthorizationError::InvalidApproval))?;
-        awaiting.signing = SigningPhase::Authenticated(intent);
         record.phase = Phase::Awaiting(awaiting);
         Ok(())
     }
@@ -483,23 +456,12 @@ impl OperationRegistry {
         let Phase::Awaiting(mut awaiting) = mem::replace(&mut record.phase, Phase::Revoked) else {
             unreachable!()
         };
-        let SigningPhase::Authenticated(intent) =
-            mem::replace(&mut awaiting.signing, SigningPhase::Unbound)
-        else {
-            unreachable!()
-        };
-        let offset = intent.authentication_offset();
+        let offset = awaiting.signing.offset().ok_or(OperationError::NotReady)?;
         let credential_digest = selection.digest();
-        let approval = intent
-            .bind_credential(credential_digest)
+        let bytes = awaiting
+            .signing
+            .challenge(selection, credential_digest)
             .map_err(|_| OperationError::Authorization(AuthorizationError::InvalidApproval))?;
-        let bytes = approval
-            .challenge()
-            .map_err(|_| OperationError::Authorization(AuthorizationError::Expired))?;
-        awaiting.signing = SigningPhase::Challenged(Box::new(ChallengeAuthority {
-            approval,
-            selection,
-        }));
         record.phase = Phase::Awaiting(awaiting);
         Ok(SigningChallenge {
             bytes,
@@ -517,7 +479,7 @@ impl OperationRegistry {
         now: Instant,
     ) -> Result<(), OperationError> {
         let record = self.owned(id, principal)?;
-        if !matches!(&record.phase, Phase::Awaiting(awaiting) if matches!(awaiting.signing, SigningPhase::Challenged(_)))
+        if !matches!(&record.phase, Phase::Awaiting(awaiting) if matches!(awaiting.signing, SigningPhase::Challenged { .. }))
         {
             return Err(OperationError::NotReady);
         }
@@ -526,24 +488,17 @@ impl OperationRegistry {
         };
         let AwaitingApproval {
             requirement,
-            signing,
+            mut signing,
         } = *awaiting;
-        let SigningPhase::Challenged(challenge) = signing else {
-            unreachable!()
-        };
-        let ChallengeAuthority {
-            approval,
+        let super::signing::Verified {
+            proof,
+            binding,
+            authenticated,
             selection,
-        } = *challenge;
-        let authenticated = approval.authenticated_at();
-        let binding = approval.binding().clone();
-        let proof = approval
+            deadline,
+        } = signing
             .approve(signature)
             .map_err(|_| OperationError::Authorization(AuthorizationError::InvalidApproval))?;
-        let expires = authenticated
-            .checked_add(Duration::from_secs(30))
-            .ok_or(OperationError::Unavailable)?;
-        let deadline = Deadline::from_instant(expires).map_err(|_| OperationError::Unavailable)?;
         let operation = authorizer
             .approve(
                 requirement,

@@ -1,6 +1,8 @@
 import AppKit
+import CryptoKit
 import Foundation
 import LocalAuthentication
+import QuartermasterApprovalUI
 import QuartermasterSecurity
 import SwiftUI
 import Synchronization
@@ -23,6 +25,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
     private let settingsReply: BrokerReply?
     @MainActor private(set) var registrationKeys: [Data] = []
     @MainActor private(set) var enrolmentKeys: [Data] = []
+    @MainActor private(set) var cancellations: [String] = []
     @MainActor private(set) var polls = 0
     @MainActor private(set) var vaultOperations = 0
     @MainActor private var synchronized = false
@@ -98,6 +101,11 @@ private final class RecoveryClient: BrokerClient, Sendable {
             enrolmentKeys.append(key)
             if suspension == .enrolment { return try await withCheckedThrowingContinuation { pending = $0 } }
             return .enrolled
+        case .revokeReadGrant, .revokeReadGrants: return .readGrantsRevoked
+        case .readGrants: return .readGrants([])
+        case .cancel(let id):
+            cancellations.append(id)
+            return .canceled
         case .next:
             polls += 1
             if suspension == .poll { return try await withCheckedThrowingContinuation { pending = $0 } }
@@ -550,4 +558,74 @@ private func vaultActionsKeepTheLastSuccessfulSyncTime(_ outcome: RecoveryClient
     try await eventually { application.vaultActivity == .locked }
     #expect(client.vaultOperations == 1)
     #expect(application.vaultStatus?.lastSync == Date(timeIntervalSince1970: 1_700_000_000))
+}
+
+private func queuedGitHubReview() throws -> ApprovalReview {
+    let id = String(repeating: "a", count: 32)
+    let created = MonotonicTimestamp.now
+    let provider: [String: Any] = [
+        "server": "https://vault.example.invalid", "account": "dummy", "email": "dummy@example.invalid",
+        "item": "dummy", "field": "LoginPassword", "role": "github-write",
+        "enrollment": String(repeating: "b", count: 32), "generation": 1,
+    ]
+    let stamp = try JSONSerialization.jsonObject(with: JSONEncoder().encode(created), options: .fragmentsAllowed)
+    let request = try JSONSerialization.data(withJSONObject: [
+        "provider": provider, "operationId": id, "created": stamp,
+        "repository": "", "method": "PATCH", "body": "", "path": "/unfamiliar",
+        "origin": "https://api.github.com", "processChain": ["gh"], "readRoots": [],
+        "presentation": ["intent": ["kind": "request"], "additionalEffects": [], "allowsReadScope": false],
+    ])
+    return try JSONDecoder().decode(
+        ApprovalReview.self,
+        from: JSONSerialization.data(withJSONObject: [
+            "id": id, "created": stamp, "provider": provider,
+            "session": Data(repeating: 1, count: 16).base64EncodedString(),
+            "policy": Data(repeating: 2, count: 32).base64EncodedString(),
+            "nonce": Data(repeating: 3, count: 32).base64EncodedString(),
+            "request": request.base64EncodedString(),
+            "requestDigest": Data(SHA256.hash(data: request)).base64EncodedString(),
+        ]))
+}
+
+@Test(arguments: [true, false]) @MainActor
+private func queuedGitHubReviewWaitsForTheVisibleDialogOrPresentationLease(_ otherProcess: Bool) async throws {
+    let client = try RecoveryClient(suspension: .poll)
+    let existing = InertApprovalWindow()
+    var acquisitions = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { client }, loadApprovalKey: { Data([1]) },
+        acquirePresentation: {
+            acquisitions += 1
+            throw DialogPresentationLease.Failure.alreadyPresented
+        })
+    defer {
+        existing.close()
+        _ = application.applicationShouldTerminate(NSApplication.shared)
+        client.complete(.failure(CancellationError()))
+    }
+    activate(application)
+    try await eventually { client.pending != nil }
+    if !otherProcess { application.present(existing) }
+    client.complete(.success(.review(try queuedGitHubReview())))
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(client.cancellations.isEmpty)
+    #expect(existing.isPresented == !otherProcess)
+    #expect(client.polls == 1)
+    if !otherProcess { existing.close() }
+    try await eventually { acquisitions > 0 }
+    application.revokeReads()
+    try await eventually { client.polls == 2 }
+    #expect(client.cancellations.isEmpty)
+    #expect(application.connected)
+}
+
+@Test @MainActor func aLateWindowCloseCannotDismissTheCurrentApproval() throws {
+    let application = BrokerApplication(setActivationPolicy: { _ in })
+    let first = InertApprovalWindow()
+    let second = InertApprovalWindow()
+    application.present(first)
+    application.present(second)
+    first.close()
+    #expect(second.isPresented)
+    second.close()
 }

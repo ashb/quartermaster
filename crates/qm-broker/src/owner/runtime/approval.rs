@@ -34,6 +34,8 @@ pub(super) struct ApprovalDelivery {
     pub(super) context_lease: Option<ipc::ContextLease>,
     pub(super) delivered: bool,
     pub(super) completion: mpsc::SyncSender<ApprovalCompletion>,
+    pub(super) _queue_ticket: Option<Arc<crate::owner::approval_queue::Ticket>>,
+    pub(super) authenticated: Option<MonotonicTimestamp>,
 }
 
 pub(super) use crate::owner::protocol::ProviderPresentation;
@@ -72,6 +74,27 @@ impl crate::owner::review::CredentialContext for ReviewContext {
 }
 
 impl ApprovalDelivery {
+    pub(super) fn check(&self, state: &OwnerState) -> Result<()> {
+        self.check_deadline(presence_now()?)?;
+        if self.provider.generation != state.provider.generation() {
+            return Err(Fault::ProviderChanged.into());
+        }
+        Ok(())
+    }
+
+    fn check_deadline(&self, now: MonotonicTimestamp) -> Result<()> {
+        if let Some(authenticated) = self.authenticated {
+            check_authenticated_deadline(authenticated, now)
+        } else if now
+            .checked_duration_since(self.created())
+            .is_none_or(|age| age >= Duration::from_secs(120))
+        {
+            Err(Fault::ApprovalExpired.into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn created(&self) -> MonotonicTimestamp {
         self.request.context().created
     }
@@ -113,6 +136,51 @@ fn check_frontend(expected: Option<&str>, app: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn wait_for_turn(
+    principal: &VerifiedPrincipal,
+    stream: &std::os::unix::net::UnixStream,
+    created: MonotonicTimestamp,
+    shared: &Shared,
+    paths: &ServicePaths,
+) -> Result<Arc<crate::owner::approval_queue::Ticket>> {
+    let ticket = {
+        let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+        state.refresh_policy(&paths.load_policy())?;
+        state.ensure_interactive()?;
+        state
+            .approval_queue
+            .enqueue()
+            .ok_or(Fault::ApprovalPending)?
+    };
+    loop {
+        principal.revalidate()?;
+        if !super::http::connected(stream) {
+            return Err(Fault::Canceled.into());
+        }
+        if presence_now()?
+            .checked_duration_since(created)
+            .is_none_or(|age| age >= Duration::from_secs(120))
+        {
+            return Err(Fault::ApprovalExpired.into());
+        }
+        let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+        state.refresh_policy(&paths.load_policy())?;
+        state.ensure_interactive()?;
+        if !state.approval_queue.contains(&ticket) {
+            return Err(Fault::Canceled.into());
+        }
+        if state.pending.is_none() && state.approval_queue.is_front(&ticket) {
+            return Ok(ticket);
+        }
+        drop(
+            shared
+                .1
+                .wait_timeout(state, Duration::from_millis(50))
+                .map_err(|_| Fault::StateUnavailable)?,
+        );
+    }
+}
+
 pub(super) fn request_approval(
     id: OperationId,
     principal: &Arc<VerifiedPrincipal>,
@@ -120,7 +188,13 @@ pub(super) fn request_approval(
     created: MonotonicTimestamp,
     shared: &Shared,
     paths: &ServicePaths,
+    stream: &std::os::unix::net::UnixStream,
 ) -> Result<mpsc::Receiver<ApprovalCompletion>> {
+    {
+        let state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+        state.check_review_context(id, principal)?;
+    }
+    let slot = wait_for_turn(principal, stream, created, shared, paths)?;
     let (generation, frontend_requirement) = {
         let state = shared
             .0
@@ -190,6 +264,9 @@ pub(super) fn request_approval(
         .lock()
         .map_err(|_| Error::State(Fault::StateUnavailable))?;
     state.refresh_policy(&policy)?;
+    if !state.approval_queue.is_front(&slot) {
+        return Err(Fault::Canceled.into());
+    }
     if state.pending.is_some() {
         return Err(Error::State(Fault::ApprovalPending));
     }
@@ -207,6 +284,8 @@ pub(super) fn request_approval(
     let (completion, receive) = mpsc::sync_channel(1);
     state.pending = Some(ApprovalDelivery {
         id,
+        _queue_ticket: Some(slot),
+        authenticated: None,
         principal: Arc::clone(principal),
         request: document,
         provider: frozen,
@@ -215,6 +294,49 @@ pub(super) fn request_approval(
         completion,
     });
     Ok(receive)
+}
+
+pub(super) fn check_authenticated_deadline(
+    authenticated: MonotonicTimestamp,
+    now: MonotonicTimestamp,
+) -> Result<()> {
+    if now
+        .checked_duration_since(authenticated)
+        .is_none_or(|age| age >= Duration::from_secs(30))
+    {
+        return Err(Fault::ApprovalExpired.into());
+    }
+    Ok(())
+}
+
+pub(super) fn proof(id: &str, signature: &[u8], state: &mut OwnerState) -> Result<Reply> {
+    state.ensure_interactive()?;
+    let id = OperationId::parse(id)?;
+    let pending = state
+        .pending
+        .as_ref()
+        .filter(|p| p.id == id && p.delivered)
+        .ok_or(Fault::PendingMissing)?;
+    pending.check(state)?;
+    let authenticated = pending.authenticated.ok_or(Fault::ReviewNotPresented)?;
+    check_authenticated_deadline(authenticated, presence_now()?)?;
+    state.operations.proof(
+        id,
+        &pending.principal,
+        &state.authorizer,
+        signature,
+        Instant::now(),
+    )?;
+    let pending = state.pending.as_mut().unwrap();
+    pending.context_lease.take();
+    pending
+        .completion
+        .send(ApprovalCompletion {
+            id,
+            principal: Arc::clone(&pending.principal),
+        })
+        .map_err(|_| Fault::Canceled)?;
+    Ok(Reply::Accepted)
 }
 
 pub(super) fn begin_native_presence(
@@ -231,11 +353,13 @@ pub(super) fn begin_native_presence(
 > {
     state.refresh_policy(policy)?;
     state.ensure_interactive()?;
-    let pending = state
+    state
         .pending
-        .as_mut()
-        .filter(|pending| pending.id == id)
-        .ok_or_else(|| Error::State(Fault::PendingMissing))?;
+        .as_ref()
+        .filter(|p| p.id == id)
+        .ok_or(Fault::PendingMissing)?
+        .check(state)?;
+    let pending = state.pending.as_mut().unwrap();
     if !pending.delivered {
         return Err(Error::State(Fault::ReviewNotPresented));
     }
@@ -258,6 +382,7 @@ pub(super) fn begin_native_presence(
     state
         .operations
         .authentication(id, &pending.principal, at, anchor, offset)?;
+    pending.authenticated = Some(authenticated);
     if state.provider.snapshot().is_some() {
         state.provider.snapshot_for(&frozen.identity)?;
         return Ok(None);
@@ -277,11 +402,13 @@ pub(super) fn complete_native_presence(
     current: Result<CacheIdentity, crate::owner::vault::Error>,
 ) -> Result<Reply> {
     state.refresh_policy(policy)?;
+    state.ensure_interactive()?;
     let pending = state
         .pending
         .as_ref()
         .filter(|pending| pending.id == id)
         .ok_or_else(|| Error::State(Fault::Canceled))?;
+    pending.check(state)?;
     let offset = state
         .operations
         .authentication_offset(id, &pending.principal)?;
@@ -338,68 +465,162 @@ pub(super) fn native_presence(
     paths: &ServicePaths,
 ) -> Result<Reply> {
     let id = OperationId::parse(id)?;
-    let deadline = authenticated
-        .checked_add(Duration::from_secs(30))
-        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
-    let lease = connection.context_lease(deadline)?;
-    let current = paths.vault_source().and_then(|source| source.identity());
-    let policy = paths.load_policy();
-    let work = {
-        let mut state = shared
-            .0
-            .lock()
-            .map_err(|_| Error::State(Fault::StateUnavailable))?;
-        if !connection.is_connected()
-            || state
-                .ui
-                .as_ref()
-                .is_none_or(|ui| ui.connection != Some(connection.id()))
-        {
-            return Err(Error::State(Fault::UiDisconnected));
-        }
-        let work = begin_native_presence(id, authenticated, &mut state, &policy, current)?;
-        state.pending.as_mut().unwrap().context_lease = Some(lease);
-        work
-    };
-    if let Some((source, operation)) = work {
-        let result = presence_now().map_err(Error::from).and_then(|now| {
-            if now
-                .checked_duration_since(authenticated)
-                .is_none_or(|age| age >= Duration::from_secs(30))
+    let result = (|| {
+        let deadline = authenticated
+            .checked_add(Duration::from_secs(30))
+            .ok_or_else(|| Error::State(Fault::InvalidClock))?;
+        let lease = connection.context_lease(deadline)?;
+        let current = paths.vault_source().and_then(|source| source.identity());
+        let policy = paths.load_policy();
+        let work = {
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
+            if !connection.is_connected()
+                || state
+                    .ui
+                    .as_ref()
+                    .is_none_or(|ui| ui.connection != Some(connection.id()))
             {
-                return Err(Error::State(Fault::ApprovalExpired));
+                return Err(Error::State(Fault::UiDisconnected));
             }
-            source.unlock_authenticated(context).map_err(Error::from)
-        });
-        let identity = paths.vault_source().and_then(|source| source.identity());
+            let work = begin_native_presence(id, authenticated, &mut state, &policy, current)?;
+            state.pending.as_mut().unwrap().context_lease = Some(lease);
+            work
+        };
+        if let Some((source, operation)) = work {
+            let result = presence_now().map_err(Error::from).and_then(|now| {
+                if now
+                    .checked_duration_since(authenticated)
+                    .is_none_or(|age| age >= Duration::from_secs(30))
+                {
+                    return Err(Error::State(Fault::ApprovalExpired));
+                }
+                source.unlock_authenticated(context).map_err(Error::from)
+            });
+            let identity = paths.vault_source().and_then(|source| source.identity());
+            let mut state = shared
+                .0
+                .lock()
+                .map_err(|_| Error::State(Fault::StateUnavailable))?;
+            state.ensure_host_session()?;
+            match result {
+                Ok(snapshot) => state
+                    .provider
+                    .finish_unlock(operation, &identity?, snapshot)?,
+                Err(error) => {
+                    state.provider.release(&operation);
+                    return Err(error);
+                }
+            }
+        }
+        let current = paths.vault_source().and_then(|source| source.identity());
+        let policy = paths.load_policy();
         let mut state = shared
             .0
             .lock()
             .map_err(|_| Error::State(Fault::StateUnavailable))?;
-        state.ensure_host_session()?;
-        match result {
-            Ok(snapshot) => state
-                .provider
-                .finish_unlock(operation, &identity?, snapshot)?,
-            Err(error) => {
-                state.provider.release(&operation);
-                return Err(error);
-            }
+        complete_native_presence(id, &mut state, &policy, current)
+    })();
+    if result.is_err() {
+        let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.id == id)
+        {
+            state.cancel_pending();
         }
     }
-    let current = paths.vault_source().and_then(|source| source.identity());
-    let policy = paths.load_policy();
-    let mut state = shared
-        .0
-        .lock()
-        .map_err(|_| Error::State(Fault::StateUnavailable))?;
-    complete_native_presence(id, &mut state, &policy, current)
+    result
 }
 
 #[cfg(test)]
 mod frontend_tests {
     use super::*;
     use qm_macos::peer_identity::requirement_for_path;
+
+    #[test]
+    fn waiting_request_advances_after_completion_but_not_after_global_revocation() {
+        for invalidation in 0..3 {
+            let (_directory, paths, _key, mut state, _receive) = super::super::tests::fixture();
+            let policy = paths.load_policy();
+            let principal = Arc::clone(&state.pending.as_ref().unwrap().principal);
+            state.pending.as_mut().unwrap()._queue_ticket =
+                Some(state.approval_queue.enqueue().unwrap());
+            let shared = Arc::new((std::sync::Mutex::new(state), std::sync::Condvar::new()));
+            let worker_shared = Arc::clone(&shared);
+            let (stream, _caller) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (send, receive) = mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = wait_for_turn(
+                    &principal,
+                    &stream,
+                    presence_now().unwrap(),
+                    &worker_shared,
+                    &paths,
+                );
+                send.send(result).unwrap();
+            });
+            assert!(matches!(
+                receive.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            {
+                let mut state = shared.0.lock().unwrap();
+                match invalidation {
+                    0 => state.cancel_pending(),
+                    1 => state.disconnect_ui(),
+                    _ => {
+                        super::super::control::handle(
+                            crate::owner::protocol::Client::RevokeReadGrant {
+                                id: "aa".repeat(16),
+                            },
+                            &mut state,
+                            &policy,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            shared.1.notify_all();
+            let result = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            if invalidation != 0 {
+                assert!(matches!(result, Err(Error::State(Fault::Canceled))));
+            } else {
+                let ticket = result.unwrap();
+                assert!(shared.0.lock().unwrap().approval_queue.is_front(&ticket));
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn expired_or_disconnected_waiters_never_take_an_approval_slot() {
+        for disconnected in [false, true] {
+            let (_directory, paths, _key, mut state, _receive) = super::super::tests::fixture();
+            let principal = Arc::clone(&state.pending.as_ref().unwrap().principal);
+            state.pending.as_mut().unwrap()._queue_ticket =
+                Some(state.approval_queue.enqueue().unwrap());
+            let shared = Arc::new((std::sync::Mutex::new(state), std::sync::Condvar::new()));
+            let (stream, caller) = std::os::unix::net::UnixStream::pair().unwrap();
+            let created = if disconnected {
+                presence_now().unwrap()
+            } else {
+                0.into()
+            };
+            if disconnected {
+                drop(caller);
+            }
+            let result = wait_for_turn(&principal, &stream, created, &shared, &paths);
+            assert!(matches!(
+                result,
+                Err(Error::State(Fault::Canceled | Fault::ApprovalExpired))
+            ));
+            assert!(shared.0.lock().unwrap().pending.is_some());
+        }
+    }
 
     #[test]
     fn frontend_preflight_rejects_changed_missing_or_invalid_code() {
