@@ -413,6 +413,14 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
 
     func unlockVault() { runVault(.unlock) }
 
+    func loadVaultItems() async throws -> [VaultItemSummary] {
+        guard active == nil, !controls.busy, !vaultActivity.busy else { throw BrokerControlError.busy }
+        do { return try await preferences.loadVaultItems() } catch {
+            await refreshVaultStatus()
+            throw error
+        }
+    }
+
     private func runVault(_ action: VaultAction) {
         if action == .lock {
             active?.cancel()

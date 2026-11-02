@@ -12,6 +12,7 @@ mod lifecycle;
 pub use lifecycle::{EnrollmentPhase, VaultEnrollment};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_LISTED_ITEMS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
@@ -24,6 +25,7 @@ pub enum ProviderError {
     CipherUnsupported,
     ItemNotFound,
     AmbiguousItem,
+    TooManyItems,
     AccountMismatch,
     MasterPasswordRepromptRequired,
     CacheIncompatible,
@@ -37,6 +39,49 @@ pub enum ProviderError {
 pub enum CredentialField {
     LoginPassword,
     HiddenField(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccountBinding {
+    server: String,
+    account_id: String,
+    email: String,
+}
+
+impl<'de> Deserialize<'de> for AccountBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            server: String,
+            account_id: String,
+            email: String,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(&fields.server, &fields.account_id, &fields.email)
+            .map_err(|_| serde::de::Error::custom("invalid_account_binding"))
+    }
+}
+
+impl AccountBinding {
+    pub fn new(server: &str, account_id: &str, email: &str) -> Result<Self, ProviderError> {
+        let (server, email) =
+            validate_location(server, email, &CredentialField::LoginPassword, "account")?;
+        Ok(Self {
+            server,
+            account_id: nonnil_uuid(account_id)?,
+            email,
+        })
+    }
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+    pub fn email(&self) -> &str {
+        &self.email
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,6 +120,18 @@ impl<'de> Deserialize<'de> for ProviderBinding {
 }
 
 impl ProviderBinding {
+    pub fn account(&self) -> AccountBinding {
+        AccountBinding {
+            server: self.server.clone(),
+            account_id: self.account_id.clone(),
+            email: self.email.clone(),
+        }
+    }
+
+    pub fn canonical_item_id(item_id: &str) -> Result<String, ProviderError> {
+        nonnil_uuid(item_id)
+    }
+
     pub fn new(
         server: &str,
         account_id: &str,
@@ -170,42 +227,21 @@ pub struct RbwProvider {
     http: reqwest::Client,
 }
 
-enum EnrollmentSelection {
-    SoleLogin,
-    Item(String),
-}
-
 struct EnrollmentRequest {
     server: String,
     email: String,
-    role: String,
-    selection: EnrollmentSelection,
 }
 
 impl EnrollmentRequest {
-    fn new(
-        server: &str,
-        email: &str,
-        role: &str,
-        item: Option<&str>,
-    ) -> Result<Self, ProviderError> {
+    fn new(server: &str, email: &str) -> Result<Self, ProviderError> {
         let (server, email) =
-            validate_location(server, email, &CredentialField::LoginPassword, role)?;
-        let selection = match item {
-            Some(id) => EnrollmentSelection::Item(nonnil_uuid(id)?),
-            None => EnrollmentSelection::SoleLogin,
-        };
-        Ok(Self {
-            server,
-            email,
-            role: role.to_owned(),
-            selection,
-        })
+            validate_location(server, email, &CredentialField::LoginPassword, "account")?;
+        Ok(Self { server, email })
     }
 }
 
 enum ProviderTarget {
-    Pinned(ProviderBinding),
+    Pinned(AccountBinding),
     Enrollment(EnrollmentRequest),
 }
 
@@ -222,19 +258,12 @@ impl ProviderTarget {
             Self::Enrollment(request) => &request.email,
         }
     }
-    fn field(&self) -> &CredentialField {
-        match self {
-            Self::Pinned(binding) => &binding.field,
-            Self::Enrollment(_) => &CredentialField::LoginPassword,
-        }
-    }
 }
 
-/// Selected ciphertext and private provider state. Persist only through `SealedSnapshot`.
+/// Encrypted account catalogue and private provider state. Persist only through `SealedSnapshot`.
 pub struct VaultSnapshot {
-    binding: ProviderBinding,
-    credential: EncryptedCredential,
-    selected_key: Zeroizing<Vec<u8>>,
+    binding: AccountBinding,
+    entries: Vec<rbw::db::Entry>,
     vault_key: Zeroizing<Vec<u8>>,
     protected_key: String,
     kdf: KdfParameters,
@@ -243,60 +272,167 @@ pub struct VaultSnapshot {
     synchronized_at: OffsetDateTime,
 }
 
-impl VaultSnapshot {
+/// The owner must persist the refreshed source even when selecting the other item fails.
+pub struct SelectionRefresh {
+    pub source: VaultSnapshot,
+    pub selected: Result<SelectedCredential, ProviderError>,
+}
+
+/// The owner must persist the refreshed source even when listing items fails.
+pub struct ItemRefresh {
+    pub source: VaultSnapshot,
+    pub items: Result<Vec<VaultItemSummary>, ProviderError>,
+}
+
+#[derive(Serialize)]
+pub struct VaultItemSummary {
+    pub id: String,
+    pub name: String,
+}
+
+/// Private owner material; possession grants neither credential use nor release authority.
+pub struct SelectedCredential {
+    binding: ProviderBinding,
+    name: Zeroizing<String>,
+    credential: EncryptedCredential,
+    selected_key: Zeroizing<Vec<u8>>,
+    checkpoint: [u8; 16],
+}
+
+impl SelectedCredential {
+    pub fn checkpoint(&self) -> [u8; 16] {
+        self.checkpoint
+    }
+    pub fn binding(&self) -> &ProviderBinding {
+        &self.binding
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn credential_digest(&self) -> [u8; 32] {
         self.credential.digest()
+    }
+
+    /// The owner must authorise this binding and digest before decryption and recheck at release.
+    pub fn decrypt_selected_for_owner(&self) -> Result<Zeroizing<Vec<u8>>, ProviderError> {
+        decrypt_value(self.credential.encoded(), &locked_keys(&self.selected_key)?)
+    }
+
+    fn from_entries(
+        binding: &ProviderBinding,
+        entries: &[rbw::db::Entry],
+        vault_key: &[u8],
+        checkpoint: [u8; 16],
+    ) -> Result<Self, ProviderError> {
+        let entry = selected_entry(entries, binding)?;
+        let (credential, selected_key) = entry_credential(entry, binding, vault_key)?;
+        let name = decrypt_value(&entry.name, &locked_keys(&selected_key)?)?;
+        if name.len() > 1024 {
+            return Err(ProviderError::InvalidResponse);
+        }
+        let name = std::str::from_utf8(&name).map_err(|_| ProviderError::InvalidResponse)?;
+        Ok(Self {
+            binding: binding.clone(),
+            name: Zeroizing::new(name.to_owned()),
+            credential,
+            selected_key,
+            checkpoint,
+        })
+    }
+}
+
+impl VaultSnapshot {
+    pub fn item_summaries(&self) -> Result<Vec<VaultItemSummary>, ProviderError> {
+        item_summaries(self, &self.entries)
+    }
+
+    pub fn select(&self, binding: &ProviderBinding) -> Result<SelectedCredential, ProviderError> {
+        if binding.account() != self.binding {
+            return Err(ProviderError::AccountMismatch);
+        }
+        SelectedCredential::from_entries(binding, &self.entries, &self.vault_key, self.checkpoint)
     }
 
     pub fn synchronized_at(&self) -> OffsetDateTime {
         self.synchronized_at
     }
 
-    pub fn binding(&self) -> &ProviderBinding {
+    pub fn binding(&self) -> &AccountBinding {
         &self.binding
     }
     pub fn checkpoint(&self) -> [u8; 16] {
         self.checkpoint
     }
-
-    /// Trusted credential-owner primitive. The owner must authorize this exact
-    /// credential before acquisition and recheck authority at final admission.
-    /// The returned buffer must stay inside its concrete credential-use adapter.
-    pub fn decrypt_selected_for_owner(&self) -> Result<Zeroizing<Vec<u8>>, ProviderError> {
-        decrypt_value(self.credential.encoded(), &locked_keys(&self.selected_key)?)
-    }
 }
 
 impl RbwProvider {
-    pub async fn enroll_sole_login(
+    pub async fn enroll(
         server: &str,
         email: &str,
         password: &[u8],
         limits: KdfLimits,
-        role: &str,
     ) -> Result<VaultSnapshot, ProviderError> {
-        let request = EnrollmentRequest::new(server, email, role, None)?;
+        let request = EnrollmentRequest::new(server, email)?;
         Self::with_target(ProviderTarget::Enrollment(request), limits)?
             .login(password)
             .await
     }
 
-    pub async fn enroll_selected_login(
-        server: &str,
-        email: &str,
-        item_id: &str,
-        password: &[u8],
-        limits: KdfLimits,
-        role: &str,
-    ) -> Result<VaultSnapshot, ProviderError> {
-        let request = EnrollmentRequest::new(server, email, role, Some(item_id))?;
-        Self::with_target(ProviderTarget::Enrollment(request), limits)?
-            .login(password)
-            .await
-    }
-
-    pub fn new(binding: ProviderBinding, limits: KdfLimits) -> Result<Self, ProviderError> {
+    pub fn new(binding: AccountBinding, limits: KdfLimits) -> Result<Self, ProviderError> {
         Self::with_target(ProviderTarget::Pinned(binding), limits)
+    }
+
+    pub async fn sync_items(&self, source: &VaultSnapshot) -> Result<ItemRefresh, ProviderError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let (source, entries) = self.refreshed_entries(source).await?;
+            let items = item_summaries(&source, &entries);
+            Ok(ItemRefresh { source, items })
+        })
+        .await
+        .map_err(|_| ProviderError::ServerUnavailable)?
+    }
+
+    pub async fn sync_selected(
+        &self,
+        source: &VaultSnapshot,
+        selected: &ProviderBinding,
+    ) -> Result<SelectionRefresh, ProviderError> {
+        if !matches!(&self.target, ProviderTarget::Pinned(binding) if binding == source.binding())
+            || selected.server != source.binding.server
+            || selected.account_id != source.binding.account_id
+            || selected.email != source.binding.email
+        {
+            return Err(ProviderError::AccountMismatch);
+        }
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let (source, _) = self.refreshed_entries(source).await?;
+            let selected = source.select(selected);
+            Ok(SelectionRefresh { source, selected })
+        })
+        .await
+        .map_err(|_| ProviderError::ServerUnavailable)?
+    }
+
+    async fn refreshed_entries(
+        &self,
+        source: &VaultSnapshot,
+    ) -> Result<(VaultSnapshot, Vec<rbw::db::Entry>), ProviderError> {
+        if !matches!(&self.target, ProviderTarget::Pinned(binding) if binding == source.binding()) {
+            return Err(ProviderError::AccountMismatch);
+        }
+        let (access, refresh_token) = self.refresh_session(source).await?;
+        let (binding, entries) = self.fetch_entries(&access, &source.protected_key).await?;
+        let source = snapshot_from_entries(
+            binding,
+            &entries,
+            refresh_token,
+            source.protected_key.clone(),
+            Zeroizing::new(source.vault_key.to_vec()),
+            source.kdf,
+        )?;
+        Ok((source, entries))
     }
 
     fn with_target(target: ProviderTarget, limits: KdfLimits) -> Result<Self, ProviderError> {
@@ -362,6 +498,22 @@ impl RbwProvider {
         vault_key: Zeroizing<Vec<u8>>,
         kdf: KdfParameters,
     ) -> Result<VaultSnapshot, ProviderError> {
+        let (binding, entries) = self.fetch_entries(access, &protected_key).await?;
+        snapshot_from_entries(
+            binding,
+            &entries,
+            refresh_token,
+            protected_key,
+            vault_key,
+            kdf,
+        )
+    }
+
+    async fn fetch_entries(
+        &self,
+        access: &str,
+        protected_key: &str,
+    ) -> Result<(AccountBinding, Vec<rbw::db::Entry>), ProviderError> {
         #[derive(Deserialize)]
         struct Profile {
             #[serde(alias = "Id")]
@@ -393,98 +545,49 @@ impl RbwProvider {
         }
         let binding = match &self.target {
             ProviderTarget::Pinned(binding) => binding.clone(),
-            ProviderTarget::Enrollment(request) => {
-                let item = match &request.selection {
-                    EnrollmentSelection::Item(id) => id.as_str(),
-                    EnrollmentSelection::SoleLogin => match entries.as_slice() {
-                        [] => return Err(ProviderError::ItemNotFound),
-                        [entry] => &entry.id,
-                        _ => return Err(ProviderError::AmbiguousItem),
-                    },
-                };
-                ProviderBinding {
-                    server: request.server.clone(),
-                    account_id: nonnil_uuid(&profile.id)
-                        .map_err(|_| ProviderError::InvalidResponse)?,
-                    email: request.email.clone(),
-                    item_id: nonnil_uuid(item).map_err(|_| ProviderError::InvalidResponse)?,
-                    field: CredentialField::LoginPassword,
-                    role: request.role.clone(),
-                }
-            }
-        };
-        let mut selected = entries
-            .into_iter()
-            .filter(|entry| entry.id == binding.item_id);
-        let entry = selected.next().ok_or(ProviderError::ItemNotFound)?;
-        if selected.next().is_some() {
-            return Err(ProviderError::AmbiguousItem);
-        }
-        if entry.org_id.is_some() {
-            return Err(ProviderError::OrganizationUnsupported);
-        }
-        if entry.master_password_reprompt() {
-            return Err(ProviderError::MasterPasswordRepromptRequired);
-        }
-        let vault_keys = locked_keys(&vault_key)?;
-        let selected_key = match &entry.key {
-            Some(key) => decrypt_key(key, &vault_keys)?,
-            None => Zeroizing::new(vault_key.to_vec()),
-        };
-        let item_keys = locked_keys(&selected_key)?;
-        let cipher = match self.target.field() {
-            CredentialField::LoginPassword => match entry.data {
-                rbw::db::EntryData::Login {
-                    password: Some(password),
-                    ..
-                } => password,
-                _ => return Err(ProviderError::ItemNotFound),
+            ProviderTarget::Enrollment(request) => AccountBinding {
+                server: request.server.clone(),
+                account_id: nonnil_uuid(&profile.id).map_err(|_| ProviderError::InvalidResponse)?,
+                email: request.email.clone(),
             },
-            CredentialField::HiddenField(name) => {
-                let mut value = None;
-                for field in entry.fields {
-                    let Some(encoded_name) = field.name else {
-                        continue;
-                    };
-                    let decoded = decrypt_value(&encoded_name, &item_keys)?;
-                    if decoded.as_slice() != name.as_bytes() {
-                        continue;
-                    }
-                    if value.is_some() {
-                        return Err(ProviderError::AmbiguousItem);
-                    }
-                    if field.ty != Some(rbw::api::FieldType::Hidden) || field.linked_id.is_some() {
-                        return Err(ProviderError::CipherUnsupported);
-                    }
-                    value = Some(field.value.ok_or(ProviderError::ItemNotFound)?);
-                }
-                value.ok_or(ProviderError::ItemNotFound)?
-            }
         };
-        let credential =
-            EncryptedCredential::parse(&cipher).map_err(|_| ProviderError::CipherUnsupported)?;
-        credential
-            .authenticate(&item_keys)
-            .map_err(|_| ProviderError::InvalidResponse)?;
-        let mut checkpoint = [0; 16];
-        SystemRandom::new()
-            .fill(&mut checkpoint)
-            .map_err(|_| ProviderError::InvalidResponse)?;
-        let synchronized_at = OffsetDateTime::now_utc()
-            .replace_nanosecond(0)
-            .map_err(|_| ProviderError::InvalidResponse)?;
-        Ok(VaultSnapshot {
-            binding,
-            credential,
-            selected_key,
-            vault_key,
-            protected_key,
-            kdf,
-            refresh_token,
-            checkpoint,
-            synchronized_at,
-        })
+        Ok((binding, entries))
     }
+    async fn refresh_session(
+        &self,
+        snapshot: &VaultSnapshot,
+    ) -> Result<(Zeroizing<String>, Zeroizing<String>), ProviderError> {
+        #[derive(Deserialize)]
+        struct Refreshed {
+            access_token: String,
+            refresh_token: Option<String>,
+        }
+        let response = self
+            .http
+            .post(format!("{}/identity/connect/token", self.target.server()))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", "cli"),
+                ("refresh_token", &snapshot.refresh_token),
+            ])
+            .send()
+            .await
+            .map_err(|_| ProviderError::ServerUnavailable)?;
+        check_status(response.status(), true)?;
+        let refreshed: Refreshed = bounded_json(response).await?;
+        let access = Zeroizing::new(refreshed.access_token);
+        let refresh = Zeroizing::new(
+            refreshed
+                .refresh_token
+                .unwrap_or_else(|| snapshot.refresh_token.to_string()),
+        );
+        if access.is_empty() || refresh.is_empty() || access.len() > 16384 || refresh.len() > 16384
+        {
+            return Err(ProviderError::InvalidResponse);
+        }
+        Ok((access, refresh))
+    }
+
     async fn login_inner(&self, password: &[u8]) -> Result<VaultSnapshot, ProviderError> {
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             let parameters = self.prelogin().await?;
@@ -534,54 +637,154 @@ impl VaultProvider for RbwProvider {
     }
 
     async fn sync(&self, snapshot: &VaultSnapshot) -> Result<VaultSnapshot, ProviderError> {
-        if !matches!(&self.target, ProviderTarget::Pinned(binding) if binding == &snapshot.binding)
-        {
-            return Err(ProviderError::AccountMismatch);
-        }
         tokio::time::timeout(REQUEST_TIMEOUT, async {
-            #[derive(Deserialize)]
-            struct Refreshed {
-                access_token: String,
-                refresh_token: Option<String>,
-            }
-            let response = self
-                .http
-                .post(format!("{}/identity/connect/token", self.target.server()))
-                .form(&[
-                    ("grant_type", "refresh_token"),
-                    ("client_id", "cli"),
-                    ("refresh_token", &snapshot.refresh_token),
-                ])
-                .send()
-                .await
-                .map_err(|_| ProviderError::ServerUnavailable)?;
-            check_status(response.status(), true)?;
-            let refreshed: Refreshed = bounded_json(response).await?;
-            let access = Zeroizing::new(refreshed.access_token);
-            let refresh = Zeroizing::new(
-                refreshed
-                    .refresh_token
-                    .unwrap_or_else(|| snapshot.refresh_token.to_string()),
-            );
-            if access.is_empty()
-                || refresh.is_empty()
-                || access.len() > 16384
-                || refresh.len() > 16384
-            {
-                return Err(ProviderError::InvalidResponse);
-            }
-            self.snapshot(
-                &access,
-                refresh,
-                snapshot.protected_key.clone(),
-                Zeroizing::new(snapshot.vault_key.to_vec()),
-                snapshot.kdf,
-            )
-            .await
+            let (snapshot, _) = self.refreshed_entries(snapshot).await?;
+            Ok(snapshot)
         })
         .await
         .map_err(|_| ProviderError::ServerUnavailable)?
     }
+}
+
+fn item_summaries(
+    source: &VaultSnapshot,
+    entries: &[rbw::db::Entry],
+) -> Result<Vec<VaultItemSummary>, ProviderError> {
+    if entries.len() > MAX_LISTED_ITEMS {
+        return Err(ProviderError::TooManyItems);
+    }
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            let binding = ProviderBinding {
+                server: source.binding.server.clone(),
+                account_id: source.binding.account_id.clone(),
+                email: source.binding.email.clone(),
+                item_id: nonnil_uuid(&entry.id).ok()?,
+                field: CredentialField::LoginPassword,
+                role: "catalogue".into(),
+            };
+            let selected = SelectedCredential::from_entries(
+                &binding,
+                entries,
+                &source.vault_key,
+                source.checkpoint,
+            )
+            .ok()?;
+            Some(VaultItemSummary {
+                id: binding.item_id,
+                name: selected.name.to_string(),
+            })
+        })
+        .collect())
+}
+
+fn selected_entry<'a>(
+    entries: &'a [rbw::db::Entry],
+    binding: &ProviderBinding,
+) -> Result<&'a rbw::db::Entry, ProviderError> {
+    let mut selected = entries.iter().filter(|entry| entry.id == binding.item_id);
+    let entry = selected.next().ok_or(ProviderError::ItemNotFound)?;
+    if selected.next().is_some() {
+        return Err(ProviderError::AmbiguousItem);
+    }
+    if entry.org_id.is_some() {
+        return Err(ProviderError::OrganizationUnsupported);
+    }
+    if entry.master_password_reprompt() {
+        return Err(ProviderError::MasterPasswordRepromptRequired);
+    }
+    Ok(entry)
+}
+
+fn entry_credential(
+    entry: &rbw::db::Entry,
+    binding: &ProviderBinding,
+    vault_key: &[u8],
+) -> Result<(EncryptedCredential, Zeroizing<Vec<u8>>), ProviderError> {
+    let vault_keys = locked_keys(vault_key)?;
+    let selected_key = match &entry.key {
+        Some(key) => decrypt_key(key, &vault_keys)?,
+        None => Zeroizing::new(vault_key.to_vec()),
+    };
+    let item_keys = locked_keys(&selected_key)?;
+    let cipher = match binding.field() {
+        CredentialField::LoginPassword => match &entry.data {
+            rbw::db::EntryData::Login {
+                password: Some(password),
+                ..
+            } => password,
+            _ => return Err(ProviderError::ItemNotFound),
+        },
+        CredentialField::HiddenField(name) => {
+            let mut value = None;
+            for field in &entry.fields {
+                let Some(encoded_name) = &field.name else {
+                    continue;
+                };
+                let decoded = decrypt_value(encoded_name, &item_keys)?;
+                if decoded.as_slice() != name.as_bytes() {
+                    continue;
+                }
+                if value.is_some() {
+                    return Err(ProviderError::AmbiguousItem);
+                }
+                if field.ty != Some(rbw::api::FieldType::Hidden) || field.linked_id.is_some() {
+                    return Err(ProviderError::CipherUnsupported);
+                }
+                value = Some(field.value.as_ref().ok_or(ProviderError::ItemNotFound)?);
+            }
+            value.ok_or(ProviderError::ItemNotFound)?
+        }
+    };
+    let credential =
+        EncryptedCredential::parse(cipher).map_err(|_| ProviderError::CipherUnsupported)?;
+    credential
+        .authenticate(&item_keys)
+        .map_err(|_| ProviderError::InvalidResponse)?;
+    Ok((credential, selected_key))
+}
+
+const MAX_CACHED_ENTRIES: usize = 10_000;
+const MAX_CATALOGUE_BYTES: usize = 8 * 1024 * 1024;
+
+fn validate_entries(entries: &[rbw::db::Entry]) -> Result<(), ProviderError> {
+    if entries.len() > MAX_CACHED_ENTRIES {
+        return Err(ProviderError::TooManyItems);
+    }
+    let encoded = serde_json::to_vec(entries).map_err(|_| ProviderError::InvalidResponse)?;
+    if encoded.len() > MAX_CATALOGUE_BYTES {
+        return Err(ProviderError::TooManyItems);
+    }
+    Ok(())
+}
+
+fn snapshot_from_entries(
+    binding: AccountBinding,
+    entries: &[rbw::db::Entry],
+    refresh_token: Zeroizing<String>,
+    protected_key: String,
+    vault_key: Zeroizing<Vec<u8>>,
+    kdf: KdfParameters,
+) -> Result<VaultSnapshot, ProviderError> {
+    validate_entries(entries)?;
+    let mut checkpoint = [0; 16];
+    SystemRandom::new()
+        .fill(&mut checkpoint)
+        .map_err(|_| ProviderError::InvalidResponse)?;
+    let synchronized_at = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .map_err(|_| ProviderError::InvalidResponse)?;
+    Ok(VaultSnapshot {
+        binding,
+        entries: entries.to_vec(),
+        vault_key,
+        protected_key,
+        kdf,
+        refresh_token,
+        checkpoint,
+        synchronized_at,
+    })
 }
 
 fn locked_keys(bytes: &[u8]) -> Result<rbw::locked::Keys, ProviderError> {
@@ -834,21 +1037,510 @@ mod tests {
     }
 
     fn provider(server: &Server) -> RbwProvider {
-        provider_with_field(server, CredentialField::LoginPassword)
+        let mut account = binding().account();
+        account.server = server.url.clone();
+        RbwProvider::new(account, LIMITS).unwrap()
     }
 
-    fn provider_with_field(server: &Server, field: CredentialField) -> RbwProvider {
-        let mut binding = binding();
-        binding.server = server.url.clone();
-        binding.field = field;
-        RbwProvider::new(binding, LIMITS).unwrap()
+    fn snapshot_binding(snapshot: &VaultSnapshot) -> ProviderBinding {
+        ProviderBinding {
+            server: snapshot.binding.server.clone(),
+            account_id: snapshot.binding.account_id.clone(),
+            email: snapshot.binding.email.clone(),
+            ..binding()
+        }
     }
 
     fn assert_selected_credential(snapshot: &VaultSnapshot) {
         assert_eq!(
-            snapshot.decrypt_selected_for_owner().unwrap().as_slice(),
+            snapshot
+                .select(&snapshot_binding(snapshot))
+                .unwrap()
+                .decrypt_selected_for_owner()
+                .unwrap()
+                .as_slice(),
             CANARY
         );
+    }
+
+    fn selection_fixture() -> Fixture {
+        let mut fixture = Fixture::new();
+        let vault_keys = locked_keys(&(0..64).collect::<Vec<_>>()).unwrap();
+        let item_key: Vec<_> = (64..128).collect();
+        let item_keys = locked_keys(&item_key).unwrap();
+        let encrypt = |value: &[u8]| {
+            CipherString::encrypt_symmetric(&item_keys, value)
+                .unwrap()
+                .to_string()
+        };
+        fixture.sync["ciphers"].as_array_mut().unwrap().push(json!({
+            "id": "33333333-3333-4333-8333-333333333333",
+            "key": CipherString::encrypt_symmetric(&vault_keys, &item_key).unwrap().to_string(),
+            "name": encrypt(b"Disposable Restic repository"),
+            "reprompt": 0,
+            "login": {"password": encrypt(b"dummy-restic-password")},
+            "fields": [{"type": 1, "name": encrypt(b"backup"), "value": encrypt(b"dummy-restic-password")}]
+        }));
+        fixture
+    }
+
+    fn selection_binding(source: &VaultSnapshot) -> ProviderBinding {
+        let mut binding = snapshot_binding(source);
+        binding.item_id = "33333333-3333-4333-8333-333333333333".into();
+        binding.role = "restic-password".into();
+        binding
+    }
+
+    #[tokio::test]
+    async fn deleting_original_item_preserves_account_sync_and_other_selection() {
+        let mut fixture = selection_fixture();
+        fixture.sync["ciphers"].as_array_mut().unwrap().remove(0);
+        let server = fixture.serve().await;
+        let provider = provider(&server);
+        let snapshot = provider.login(PASSWORD).await.unwrap();
+        let refreshed = provider
+            .sync_selected(&snapshot, &selection_binding(&snapshot))
+            .await
+            .unwrap();
+        assert!(
+            refreshed
+                .selected
+                .unwrap()
+                .decrypt_selected_for_owner()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_account_selects_independent_items_without_network_and_rejects_other_accounts() {
+        let server = selection_fixture().serve().await;
+        let snapshot = provider(&server).login(PASSWORD).await.unwrap();
+        let mut cached = snapshot;
+        cached.binding.server = "https://vault.example.invalid".into();
+        let first = snapshot_binding(&cached);
+        let second = selection_binding(&cached);
+        let sealed = SealedSnapshot::seal(&cached, &[6; 32], [7; 32], &[8; 113]).unwrap();
+        server.task.abort();
+        let restored = SealedSnapshot::decode(sealed.as_bytes(), cached.binding(), &[7; 32])
+            .unwrap()
+            .open(&[6; 32], cached.synchronized_at())
+            .unwrap();
+        let github = restored.select(&first).unwrap();
+        let restic = restored.select(&second).unwrap();
+        assert_eq!(
+            github.decrypt_selected_for_owner().unwrap().as_slice(),
+            CANARY
+        );
+        assert_eq!(
+            restic.decrypt_selected_for_owner().unwrap().as_slice(),
+            b"dummy-restic-password"
+        );
+        assert_ne!(github.credential_digest(), restic.credential_digest());
+        assert_eq!(github.checkpoint(), restored.checkpoint());
+        assert_eq!(restic.checkpoint(), restored.checkpoint());
+        let mut other = first;
+        other.account_id = "44444444-4444-4444-8444-444444444444".into();
+        assert!(matches!(
+            restored.select(&other),
+            Err(ProviderError::AccountMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsupported_cached_item_fails_only_when_selected_and_empty_snapshot_roundtrips() {
+        for empty in [false, true] {
+            let mut fixture = selection_fixture();
+            fixture.sync["ciphers"][0]["organizationId"] = json!(ACCOUNT);
+            if empty {
+                fixture.sync["ciphers"] = json!([]);
+            }
+            let server = fixture.serve().await;
+            let mut snapshot = provider(&server).login(PASSWORD).await.unwrap();
+            snapshot.binding.server = "https://vault.example.invalid".into();
+            let sealed = SealedSnapshot::seal(&snapshot, &[6; 32], [7; 32], &[8; 113]).unwrap();
+            let restored = SealedSnapshot::decode(sealed.as_bytes(), snapshot.binding(), &[7; 32])
+                .unwrap()
+                .open(&[6; 32], snapshot.synchronized_at())
+                .unwrap();
+            let expected = if empty {
+                ProviderError::ItemNotFound
+            } else {
+                ProviderError::OrganizationUnsupported
+            };
+            assert!(
+                matches!(restored.select(&snapshot_binding(&restored)), Err(error) if error == expected)
+            );
+            if !empty {
+                assert!(restored.select(&selection_binding(&restored)).is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalogue_count_and_encoded_size_are_bounded() {
+        let server = Fixture::new().serve().await;
+        let snapshot = provider(&server).login(PASSWORD).await.unwrap();
+        let mut oversized = snapshot.entries[0].clone();
+        oversized.name = "x".repeat(MAX_CATALOGUE_BYTES);
+        assert_eq!(
+            validate_entries(&[oversized]),
+            Err(ProviderError::TooManyItems)
+        );
+        assert_eq!(
+            validate_entries(&vec![snapshot.entries[0].clone(); MAX_CACHED_ENTRIES + 1]),
+            Err(ProviderError::TooManyItems)
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_item_summaries_authenticate_names_without_fetching_or_exporting_credentials() {
+        let fixture = selection_fixture();
+        let requests = Arc::clone(&fixture.requests);
+        let server = fixture.serve().await;
+        let mut source = provider(&server).login(PASSWORD).await.unwrap();
+        requests.lock().unwrap().clear();
+
+        let items = source.item_summaries().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&items[1]).unwrap(),
+            json!({"id": "33333333-3333-4333-8333-333333333333", "name": "Disposable Restic repository"})
+        );
+        source.entries[1].name = "invalid authenticated ciphertext".into();
+        let items = source.item_summaries().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, source.entries[0].id);
+        source.entries = vec![source.entries[0].clone(); MAX_LISTED_ITEMS + 1];
+        assert!(matches!(
+            source.item_summaries(),
+            Err(ProviderError::TooManyItems)
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_items_returns_only_authenticated_names_and_ids_from_the_unlocked_vault() {
+        let fixture = selection_fixture();
+        let requests = Arc::clone(&fixture.requests);
+        let server = fixture.serve().await;
+        let provider = provider(&server);
+        let source = provider.login(PASSWORD).await.unwrap();
+        requests.lock().unwrap().clear();
+
+        let refreshed = provider.sync_items(&source).await.unwrap();
+        let items = refreshed.items.unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].id, "33333333-3333-4333-8333-333333333333");
+        assert_eq!(items[1].name, "Disposable Restic repository");
+        assert_eq!(
+            serde_json::to_value(&items[1]).unwrap(),
+            json!({"id": "33333333-3333-4333-8333-333333333333", "name": "Disposable Restic repository"})
+        );
+        assert_eq!(refreshed.source.binding(), source.binding());
+        assert_selected_credential(&refreshed.source);
+        assert_eq!(
+            refreshed.source.refresh_token.as_str(),
+            "dummy-rotated-refresh"
+        );
+        let requests = requests.lock().unwrap();
+        let paths: Vec<_> = requests
+            .iter()
+            .map(|(_, path, _, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/identity/connect/token",
+                "/api/accounts/profile",
+                "/api/sync"
+            ]
+        );
+        let form = url_form(&requests[0].3);
+        assert_eq!(form.get("grant_type").unwrap(), "refresh_token");
+        assert!(!form.contains_key("password"));
+    }
+
+    #[tokio::test]
+    async fn sync_items_rejects_another_source_account_before_network_access() {
+        let fixture = selection_fixture();
+        let requests = Arc::clone(&fixture.requests);
+        let server = fixture.serve().await;
+        let provider = provider(&server);
+        let mut source = provider.login(PASSWORD).await.unwrap();
+        source.binding.account_id = "44444444-4444-4444-8444-444444444444".into();
+        requests.lock().unwrap().clear();
+
+        assert!(matches!(
+            provider.sync_items(&source).await,
+            Err(ProviderError::AccountMismatch)
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_items_skips_unusable_items_and_retains_the_rotated_source() {
+        for failure in [
+            "organization",
+            "reprompt",
+            "key",
+            "name-mac",
+            "name-length",
+            "name-encoding",
+            "id",
+            "password",
+            "duplicate",
+        ] {
+            let mut fixture = selection_fixture();
+            match failure {
+                "organization" => fixture.sync["ciphers"][1]["organizationId"] = json!(ACCOUNT),
+                "reprompt" => fixture.sync["ciphers"][1]["reprompt"] = json!(1),
+                "key" => fixture.sync["ciphers"][1]["key"] = json!("invalid"),
+                "name-mac" => {
+                    let name = &mut fixture.sync["ciphers"][1]["name"];
+                    let mut cipher = CipherString::new(name.as_str().unwrap()).unwrap();
+                    let CipherString::Symmetric { ciphertext, .. } = &mut cipher else {
+                        unreachable!()
+                    };
+                    ciphertext[0] ^= 1;
+                    *name = json!(cipher.to_string());
+                }
+                "name-length" | "name-encoding" => {
+                    let name = if failure == "name-length" {
+                        vec![b'x'; 1025]
+                    } else {
+                        vec![0xff]
+                    };
+                    let keys = locked_keys(&(64..128).collect::<Vec<_>>()).unwrap();
+                    fixture.sync["ciphers"][1]["name"] = json!(
+                        CipherString::encrypt_symmetric(&keys, &name)
+                            .unwrap()
+                            .to_string()
+                    );
+                }
+                "id" => fixture.sync["ciphers"][1]["id"] = json!("invalid"),
+                "password" => fixture.sync["ciphers"][1]["login"]["password"] = json!(null),
+                "duplicate" => {
+                    let entry = fixture.sync["ciphers"][1].clone();
+                    fixture.sync["ciphers"].as_array_mut().unwrap().push(entry);
+                }
+                _ => unreachable!(),
+            }
+            let requests = Arc::clone(&fixture.requests);
+            let server = fixture.serve().await;
+            let provider = provider(&server);
+            let source = provider.login(PASSWORD).await.unwrap();
+
+            let refreshed = provider.sync_items(&source).await.unwrap();
+
+            let items = refreshed.items.unwrap();
+            assert_eq!(items.len(), 1, "{failure}");
+            assert_eq!(items[0].id, ITEM, "{failure}");
+            assert_selected_credential(&refreshed.source);
+            requests.lock().unwrap().clear();
+            provider.sync(&refreshed.source).await.unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                url_form(&requests[0].3).get("refresh_token").unwrap(),
+                "dummy-rotated-refresh",
+                "{failure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_items_retains_the_rotated_source_when_the_item_limit_is_exceeded() {
+        let mut fixture = selection_fixture();
+        let entry = fixture.sync["ciphers"][1].clone();
+        fixture.sync["ciphers"]
+            .as_array_mut()
+            .unwrap()
+            .extend(std::iter::repeat_n(entry, 999));
+        let server = fixture.serve().await;
+        let provider = provider(&server);
+        let source = provider.login(PASSWORD).await.unwrap();
+
+        let refreshed = provider.sync_items(&source).await.unwrap();
+
+        assert!(matches!(refreshed.items, Err(ProviderError::TooManyItems)));
+        assert_selected_credential(&refreshed.source);
+        assert_eq!(
+            refreshed.source.refresh_token.as_str(),
+            "dummy-rotated-refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_selected_authenticates_the_target_name_and_credential_with_its_item_key() {
+        for field in [
+            CredentialField::LoginPassword,
+            CredentialField::HiddenField("backup".into()),
+        ] {
+            let fixture = selection_fixture();
+            let requests = Arc::clone(&fixture.requests);
+            let server = fixture.serve().await;
+            let provider = provider(&server);
+            let source = provider.login(PASSWORD).await.unwrap();
+            let mut binding = selection_binding(&source);
+            binding.field = field;
+            requests.lock().unwrap().clear();
+
+            let refreshed = provider.sync_selected(&source, &binding).await.unwrap();
+            let selected = refreshed.selected.unwrap();
+
+            assert_eq!(selected.binding(), &binding);
+            assert_eq!(selected.name(), "Disposable Restic repository");
+            assert_eq!(
+                selected.decrypt_selected_for_owner().unwrap().as_slice(),
+                b"dummy-restic-password"
+            );
+            assert_ne!(
+                selected.credential_digest(),
+                source
+                    .select(&snapshot_binding(&source))
+                    .unwrap()
+                    .credential_digest()
+            );
+            assert_eq!(refreshed.source.binding(), source.binding());
+            assert_selected_credential(&refreshed.source);
+            assert_eq!(
+                refreshed.source.refresh_token.as_str(),
+                "dummy-rotated-refresh"
+            );
+            let requests = requests.lock().unwrap();
+            let paths: Vec<_> = requests
+                .iter()
+                .map(|(_, path, _, _)| path.as_str())
+                .collect();
+            assert_eq!(
+                paths,
+                [
+                    "/identity/connect/token",
+                    "/api/accounts/profile",
+                    "/api/sync"
+                ]
+            );
+            let form = url_form(&requests[0].3);
+            assert_eq!(form.get("grant_type").unwrap(), "refresh_token");
+            assert!(!form.contains_key("password"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_selected_rejects_other_accounts_and_unpinned_sources_before_network_access() {
+        let fixture = selection_fixture();
+        let requests = Arc::clone(&fixture.requests);
+        let server = fixture.serve().await;
+        let provider = provider(&server);
+        let mut source = provider.login(PASSWORD).await.unwrap();
+        for changed in ["server", "account", "email", "source"] {
+            let mut binding = selection_binding(&source);
+            match changed {
+                "server" => binding.server = "https://other.example.invalid".into(),
+                "account" => binding.account_id = "44444444-4444-4444-8444-444444444444".into(),
+                "email" => binding.email = "other@example.invalid".into(),
+                "source" => {
+                    source.binding.account_id = "55555555-5555-4555-8555-555555555555".into()
+                }
+                _ => unreachable!(),
+            }
+            requests.lock().unwrap().clear();
+
+            assert!(matches!(
+                provider.sync_selected(&source, &binding).await,
+                Err(ProviderError::AccountMismatch)
+            ));
+            assert!(requests.lock().unwrap().is_empty(), "{changed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_selected_target_failures_retain_the_refreshed_source_and_rotated_token() {
+        for (failure, expected) in [
+            ("missing", ProviderError::ItemNotFound),
+            ("duplicate", ProviderError::AmbiguousItem),
+            ("organization", ProviderError::OrganizationUnsupported),
+            ("reprompt", ProviderError::MasterPasswordRepromptRequired),
+            ("credential-mac", ProviderError::InvalidResponse),
+            ("name-mac", ProviderError::InvalidResponse),
+            ("name-length", ProviderError::InvalidResponse),
+            ("name-encoding", ProviderError::InvalidResponse),
+        ] {
+            let mut fixture = selection_fixture();
+            match failure {
+                "missing" => {
+                    fixture.sync["ciphers"].as_array_mut().unwrap().pop();
+                }
+                "duplicate" => {
+                    let entry = fixture.sync["ciphers"][1].clone();
+                    fixture.sync["ciphers"].as_array_mut().unwrap().push(entry);
+                }
+                "organization" => fixture.sync["ciphers"][1]["organizationId"] = json!(ACCOUNT),
+                "reprompt" => fixture.sync["ciphers"][1]["reprompt"] = json!(1),
+                "credential-mac" | "name-mac" => {
+                    let value = if failure == "credential-mac" {
+                        &mut fixture.sync["ciphers"][1]["login"]["password"]
+                    } else {
+                        &mut fixture.sync["ciphers"][1]["name"]
+                    };
+                    let mut cipher = CipherString::new(value.as_str().unwrap()).unwrap();
+                    let CipherString::Symmetric { ciphertext, .. } = &mut cipher else {
+                        unreachable!()
+                    };
+                    ciphertext[0] ^= 1;
+                    *value = json!(cipher.to_string());
+                }
+                "name-length" | "name-encoding" => {
+                    let name = if failure == "name-length" {
+                        vec![b'x'; 1025]
+                    } else {
+                        vec![0xff]
+                    };
+                    let keys = locked_keys(&(64..128).collect::<Vec<_>>()).unwrap();
+                    fixture.sync["ciphers"][1]["name"] = json!(
+                        CipherString::encrypt_symmetric(&keys, &name)
+                            .unwrap()
+                            .to_string()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let requests = Arc::clone(&fixture.requests);
+            let server = fixture.serve().await;
+            let provider = provider(&server);
+            let source = provider.login(PASSWORD).await.unwrap();
+            let binding = selection_binding(&source);
+
+            let refreshed = provider.sync_selected(&source, &binding).await.unwrap();
+
+            assert!(
+                matches!(refreshed.selected, Err(error) if error == expected),
+                "{failure}"
+            );
+            assert_eq!(refreshed.source.binding(), source.binding());
+            assert_selected_credential(&refreshed.source);
+            let mut cached = refreshed.source;
+            let loopback = std::mem::replace(
+                &mut cached.binding.server,
+                "https://vault.example.invalid".into(),
+            );
+            let sealed = SealedSnapshot::seal(&cached, &[6; 32], [7; 32], &[8; 113]).unwrap();
+            let mut reopened =
+                SealedSnapshot::decode(sealed.as_bytes(), cached.binding(), &[7; 32])
+                    .unwrap()
+                    .open(&[6; 32], source.synchronized_at())
+                    .unwrap();
+            reopened.binding.server = loopback;
+            requests.lock().unwrap().clear();
+            provider.sync(&reopened).await.unwrap();
+            let requests = requests.lock().unwrap();
+            let form = url_form(&requests[0].3);
+            assert_eq!(
+                form.get("refresh_token").unwrap(),
+                "dummy-rotated-refresh",
+                "{failure}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -856,7 +1548,11 @@ mod tests {
         let server = Fixture::new().serve().await;
         let snapshot = provider(&server).login(PASSWORD).await.unwrap();
 
-        let plaintext = snapshot.decrypt_selected_for_owner().unwrap();
+        let plaintext = snapshot
+            .select(&snapshot_binding(&snapshot))
+            .unwrap()
+            .decrypt_selected_for_owner()
+            .unwrap();
 
         assert_eq!(&*plaintext, CANARY);
     }
@@ -865,7 +1561,8 @@ mod tests {
     async fn owner_decryption_rejects_changed_keys_and_ciphertext() {
         let server = Fixture::new().serve().await;
         for change_ciphertext in [false, true] {
-            let mut snapshot = provider(&server).login(PASSWORD).await.unwrap();
+            let snapshot = provider(&server).login(PASSWORD).await.unwrap();
+            let mut snapshot = snapshot.select(&snapshot_binding(&snapshot)).unwrap();
             if change_ciphertext {
                 let mut cipher = CipherString::new(snapshot.credential.encoded()).unwrap();
                 let CipherString::Symmetric { ciphertext, .. } = &mut cipher else {
@@ -887,7 +1584,8 @@ mod tests {
     #[tokio::test]
     async fn owner_decryption_rejects_invalid_key_lengths() {
         let server = Fixture::new().serve().await;
-        let mut snapshot = provider(&server).login(PASSWORD).await.unwrap();
+        let snapshot = provider(&server).login(PASSWORD).await.unwrap();
+        let mut snapshot = snapshot.select(&snapshot_binding(&snapshot)).unwrap();
         snapshot.selected_key = Zeroizing::new(vec![0; 63]);
 
         assert!(matches!(
@@ -1040,7 +1738,7 @@ mod tests {
             }
             let server = fixture.serve().await;
             assert!(
-                matches!(provider(&server).login(PASSWORD).await, Err(error) if error == expected),
+                matches!(provider(&server).login(PASSWORD).await.and_then(|snapshot| snapshot.select(&snapshot_binding(&snapshot))), Err(error) if error == expected),
                 "{kind}"
             );
         }
@@ -1111,15 +1809,25 @@ mod tests {
                 .unwrap()
                 .to_string()
         );
+        fixture.sync["ciphers"][0]["name"] = json!(encrypt(b"Hidden credential"));
         fixture.sync["ciphers"][0]["fields"] = json!([
             {"type": 1, "name": encrypt(b"other"), "value": encrypt(b"other-secret")},
             {"type": 1, "name": encrypt(b"selected"), "value": encrypt(CANARY)}
         ]);
         let server = fixture.clone().serve().await;
-        let provider =
-            provider_with_field(&server, CredentialField::HiddenField("selected".into()));
+        let provider = provider(&server);
         let snapshot = provider.login(PASSWORD).await.unwrap();
-        assert_selected_credential(&snapshot);
+        let mut binding = snapshot_binding(&snapshot);
+        binding.field = CredentialField::HiddenField("selected".into());
+        assert_eq!(
+            snapshot
+                .select(&binding)
+                .unwrap()
+                .decrypt_selected_for_owner()
+                .unwrap()
+                .as_slice(),
+            CANARY
+        );
 
         let mut duplicate = fixture.clone();
         let field = duplicate.sync["ciphers"][0]["fields"][1].clone();
@@ -1128,9 +1836,12 @@ mod tests {
             .unwrap()
             .push(field);
         let server = duplicate.serve().await;
-        let other = provider_with_field(&server, CredentialField::HiddenField("selected".into()));
+        let other = self::provider(&server);
+        let snapshot = other.login(PASSWORD).await.unwrap();
+        let mut binding = snapshot_binding(&snapshot);
+        binding.field = CredentialField::HiddenField("selected".into());
         assert!(matches!(
-            other.login(PASSWORD).await,
+            snapshot.select(&binding),
             Err(ProviderError::AmbiguousItem)
         ));
     }
@@ -1165,7 +1876,7 @@ mod tests {
                 ProviderError::InvalidResponse
             };
             assert!(
-                matches!(provider(&server).login(PASSWORD).await, Err(error) if error == expected)
+                matches!(provider(&server).login(PASSWORD).await.and_then(|snapshot| snapshot.select(&snapshot_binding(&snapshot))), Err(error) if error == expected)
             );
         }
     }
@@ -1256,22 +1967,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliberate_enrollment_discovers_and_pins_the_sole_personal_login() {
+    async fn account_enrollment_discovers_and_pins_the_account() {
         let fixture = Fixture::new();
         let server = fixture.serve().await;
-        let snapshot = enrollment_provider(&server, None)
-            .login(PASSWORD)
-            .await
-            .unwrap();
+        let snapshot = enrollment_provider(&server).login(PASSWORD).await.unwrap();
 
         assert_eq!(snapshot.binding().account_id(), ACCOUNT);
-        assert_eq!(snapshot.binding().item_id(), ITEM);
         assert_eq!(snapshot.binding().email(), EMAIL);
         assert_selected_credential(&snapshot);
     }
 
     #[tokio::test]
-    async fn selected_enrollment_discovers_the_account_without_opening_other_items() {
+    async fn account_enrollment_does_not_open_unrelated_items() {
         let mut fixture = Fixture::new();
         let mut unrelated = fixture.sync["ciphers"][0].clone();
         unrelated["id"] = json!("33333333-3333-4333-8333-333333333333");
@@ -1281,87 +1988,38 @@ mod tests {
             .unwrap()
             .insert(0, unrelated);
         let server = fixture.serve().await;
-        let snapshot = enrollment_provider(&server, Some(ITEM))
-            .login(PASSWORD)
-            .await
-            .unwrap();
+        let snapshot = enrollment_provider(&server).login(PASSWORD).await.unwrap();
 
         assert_eq!(snapshot.binding().account_id(), ACCOUNT);
-        assert_eq!(snapshot.binding().item_id(), ITEM);
         assert_selected_credential(&snapshot);
     }
 
     #[tokio::test]
-    async fn selected_enrollment_rejects_missing_duplicate_or_wrong_account_items() {
-        for (kind, expected) in [
-            ("missing", ProviderError::ItemNotFound),
-            ("duplicate", ProviderError::AmbiguousItem),
-            ("wrong-email", ProviderError::AccountMismatch),
-        ] {
+    async fn account_enrollment_accepts_empty_and_multiple_item_catalogues() {
+        for count in [0, 2] {
             let mut fixture = Fixture::new();
-            match kind {
-                "missing" => {
-                    fixture.sync["ciphers"][0]["id"] = json!("33333333-3333-4333-8333-333333333333")
-                }
-                "duplicate" => {
-                    let duplicate = fixture.sync["ciphers"][0].clone();
-                    fixture.sync["ciphers"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(duplicate);
-                }
-                "wrong-email" => fixture.profile["email"] = json!("other@example.invalid"),
-                _ => unreachable!(),
-            }
+            let entry = fixture.sync["ciphers"][0].clone();
+            fixture.sync["ciphers"] = json!(vec![entry; count]);
             let server = fixture.serve().await;
-            assert!(
-                matches!(enrollment_provider(&server, Some(ITEM)).login(PASSWORD).await,
-                         Err(error) if error == expected),
-                "{kind}"
-            );
+            let snapshot = enrollment_provider(&server).login(PASSWORD).await.unwrap();
+            assert_eq!(snapshot.binding().account_id(), ACCOUNT);
+            assert_eq!(snapshot.entries.len(), count);
         }
     }
 
-    #[tokio::test]
-    async fn selected_enrollment_rejects_malformed_item_ids_before_network_access() {
-        assert!(matches!(
-            RbwProvider::enroll_selected_login(
-                "https://vault.example.invalid",
-                EMAIL,
-                "not-a-uuid",
-                PASSWORD,
-                LIMITS,
-                "github-write"
-            )
-            .await,
-            Err(ProviderError::InvalidBinding)
-        ));
-    }
-
-    #[tokio::test]
-    async fn enrollment_discovery_rejects_empty_ambiguous_or_wrong_account_vaults() {
-        for (kind, expected) in [
-            ("empty", ProviderError::ItemNotFound),
-            ("multiple", ProviderError::AmbiguousItem),
-            ("wrong-email", ProviderError::AccountMismatch),
-        ] {
-            let mut fixture = Fixture::new();
-            match kind {
-                "empty" => fixture.sync["ciphers"] = json!([]),
-                "multiple" => {
-                    let mut other = fixture.sync["ciphers"][0].clone();
-                    other["id"] = json!("33333333-3333-4333-8333-333333333333");
-                    fixture.sync["ciphers"].as_array_mut().unwrap().push(other);
-                }
-                "wrong-email" => fixture.profile["email"] = json!("other@example.invalid"),
-                _ => unreachable!(),
-            }
-            let server = fixture.serve().await;
-            assert!(
-                matches!(enrollment_provider(&server, None).login(PASSWORD).await, Err(error) if error == expected),
-                "{kind}"
-            );
-        }
+    #[test]
+    fn account_binding_is_canonical_strict_and_rejects_credential_fields() {
+        let account = AccountBinding::new(
+            "https://vault.example.invalid/",
+            ACCOUNT,
+            " DUMMY@EXAMPLE.INVALID ",
+        )
+        .unwrap();
+        assert_eq!(account, binding().account());
+        let mut value = serde_json::to_value(&account).unwrap();
+        value["item_id"] = json!(ITEM);
+        assert!(serde_json::from_value::<AccountBinding>(value).is_err());
+        assert!(AccountBinding::new("http://vault.example.invalid", ACCOUNT, EMAIL).is_err());
     }
 
     #[test]
@@ -1382,10 +2040,8 @@ mod tests {
         }
     }
 
-    fn enrollment_provider(server: &Server, item: Option<&str>) -> RbwProvider {
-        let mut request =
-            EnrollmentRequest::new("https://vault.example.invalid", EMAIL, "github-write", item)
-                .unwrap();
+    fn enrollment_provider(server: &Server) -> RbwProvider {
+        let mut request = EnrollmentRequest::new("https://vault.example.invalid", EMAIL).unwrap();
         request.server = server.url.clone();
         RbwProvider::with_target(ProviderTarget::Enrollment(request), LIMITS).unwrap()
     }

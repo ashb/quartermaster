@@ -32,7 +32,7 @@ fn authenticated_lookup_context_reaches_mutation_review_without_serving_cached_r
     {
         let mut state = shared.0.lock().unwrap();
         state.refresh_policy(&paths.load_policy()).unwrap();
-        let mut policy: Value = serde_json::from_slice(&test_support::policy_bytes(
+        let mut policy: Value = serde_json::from_slice(&test_support::vault::write_policy_bytes(
             (OffsetDateTime::now_utc() + Duration::from_secs(60))
                 .unix_timestamp()
                 .try_into()

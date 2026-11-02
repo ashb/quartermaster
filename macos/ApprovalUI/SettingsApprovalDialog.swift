@@ -44,8 +44,10 @@ private struct SettingsApprovalView: View {
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding()
             }.frame(height: 330).luminareSurface()
-            Text("This selects the vault and rules. API requests still require their own applicable authorisation.")
-                .font(.caption).foregroundStyle(.secondary)
+            Text(
+                "This selects the vault and rules. API requests still require their own applicable authorisation."
+            )
+            .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button(controller.phase == .stopped ? "Close" : "Cancel") {
                     controller.cancel()
@@ -75,7 +77,7 @@ private struct SettingsApprovalView: View {
                 Text(verbatim: "\(provider.binding.email) · \(provider.binding.server)")
                 Text(
                     verbatim:
-                        "Account: \(provider.binding.accountID)\nLogin item: \(provider.binding.itemID)\nField: \(provider.binding.field) · role: \(provider.binding.role)"
+                        "Account: \(provider.binding.accountID)"
                 )
                 .font(.caption.monospaced())
             } else {
@@ -85,6 +87,15 @@ private struct SettingsApprovalView: View {
                 Text(
                     "GitHub \(github.enabled ? "enabled" : "disabled") · \(github.repositories.count + additions.count) repositories"
                 )
+                if let credential = record.settings?.githubCredential {
+                    Text(
+                        verbatim:
+                            "Login item: \(credential.displayName) · \(escapeApprovalText(credential.itemId))"
+                    )
+                    .font(.caption.monospaced())
+                } else {
+                    Text("No GitHub credential selected").font(.caption)
+                }
                 ForEach(github.repositories) { repo in
                     Text(verbatim: "\(repo.owner)/\(repo.name)").font(.caption.monospaced())
                 }
@@ -102,6 +113,7 @@ private struct SettingsApprovalView: View {
             Text(
                 record.settings?.mutations == .deny
                     ? "Recognised writes: denied" : "Recognised writes: fingerprint per use")
+
         }.textSelection(.enabled)
     }
 }

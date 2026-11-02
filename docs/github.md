@@ -19,24 +19,23 @@ dedicated development vault account.
    a Quartermaster grant does not supply missing GitHub permissions.
 2. Put the token in a vault Login item's **password** field. The development UI
    selects this field; custom-field selection is not available in it yet.
-3. Open **Settings → GitHub** and enter the Login item UUID under **Token source**.
-   The UUID can be omitted only when the vault contains exactly one entry, which
-   must be a supported personal Login.
-4. Open **Vault**, enter the server URL, account email and master password, then
-   choose **Log in** and **Review Changes…**. Check the account,
-   item and proposed rules, then choose **Save Changes** and approve with Touch ID. Verification alone
-   does not replace the active enrolment.
+3. Open **Settings → Vault**, enter the server URL, account email and master
+   password, then choose **Log in**. Review the account and save with Touch
+   ID. Verification alone does not replace the active enrolment.
+4. Open **Tools → GitHub CLI**, choose **Change…** on the credential card, and
+   select the Login item by name. Review and save the item and access rules with
+   Touch ID.
 
-Editing the server, email or Login item after verification invalidates it. Verify
-the edited selection before reviewing changes; Discard Changes restores the
-approved selection.
+Editing the server or email invalidates account verification. Choosing a different
+Login item changes only GitHub's signed settings and does not require the master
+password. Discard Changes restores the approved selection.
 
 If previous settings need migration, Settings explains the change and offers
 **Review Import…**. Inspect the previous vault selection and access rules, then
 choose **Import and Trust** with Touch ID. Closing the review preserves the
 original data. **Sync Vault** refreshes the selected cache from Vaultwarden.
 
-The development enrolment uses the role label `github-write`. It can hold the
+GitHub credential use carries the role label `github-write`. It can hold the
 read-only token above; the label does not give that token write permissions.
 
 ## Select a repository

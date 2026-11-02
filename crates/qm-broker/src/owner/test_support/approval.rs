@@ -1,10 +1,11 @@
+use super::vault::CredentialFixture;
 use crate::owner::{
     identity::VerifiedPrincipal,
     operation::{OperationId, OperationRegistry},
     policy::{ApprovalRequirement, AuthorizationOutcome, Authorizer},
     test_support::close_request,
 };
-use qm_providers::{ApprovalSession, VaultSnapshot};
+use qm_providers::ApprovalSession;
 use ring::{
     rand::SystemRandom,
     signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair},
@@ -29,7 +30,7 @@ pub(crate) fn read_grant(
     registry: &mut OperationRegistry,
     authorizer: &mut Authorizer,
     principal: &VerifiedPrincipal,
-    snapshot: &VaultSnapshot,
+    snapshot: &CredentialFixture,
 ) -> (OperationId, ApprovalSession, EcdsaKeyPair, [u8; 32]) {
     let result = read_grant_at(registry, authorizer, principal, snapshot, Instant::now());
     let prepared = crate::owner::execution::prepare_simulation(
@@ -52,11 +53,15 @@ pub(crate) fn read_grant_at(
     registry: &mut OperationRegistry,
     authorizer: &Authorizer,
     principal: &VerifiedPrincipal,
-    snapshot: &VaultSnapshot,
+    snapshot: &CredentialFixture,
     created: Instant,
 ) -> (OperationId, ApprovalSession, EcdsaKeyPair, [u8; 32]) {
     let requirement = authorizer
-        .request_read_grant(principal, super::read_request(), snapshot.binding().role())
+        .request_read_grant(
+            principal,
+            super::read_request(),
+            super::vault::selection(snapshot).role(),
+        )
         .unwrap();
     sign(
         registry,
@@ -73,7 +78,7 @@ pub(crate) fn write(
     registry: &mut OperationRegistry,
     authorizer: &Authorizer,
     principal: &VerifiedPrincipal,
-    snapshot: &VaultSnapshot,
+    snapshot: &CredentialFixture,
 ) -> (OperationId, ApprovalSession) {
     write_at(
         registry,
@@ -89,7 +94,7 @@ pub(crate) fn write_at(
     registry: &mut OperationRegistry,
     authorizer: &Authorizer,
     principal: &VerifiedPrincipal,
-    snapshot: &VaultSnapshot,
+    snapshot: &CredentialFixture,
     created: Instant,
     proof_delay: Duration,
 ) -> (OperationId, ApprovalSession) {
@@ -115,7 +120,7 @@ pub(crate) fn sign(
     registry: &mut OperationRegistry,
     authorizer: &Authorizer,
     principal: &VerifiedPrincipal,
-    snapshot: &VaultSnapshot,
+    snapshot: &CredentialFixture,
     requirement: ApprovalRequirement,
     created: Instant,
     proof_delay: Duration,
@@ -123,7 +128,7 @@ pub(crate) fn sign(
     let document = selected_review(
         requirement.request().clone(),
         requirement.grant_claims(),
-        snapshot.binding().role(),
+        super::vault::selection(snapshot).role(),
     );
     let request_digest = ring::digest::digest(&ring::digest::SHA256, document.bytes())
         .as_ref()

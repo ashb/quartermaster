@@ -4,19 +4,16 @@ import Foundation
 public struct EnrollmentDraft: Equatable, Sendable {
     public var server = ""
     public var email = ""
-    public var itemID = ""
 
     fileprivate init(provider: SettingsProvider?) {
         server = provider?.binding.server ?? ""
         email = provider?.binding.email ?? ""
-        itemID = provider?.binding.itemID ?? ""
     }
 
     fileprivate var normalized: Self {
         var result = self
         result.server = server.trimmingCharacters(in: .whitespacesAndNewlines)
         result.email = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        result.itemID = itemID.trimmingCharacters(in: .whitespacesAndNewlines)
         return result
     }
 }
@@ -30,23 +27,27 @@ public final class SettingsEditor: ObservableObject {
     private enum Action { case change, vaultLogin }
     private enum Selection {
         case keep, forget
-        case staged(ticket: String, provider: SettingsProvider)
+        case staged(ticket: String, provider: SettingsProvider, catalogue: StagedVaultCatalogue)
 
         var choice: SettingsProviderChoice {
             switch self {
             case .keep: .keep
             case .forget: .forget
-            case .staged(let ticket, _): .staged(ticket)
+            case .staged(let ticket, _, _): .staged(ticket)
             }
         }
     }
 
     public enum Failure: LocalizedError {
-        case unverifiedEnrollment, noChanges
+        case unverifiedEnrollment, noChanges, invalidGitHubCredential,
+            stagedCatalogueUnavailable
         public var errorDescription: String? {
             switch self {
+            case .stagedCatalogueUnavailable:
+                "Item names are unavailable for this vault draft. You can still save the vault connection."
             case .unverifiedEnrollment: "Vault details changed. Log in again before reviewing changes."
             case .noChanges: "There are no changes to review."
+            case .invalidGitHubCredential: "Choose the vault login item containing the GitHub token."
             }
         }
     }
@@ -93,7 +94,7 @@ public final class SettingsEditor: ObservableObject {
     }
 
     public var stagedProvider: SettingsProvider? {
-        if case .staged(_, let provider) = selection { return provider }
+        if case .staged(_, let provider, _) = selection { return provider }
         return nil
     }
 
@@ -109,6 +110,7 @@ public final class SettingsEditor: ObservableObject {
 
     public var canReview: Bool {
         available && !busy && snapshot?.migration == nil && !enrollmentNeedsVerification && hasChanges
+            && draft.githubCredential?.validationMessage == nil
     }
     public var canImport: Bool { available && !busy && snapshot?.migration?.source.supported == true }
     public var canDiscard: Bool {
@@ -121,6 +123,55 @@ public final class SettingsEditor: ObservableObject {
             if draft.github == nil && newValue { draft.github = GitHubSettings() }
             draft.github?.enabled = newValue
         }
+    }
+
+    public var vaultItemSource: String? {
+        guard available, snapshot?.migration == nil, !enrollmentNeedsVerification else { return nil }
+        switch selection {
+        case .staged(let ticket, _, _): return "staged:\(ticket)"
+        case .keep: return snapshot?.provider.map { "saved:\($0.slot):\(snapshot?.revision ?? 0)" }
+        case .forget: return nil
+        }
+    }
+
+    public var canChooseVaultItems: Bool { !busy && vaultItemSource != nil }
+
+    public func loadVaultItems() async throws -> [VaultItemSummary] {
+        guard canChooseVaultItems else { throw BrokerControlError.busy }
+        try Task.checkCancellation()
+        if case .staged(_, _, let catalogue) = selection {
+            switch catalogue {
+            case .available(let items): return items
+            case .unavailable: throw Failure.stagedCatalogueUnavailable
+            }
+        }
+        guard case .keep = selection
+        else { throw BrokerControlError.busy }
+        busy = true
+        defer { busy = false }
+        let generation = generation
+        guard case .vaultItems(let items) = try await call(.vaultItems) else {
+            throw BrokerControlError.invalidMessage
+        }
+        try Task.checkCancellation()
+        guard generation == self.generation, available, !enrollmentNeedsVerification, case .keep = selection else {
+            throw CancellationError()
+        }
+        return items
+    }
+
+    private func acceptsItem(_ item: VaultItemSummary) -> Bool {
+        guard canChooseVaultItems else { return false }
+        if case .staged(_, _, let catalogue) = selection {
+            guard case .available(let items) = catalogue else { return false }
+            return items.contains(item)
+        }
+        return true
+    }
+
+    public func selectGitHubItem(_ item: VaultItemSummary) {
+        guard acceptsItem(item) else { return }
+        draft.githubCredential = GitHubCredential(itemId: item.id, itemName: item.name)
     }
 
     public func load() async {
@@ -147,10 +198,9 @@ public final class SettingsEditor: ObservableObject {
             let generation = generation
             selection = .keep
             guard
-                case .enrollmentStaged(let ticket, let provider) = try await call(
+                case .enrollmentStaged(let ticket, let provider, let catalogue) = try await call(
                     .stageEnrollment(
-                        server: inputs.server, email: inputs.email, password: password,
-                        itemID: inputs.itemID.isEmpty ? nil : inputs.itemID))
+                        server: inputs.server, email: inputs.email, password: password))
             else { throw BrokerControlError.invalidMessage }
             guard generation == self.generation else {
                 _ = try? await call(.settingsCancel(id: nil))
@@ -158,7 +208,7 @@ public final class SettingsEditor: ObservableObject {
             }
             guard enrollment.normalized == original else { throw Failure.unverifiedEnrollment }
             enrollment = inputs
-            selection = .staged(ticket: ticket, provider: provider)
+            selection = .staged(ticket: ticket, provider: provider, catalogue: catalogue)
             message = ""
             vaultLoginState = .ready
         }
@@ -174,6 +224,7 @@ public final class SettingsEditor: ObservableObject {
         guard !busy, available, let snapshot, snapshot.migration == nil else { throw BrokerControlError.busy }
         guard !enrollmentNeedsVerification else { throw Failure.unverifiedEnrollment }
         guard hasChanges else { throw Failure.noChanges }
+        guard draft.githubCredential?.validationMessage == nil else { throw Failure.invalidGitHubCredential }
         return try await prepareReview(
             .prepareSettings(
                 revision: snapshot.revision, settings: draft, provider: selection.choice, additions: pendingRepositories
@@ -308,6 +359,7 @@ public final class SettingsEditor: ObservableObject {
     private func invalidateSession() {
         generation = UUID()
         vaultLoginState = .idle
+        selection = .keep
         if let snapshot {
             self.snapshot = SettingsSnapshot(
                 state: "unavailable", revision: snapshot.revision, session: nil,

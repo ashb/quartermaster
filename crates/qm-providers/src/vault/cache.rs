@@ -1,4 +1,4 @@
-use super::{ProviderBinding, VaultSnapshot};
+use super::{AccountBinding, VaultSnapshot};
 use crate::{EncryptedCredential, KdfParameters};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"QMVCACHE";
-const MAX_CACHE: usize = 262144;
+const MAX_CACHE: usize = qm_types::VAULT_CACHE_BYTES;
 const MAX_HEADER: usize = 16384;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub struct SealedSnapshot {
 struct Header {
     schema: u32,
     rbw_version: String,
-    binding: ProviderBinding,
+    binding: AccountBinding,
     device_key: [u8; 32],
     wrapped_key: Vec<u8>,
     checkpoint: [u8; 16],
@@ -46,8 +46,7 @@ struct Header {
 
 #[derive(Serialize)]
 struct PayloadRef<'a> {
-    cipher: &'a str,
-    selected_key: &'a [u8],
+    entries: &'a [rbw::db::Entry],
     vault_key: &'a [u8],
     protected_key: &'a str,
     refresh_token: &'a str,
@@ -56,8 +55,7 @@ struct PayloadRef<'a> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Payload {
-    cipher: String,
-    selected_key: Zeroizing<Vec<u8>>,
+    entries: Vec<rbw::db::Entry>,
     vault_key: Zeroizing<Vec<u8>>,
     protected_key: String,
     refresh_token: Zeroizing<String>,
@@ -75,12 +73,13 @@ impl SealedSnapshot {
         {
             return Err(CacheError::InvalidSnapshot);
         }
+        super::validate_entries(&snapshot.entries).map_err(|_| CacheError::InvalidSnapshot)?;
         let encryption = encryption_key(key)?;
         if wrapped.len() != 113 {
             return Err(CacheError::InvalidFormat);
         }
         let header = Header {
-            schema: 1,
+            schema: 2,
             rbw_version: "1.15.0".into(),
             binding: snapshot.binding.clone(),
             device_key: identity,
@@ -104,8 +103,7 @@ impl SealedSnapshot {
             .map_err(|_| CacheError::RandomnessUnavailable)?;
         let mut payload = Zeroizing::new(
             serde_json::to_vec(&PayloadRef {
-                cipher: snapshot.credential.encoded(),
-                selected_key: &snapshot.selected_key,
+                entries: &snapshot.entries,
                 vault_key: &snapshot.vault_key,
                 protected_key: &snapshot.protected_key,
                 refresh_token: &snapshot.refresh_token,
@@ -134,7 +132,7 @@ impl SealedSnapshot {
 
     pub fn decode(
         bytes: &[u8],
-        binding: &ProviderBinding,
+        binding: &AccountBinding,
         identity: &[u8; 32],
     ) -> Result<Self, CacheError> {
         if bytes.len() < 40 || bytes.len() > MAX_CACHE || &bytes[..8] != MAGIC {
@@ -144,9 +142,18 @@ impl SealedSnapshot {
         if length > MAX_HEADER || 12 + length + 28 >= bytes.len() {
             return Err(CacheError::InvalidFormat);
         }
+        #[derive(Deserialize)]
+        struct Version {
+            schema: u32,
+        }
+        let version: Version = serde_json::from_slice(&bytes[12..12 + length])
+            .map_err(|_| CacheError::InvalidFormat)?;
+        if version.schema != 2 {
+            return Err(CacheError::UnsupportedVersion);
+        }
         let header: Header = serde_json::from_slice(&bytes[12..12 + length])
             .map_err(|_| CacheError::InvalidFormat)?;
-        if header.schema != 1 || header.rbw_version != "1.15.0" {
+        if header.schema != 2 || header.rbw_version != "1.15.0" {
             return Err(CacheError::UnsupportedVersion);
         }
         if &header.binding != binding {
@@ -204,25 +211,18 @@ impl SealedSnapshot {
         }
         let payload: Payload =
             serde_json::from_slice(opened).map_err(|_| CacheError::InvalidSnapshot)?;
-        let keys =
-            super::locked_keys(&payload.selected_key).map_err(|_| CacheError::InvalidSnapshot)?;
+        super::validate_entries(&payload.entries).map_err(|_| CacheError::InvalidSnapshot)?;
         if payload.vault_key.len() != 64
             || payload.refresh_token.is_empty()
             || payload.refresh_token.len() > 16384
         {
             return Err(CacheError::InvalidSnapshot);
         }
-        let credential =
-            EncryptedCredential::parse(&payload.cipher).map_err(|_| CacheError::InvalidSnapshot)?;
-        credential
-            .authenticate(&keys)
-            .map_err(|_| CacheError::InvalidSnapshot)?;
         EncryptedCredential::parse(&payload.protected_key)
             .map_err(|_| CacheError::InvalidSnapshot)?;
         Ok(VaultSnapshot {
             binding: self.header.binding,
-            credential,
-            selected_key: payload.selected_key,
+            entries: payload.entries,
             vault_key: payload.vault_key,
             protected_key: payload.protected_key,
             refresh_token: payload.refresh_token,
@@ -245,8 +245,8 @@ fn encryption_key(bytes: &[u8]) -> Result<LessSafeKey, CacheError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{VaultSnapshot, locked_keys};
-    use crate::{CredentialField, EncryptedCredential, ProviderBinding};
+    use crate::AccountBinding;
+    use crate::vault::VaultSnapshot;
     use ring::rand::{SecureRandom, SystemRandom};
     use zeroize::Zeroizing;
 
@@ -255,20 +255,13 @@ mod tests {
 
     fn snapshot() -> VaultSnapshot {
         VaultSnapshot {
-            binding: ProviderBinding::new(
+            binding: AccountBinding::new(
                 "https://vault.example.invalid",
                 "11111111-1111-4111-8111-111111111111",
                 "dummy@example.invalid",
-                "22222222-2222-4222-8222-222222222222",
-                CredentialField::LoginPassword,
-                "github-write",
             )
             .unwrap(),
-            credential: EncryptedCredential::parse(
-                include_str!("../../tests/fixtures/dummy.type2").trim(),
-            )
-            .unwrap(),
-            selected_key: Zeroizing::new((0..64).collect()),
+            entries: Vec::new(),
             vault_key: Zeroizing::new((0..64).collect()),
             protected_key: include_str!("../../tests/fixtures/dummy.type2")
                 .trim()
@@ -305,16 +298,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(restored.binding(), original.binding());
-        assert_eq!(restored.credential_digest(), original.credential_digest());
+        assert!(restored.entries.is_empty());
         assert_eq!(restored.checkpoint(), [3; 16]);
         assert_eq!(
             restored.refresh_token.as_str(),
             "dummy-sensitive-refresh-canary"
         );
-        restored
-            .credential
-            .authenticate(&locked_keys(&restored.selected_key).unwrap())
-            .unwrap();
         for canary in [
             b"quartermaster-dummy-canary".as_slice(),
             b"dummy-sensitive-refresh-canary".as_slice(),
@@ -387,13 +376,10 @@ mod tests {
         let key = key();
         let encrypted = SealedSnapshot::seal(&original, key.as_ref(), IDENTITY, &WRAPPED).unwrap();
         let mut other = snapshot();
-        other.binding = ProviderBinding::new(
+        other.binding = AccountBinding::new(
             original.binding.server(),
-            original.binding.account_id(),
-            original.binding.email(),
             "33333333-3333-4333-8333-333333333333",
-            CredentialField::LoginPassword,
-            "github-write",
+            original.binding.email(),
         )
         .unwrap();
         assert!(matches!(
@@ -404,7 +390,9 @@ mod tests {
             SealedSnapshot::decode(encrypted.as_bytes(), original.binding(), &[9; 32]),
             Err(CacheError::KeyMismatch)
         ));
-        assert!(SealedSnapshot::decode(&vec![0; 262145], original.binding(), &IDENTITY).is_err());
+        assert!(
+            SealedSnapshot::decode(&vec![0; MAX_CACHE + 1], original.binding(), &IDENTITY).is_err()
+        );
         for size in [0, 1, 8, 11, 12, 24] {
             assert!(
                 SealedSnapshot::decode(
@@ -427,10 +415,10 @@ mod tests {
 
         let mut unsupported = encrypted.as_bytes().to_vec();
         let offset = unsupported
-            .windows(b"\"schema\":1".len())
-            .position(|bytes| bytes == b"\"schema\":1")
+            .windows(b"\"schema\":2".len())
+            .position(|bytes| bytes == b"\"schema\":2")
             .unwrap();
-        unsupported[offset + b"\"schema\":".len()] = b'2';
+        unsupported[offset + b"\"schema\":".len()] = b'1';
         assert!(matches!(
             SealedSnapshot::decode(&unsupported, original.binding(), &IDENTITY),
             Err(CacheError::UnsupportedVersion)

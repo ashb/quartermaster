@@ -273,7 +273,7 @@ use {
     },
     crate::owner::{
         deadline::Deadline,
-        dispatch::{CredentialSelection, PreparedOperation},
+        dispatch::PreparedOperation,
         identity::VerifiedPrincipal,
         operation::{CancellationResult, OperationId},
         policy::AuthorizationOutcome,
@@ -383,10 +383,9 @@ mod authentication_tests {
             BASE64.encode(
                 fixture
                     .state
-                    .provider
-                    .snapshot()
+                    .github_selection(fixture.state.provider.snapshot().unwrap())
                     .unwrap()
-                    .credential_digest()
+                    .digest()
             )
         );
         let bytes = BASE64.decode(challenge["bytes"].as_str().unwrap()).unwrap();
@@ -630,7 +629,7 @@ mod github_tests {
         };
         let (server, client) = UnixStream::pair().unwrap();
         let peer = PeerIdentity::capture(&server).unwrap();
-        let mut policy: Value = serde_json::from_slice(&test_support::policy_bytes(
+        let mut policy: Value = serde_json::from_slice(&test_support::vault::write_policy_bytes(
             (time::OffsetDateTime::now_utc() + Duration::from_secs(60))
                 .unix_timestamp()
                 .try_into()
@@ -648,6 +647,7 @@ mod github_tests {
             crate::owner::github::configuration::GitHubConfig::decode(br#"{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one","writes":true}]}"#).unwrap()
         ));
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         state.refresh_policy(&paths.load_policy()).unwrap();
         state
             .authorizer
@@ -684,7 +684,8 @@ mod github_tests {
     fn enable_github_read_scope(shared: &Shared) {
         let mut state = shared.0.lock().unwrap();
         let active = serde_json::to_value(state.authorizer.active_read_grants()).unwrap();
-        let mut policy: Value = serde_json::from_slice(&test_support::policy_bytes(1)).unwrap();
+        let mut policy: Value =
+            serde_json::from_slice(&test_support::vault::write_policy_bytes(1)).unwrap();
         policy["grants"] = active
             .as_array()
             .unwrap()
@@ -989,10 +990,9 @@ mod github_tests {
                 )
                 .unwrap();
             let id = state.operations.register(outcome, Instant::now()).unwrap();
-            let selection = CredentialSelection::at_generation(
-                state.provider.snapshot().unwrap(),
-                state.provider.generation(),
-            );
+            let selection = state
+                .github_selection(state.provider.snapshot().unwrap())
+                .unwrap();
             state
                 .operations
                 .select_credential(id, &principal, selection)
@@ -1236,18 +1236,16 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_accepts_an_explicit_item_selector_without_changing_authority_fields() {
-        for selected in [None, Some("22222222-2222-4222-8222-222222222222")] {
-            let mut message = json!({"kind":"vaultLogin", "server":"https://vault.example.invalid", "email":"dummy@example.invalid", "password":"dummy"});
-            if let Some(selected) = selected {
-                message["itemId"] = json!(selected);
-            }
-            assert!(matches!(
-                decode_client(&serde_json::to_vec(&message).unwrap()).unwrap(),
-                Client::VaultLogin { item_id, .. } if item_id.as_deref() == selected
-            ));
-            message["role"] = json!("arbitrary-role");
-            assert!(decode_client(&serde_json::to_vec(&message).unwrap()).is_err());
+    fn enrollment_accepts_account_only_and_rejects_credential_authority_fields() {
+        let message = json!({"kind":"vaultLogin", "server":"https://vault.example.invalid", "email":"dummy@example.invalid", "password":"dummy"});
+        assert!(matches!(
+            decode_client(&serde_json::to_vec(&message).unwrap()).unwrap(),
+            Client::VaultLogin { .. }
+        ));
+        for field in ["itemId", "role"] {
+            let mut invalid = message.clone();
+            invalid[field] = json!("arbitrary");
+            assert!(decode_client(&serde_json::to_vec(&invalid).unwrap()).is_err());
         }
     }
 
@@ -1286,6 +1284,7 @@ mod tests {
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, document.as_ref(), &random)
                 .unwrap();
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         handle(
             Client::Enroll {
                 public_key: BASE64.encode(key.public_key()),
@@ -1313,13 +1312,17 @@ mod tests {
             let unlock = state.provider.begin_unlock(identity.clone()).unwrap();
             state
                 .provider
-                .finish_unlock(unlock, &identity, snapshot)
+                .finish_unlock(unlock, &identity, snapshot.into())
                 .unwrap();
         }
         let generation = state.provider.generation();
         let context = ReviewContext {
             read_roots: Vec::new(),
-            provider: ProviderPresentation::new(&identity, generation),
+            provider: ProviderPresentation::new(
+                &identity,
+                generation,
+                &state.github_binding().unwrap(),
+            ),
             operation_id: id.to_string(),
             created,
             process_chain: vec!["dummy test process · PID 1".into()],
@@ -1632,7 +1635,10 @@ mod tests {
     fn cache_lock_contention_reports_busy_without_blocking_cancellation_or_losing_warm_state() {
         let (_directory, paths, _key, state, _receive) = fixture();
         let id = state.pending.as_ref().unwrap().id.to_string();
-        let digest = state.provider.snapshot().unwrap().credential_digest();
+        let digest = state
+            .github_selection(state.provider.snapshot().unwrap())
+            .unwrap()
+            .digest();
         let cache = super::super::persistence::store(&paths.root).unwrap();
         let before = (cache.load().unwrap(), cache.load_enrollment().unwrap());
         let lock = OpenOptions::new()
@@ -1668,7 +1674,10 @@ mod tests {
         assert_eq!(status.state, crate::VaultState::Busy);
         let mut state = shared.0.try_lock().unwrap();
         assert_eq!(
-            state.provider.snapshot().unwrap().credential_digest(),
+            state
+                .github_selection(state.provider.snapshot().unwrap())
+                .unwrap()
+                .digest(),
             digest
         );
         assert!(matches!(
@@ -1677,7 +1686,10 @@ mod tests {
         ));
         assert!(state.pending.is_none());
         assert_eq!(
-            state.provider.snapshot().unwrap().credential_digest(),
+            state
+                .github_selection(state.provider.snapshot().unwrap())
+                .unwrap()
+                .digest(),
             digest
         );
         drop(lock);
@@ -1816,6 +1828,7 @@ mod tests {
         handle(message, &mut state, &paths.load_policy()).unwrap();
         let ready = receive.try_recv().unwrap();
         let mut restarted = OwnerState::new().unwrap();
+        restarted.administration.manager = Some(crate::owner::test_support::vault::manager());
 
         assert_ne!(state.authorizer.session(), restarted.authorizer.session());
         assert!(admit_test(&mut restarted, &ready, &paths).is_err());
@@ -1835,10 +1848,11 @@ mod tests {
             )),
         };
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         let expires = (OffsetDateTime::now_utc() + Duration::from_secs(60)).unix_timestamp() as u64;
-        state
-            .authorizer
-            .seed_fixture_grants(&crate::owner::test_support::policy_bytes(expires));
+        state.authorizer.seed_fixture_grants(
+            &crate::owner::test_support::vault::write_policy_bytes(expires),
+        );
         let principal = super::super::identity::VerifiedPrincipal::fixture(
             501,
             "11".repeat(20),
@@ -1916,15 +1930,16 @@ mod tests {
             )),
         };
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         let principal =
             VerifiedPrincipal::fixture(501, "11".repeat(20), state.authorizer.session());
         let expires = (OffsetDateTime::now_utc() + Duration::from_secs(60))
             .unix_timestamp()
             .try_into()
             .unwrap();
-        state
-            .authorizer
-            .seed_fixture_grants(&crate::owner::test_support::policy_bytes(expires));
+        state.authorizer.seed_fixture_grants(
+            &crate::owner::test_support::vault::write_policy_bytes(expires),
+        );
         crate::owner::test_support::vault::install(
             &mut state.provider,
             crate::owner::test_support::vault::snapshot("github-read"),
@@ -1938,10 +1953,9 @@ mod tests {
             )
             .unwrap();
         let id = state.operations.register(outcome, Instant::now()).unwrap();
-        let selection = CredentialSelection::at_generation(
-            state.provider.snapshot().unwrap(),
-            state.provider.generation(),
-        );
+        let selection = state
+            .github_selection(state.provider.snapshot().unwrap())
+            .unwrap();
         state
             .operations
             .select_credential(id, &principal, selection)
@@ -1977,8 +1991,10 @@ mod tests {
                 .unix_timestamp()
                 .try_into()
                 .unwrap();
-            let mut policy: Value =
-                serde_json::from_slice(&crate::owner::test_support::policy_bytes(expires)).unwrap();
+            let mut policy: Value = serde_json::from_slice(
+                &crate::owner::test_support::vault::write_policy_bytes(expires),
+            )
+            .unwrap();
             policy["grants"][0]["role"] = "github-write".into();
             state
                 .authorizer
@@ -1993,8 +2009,9 @@ mod tests {
                 )
                 .unwrap();
             let read = state.operations.register(outcome, Instant::now()).unwrap();
-            let selection =
-                CredentialSelection::at_generation(state.provider.snapshot().unwrap(), generation);
+            let selection = state
+                .github_selection(state.provider.snapshot().unwrap())
+                .unwrap();
             state
                 .operations
                 .select_credential(read, &principal, selection)
@@ -2111,17 +2128,19 @@ mod tests {
         };
         let (mut server, mut client) = UnixStream::pair().unwrap();
         let peer = qm_macos::peer_identity::PeerIdentity::capture(&server).unwrap();
-        let mut policy: Value = serde_json::from_slice(&super::super::test_support::policy_bytes(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 60,
-        ))
-        .unwrap();
+        let mut policy: Value =
+            serde_json::from_slice(&super::super::test_support::vault::write_policy_bytes(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 60,
+            ))
+            .unwrap();
         policy["grants"][0]["uid"] = json!(unsafe { libc::geteuid() });
         policy["grants"][0]["codeHash"] = json!(peer.code_hash());
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         state
             .authorizer
             .seed_native_fixture_grants(&serde_json::to_vec(&policy).unwrap());
@@ -2162,17 +2181,19 @@ mod tests {
         let slow_client = UnixStream::connect(&socket).unwrap();
         let mut read_client = UnixStream::connect(&socket).unwrap();
         let peer = PeerIdentity::capture(&read_client).unwrap();
-        let mut policy: Value = serde_json::from_slice(&super::super::test_support::policy_bytes(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 60,
-        ))
-        .unwrap();
+        let mut policy: Value =
+            serde_json::from_slice(&super::super::test_support::vault::write_policy_bytes(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 60,
+            ))
+            .unwrap();
         policy["grants"][0]["uid"] = json!(unsafe { libc::geteuid() });
         policy["grants"][0]["codeHash"] = json!(peer.code_hash());
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         state
             .authorizer
             .seed_native_fixture_grants(&serde_json::to_vec(&policy).unwrap());
@@ -2218,9 +2239,10 @@ mod tests {
             )),
         };
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         let principal =
             VerifiedPrincipal::fixture(501, "11".repeat(20), state.authorizer.session());
-        let policy = super::super::test_support::policy_bytes(
+        let policy = super::super::test_support::vault::write_policy_bytes(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -2246,7 +2268,9 @@ mod tests {
             .select_credential(
                 id,
                 &principal,
-                crate::owner::test_support::vault::selection(state.provider.snapshot().unwrap()),
+                state
+                    .github_selection(state.provider.snapshot().unwrap())
+                    .unwrap(),
             )
             .unwrap();
         let request = state.prepare(id, &principal, &paths.load_policy()).unwrap();
@@ -2282,22 +2306,28 @@ mod tests {
             .unwrap();
 
         state.disconnect_ui();
-        super::super::vault::finish_unlock(&paths.root, &mut state.provider, unlock, snapshot)
-            .unwrap();
+        super::super::vault::finish_unlock(
+            &paths.root,
+            &mut state.provider,
+            unlock,
+            snapshot.into(),
+        )
+        .unwrap();
 
         assert!(state.ui.is_none());
         assert_eq!(
             state.operations.cancel(id, &principal),
             CancellationResult::Canceled
         );
-        let mut policy: Value = serde_json::from_slice(&crate::owner::test_support::policy_bytes(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 60,
-        ))
-        .unwrap();
+        let mut policy: Value =
+            serde_json::from_slice(&crate::owner::test_support::vault::write_policy_bytes(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 60,
+            ))
+            .unwrap();
         policy["grants"][0]["role"] = "github-write".into();
         state
             .authorizer
@@ -2316,10 +2346,9 @@ mod tests {
             .select_credential(
                 read,
                 &principal,
-                CredentialSelection::at_generation(
-                    state.provider.snapshot().unwrap(),
-                    state.provider.generation(),
-                ),
+                state
+                    .github_selection(state.provider.snapshot().unwrap())
+                    .unwrap(),
             )
             .unwrap();
         let request = state

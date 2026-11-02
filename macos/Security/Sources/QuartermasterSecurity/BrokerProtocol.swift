@@ -13,7 +13,8 @@ public enum BrokerCommand: Encodable, Sendable {
     case proof(id: String, signature: Data)
     case cancel(id: String)
     case vaultStatus
-    case vaultLogin(server: String, email: String, password: String, itemID: String?)
+    case vaultItems
+    case vaultLogin(server: String, email: String, password: String)
     case vaultLock
     case vaultUnlock
     case vaultSync
@@ -29,7 +30,7 @@ public enum BrokerCommand: Encodable, Sendable {
     case prepareVaultUnlock(revision: UInt64)
     case vaultUnlockPresence(id: String, authenticated: MonotonicTimestamp)
     case vaultUnlockCancel(id: String)
-    case stageEnrollment(server: String, email: String, password: String, itemID: String?)
+    case stageEnrollment(server: String, email: String, password: String)
     case prepareSettings(
         revision: UInt64, settings: BrokerSettings, provider: SettingsProviderChoice, additions: [RepositoryName] = [])
     case settingsPresence(id: String, authenticated: MonotonicTimestamp)
@@ -41,7 +42,8 @@ public enum BrokerCommand: Encodable, Sendable {
         case .presence, .settingsPresence, .settingsProof, .settingsRegister, .prepareSettings, .prepareSettingsImport,
             .prepareSettingsDiscard:
             .seconds(30)
-        case .vaultLogin, .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard, .stageEnrollment: .seconds(120)
+        case .vaultLogin, .vaultLock, .vaultUnlock, .vaultSync, .vaultItems, .vaultDiscard, .stageEnrollment:
+            .seconds(120)
         case .hello, .enroll, .next, .proof, .cancel, .vaultStatus, .revokeReadGrants, .readGrants, .revokeReadGrant,
             .selectReadRoot:
             .seconds(5)
@@ -57,7 +59,7 @@ public enum BrokerCommand: Encodable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, id, publicKey, authenticated, signature, server, email, password, itemId, revision, settings,
+        case kind, id, publicKey, authenticated, signature, server, email, password, revision, settings,
             provider, additions, nonce, root
     }
 
@@ -82,12 +84,12 @@ public enum BrokerCommand: Encodable, Sendable {
             kind = "cancel"
             try fields.encode(id, forKey: .id)
         case .vaultStatus: kind = "vaultStatus"
-        case .vaultLogin(let server, let email, let password, let itemID):
+        case .vaultItems: kind = "vaultItems"
+        case .vaultLogin(let server, let email, let password):
             kind = "vaultLogin"
             try fields.encode(server, forKey: .server)
             try fields.encode(email, forKey: .email)
             try fields.encode(password, forKey: .password)
-            try fields.encodeIfPresent(itemID, forKey: .itemId)
         case .vaultLock: kind = "vaultLock"
         case .vaultUnlock: kind = "vaultUnlock"
         case .vaultSync: kind = "vaultSync"
@@ -122,12 +124,11 @@ public enum BrokerCommand: Encodable, Sendable {
         case .vaultUnlockCancel(let id):
             kind = "vaultUnlockCancel"
             try fields.encode(id, forKey: .id)
-        case .stageEnrollment(let server, let email, let password, let itemID):
+        case .stageEnrollment(let server, let email, let password):
             kind = "stageEnrollment"
             try fields.encode(server, forKey: .server)
             try fields.encode(email, forKey: .email)
             try fields.encode(password, forKey: .password)
-            try fields.encodeIfPresent(itemID, forKey: .itemId)
         case .prepareSettings(let revision, let settings, let provider, let additions):
             kind = "prepareSettings"
             try fields.encode(revision, forKey: .revision)
@@ -159,14 +160,10 @@ public struct VaultBinding: Codable, Equatable, Sendable {
     public let server: String
     public let email: String
     public let accountID: String
-    public let itemID: String
-    public let field: String
-    public let role: String
 
     private enum CodingKeys: String, CodingKey {
-        case server, email, field, role
+        case server, email
         case accountID = "account_id"
-        case itemID = "item_id"
     }
 }
 
@@ -204,6 +201,32 @@ public struct BrokerBuildInfo: Decodable, Equatable, Sendable {
     public let modified: Bool
 }
 
+public struct VaultItemSummary: Codable, Equatable, Identifiable, Sendable {
+    public init(id: String, name: String) {
+        self.id = id
+        self.name = name
+    }
+
+    public let id: String
+    public let name: String
+}
+
+public enum StagedVaultCatalogue: Decodable, Equatable, Sendable {
+    case available([VaultItemSummary])
+    case unavailable
+
+    private enum CodingKeys: String, CodingKey { case state, items }
+    private enum State: String, Decodable { case available, unavailable }
+
+    public init(from decoder: any Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        switch try fields.decode(State.self, forKey: .state) {
+        case .available: self = .available(try fields.decode([VaultItemSummary].self, forKey: .items))
+        case .unavailable: self = .unavailable
+        }
+    }
+}
+
 public enum BrokerReply: Decodable, Sendable {
     case hello(profile: String, build: BrokerBuildInfo? = nil)
     case enrolled
@@ -218,11 +241,12 @@ public enum BrokerReply: Decodable, Sendable {
     case readGrants([ActiveReadGrant])
     case error(BrokerControlError)
     case vaultStatus(BrokerVaultStatus)
+    case vaultItems(items: [VaultItemSummary])
     case settingsStatus(SettingsSnapshot)
     case settingsReview(SettingsReview)
     case vaultUnlockReview(VaultUnlockReview)
     case settingsChallenge(SettingsChallenge)
-    case enrollmentStaged(ticket: String, provider: SettingsProvider)
+    case enrollmentStaged(ticket: String, provider: SettingsProvider, catalogue: StagedVaultCatalogue = .available([]))
     case settingsApplied(revision: UInt64)
 
     public static func decodeSuccess(_ bytes: Data) throws -> Self {
@@ -236,12 +260,13 @@ public enum BrokerReply: Decodable, Sendable {
 
     private enum Kind: String, Decodable {
         case hello, enrolled, idle, review, challenge, accepted, canceled
-        case alreadyAdmitted, unknownOperation, readGrantsRevoked, readGrants, error, vaultStatus
+        case alreadyAdmitted, unknownOperation, readGrantsRevoked, readGrants, error, vaultStatus, vaultItems
         case settingsStatus, settingsReview, settingsChallenge, enrollmentStaged, settingsApplied, vaultUnlockReview
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, profile, build, approval, authorization, code, settings, review, ticket, provider, revision, grants
+        case kind, profile, build, approval, authorization, code, settings, review, ticket, provider, revision, grants,
+            items, catalogue
     }
 
     public init(from decoder: any Decoder) throws {
@@ -265,6 +290,7 @@ public enum BrokerReply: Decodable, Sendable {
             self = .readGrants(grants)
         case .error: self = .error(try fields.decode(BrokerControlError.self, forKey: .code))
         case .vaultStatus: self = .vaultStatus(try BrokerVaultStatus(from: decoder))
+        case .vaultItems: self = .vaultItems(items: try fields.decode([VaultItemSummary].self, forKey: .items))
         case .settingsStatus: self = .settingsStatus(try fields.decode(SettingsSnapshot.self, forKey: .settings))
         case .settingsReview: self = .settingsReview(try fields.decode(SettingsReview.self, forKey: .review))
         case .vaultUnlockReview: self = .vaultUnlockReview(try fields.decode(VaultUnlockReview.self, forKey: .review))
@@ -273,7 +299,8 @@ public enum BrokerReply: Decodable, Sendable {
         case .enrollmentStaged:
             self = .enrollmentStaged(
                 ticket: try fields.decode(String.self, forKey: .ticket),
-                provider: try fields.decode(SettingsProvider.self, forKey: .provider))
+                provider: try fields.decode(SettingsProvider.self, forKey: .provider),
+                catalogue: try fields.decode(StagedVaultCatalogue.self, forKey: .catalogue))
         case .settingsApplied: self = .settingsApplied(revision: try fields.decode(UInt64.self, forKey: .revision))
         }
     }

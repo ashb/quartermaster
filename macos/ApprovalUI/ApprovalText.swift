@@ -1,6 +1,19 @@
 import Foundation
 import QuartermasterSecurity
 
+extension GitHubCredential {
+    public var displayName: String {
+        itemName.map { VaultItemSummary(id: itemId, name: $0).displayName }
+            ?? escapeApprovalText(itemId)
+    }
+}
+
+extension VaultItemSummary {
+    public var displayName: String {
+        name.isEmpty ? "Untitled item" : escapeApprovalText(name)
+    }
+}
+
 extension ApprovalDisplay {
     var title: String {
         switch intent {
@@ -151,4 +164,22 @@ extension GitHubReadCategory {
         case .output: "Read build logs and check annotations. Output may contain sensitive values printed by workflows."
         }
     }
+}
+
+func escapeApprovalText(_ text: String) -> String {
+    text.unicodeScalars.map { scalar in
+        switch scalar.value {
+        case 10: "\\n"
+        case 13: "\\r"
+        case 9: "\\t"
+        case 34: "\\\""
+        case 92: "\\\\"
+        default:
+            switch scalar.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator:
+                "\\u{\(String(scalar.value, radix: 16))}"
+            default: String(scalar)
+            }
+        }
+    }.joined()
 }

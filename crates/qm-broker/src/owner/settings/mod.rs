@@ -12,7 +12,7 @@ pub(super) use approval::{Admission, Challenge, Manager, Review};
 pub(super) use approval::{LookupAdmission, LookupResult, PreparedLookup, RepositoryName};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 pub(super) use migration::{Migration, MigrationSource};
-use qm_providers::ProviderBinding;
+use qm_providers::{AccountBinding, ProviderBinding};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub(super) use store::Store;
@@ -78,6 +78,40 @@ pub(super) struct Settings {
     #[serde(default, deserialize_with = "decode_github")]
     github: Option<GitHubConfig>,
     mutations: MutationRule,
+    #[serde(
+        default,
+        rename = "githubCredential",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "decode_github_credential"
+    )]
+    github_credential: Option<GitHubCredential>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::owner) struct GitHubCredential {
+    item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    item_name: Option<String>,
+}
+
+fn decode_github_credential<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<GitHubCredential>, D::Error> {
+    Option::<GitHubCredential>::deserialize(deserializer)?
+        .map(|mut credential| {
+            credential.item_id = ProviderBinding::canonical_item_id(&credential.item_id)
+                .map_err(|_| serde::de::Error::custom("invalid GitHub item identity"))?;
+            if credential
+                .item_name
+                .as_ref()
+                .is_some_and(|name| name.len() > 1024)
+            {
+                return Err(serde::de::Error::custom("GitHub item name is too long"));
+            }
+            Ok(credential)
+        })
+        .transpose()
 }
 
 fn decode_github<'de, D: serde::Deserializer<'de>>(
@@ -98,6 +132,29 @@ fn decode_github<'de, D: serde::Deserializer<'de>>(
 }
 
 impl Settings {
+    pub(in crate::owner) fn github_binding(
+        &self,
+        account: &AccountBinding,
+    ) -> Result<ProviderBinding, Error> {
+        let credential = self.github_credential.as_ref().ok_or(Error::Invalid)?;
+        if credential
+            .item_name
+            .as_ref()
+            .is_some_and(|name| name.len() > 1024)
+        {
+            return Err(Error::Invalid);
+        }
+        ProviderBinding::new(
+            account.server(),
+            account.account_id(),
+            account.email(),
+            &credential.item_id,
+            qm_providers::CredentialField::LoginPassword,
+            "github-write",
+        )
+        .map_err(|_| Error::Invalid)
+    }
+
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > 65536 {
             return Err(Error::Invalid);
@@ -106,17 +163,15 @@ impl Settings {
     }
 
     pub(super) fn policy(&self) -> Result<Policy, AuthorizationError> {
-        let config = self
-            .github
-            .clone()
-            .filter(GitHubConfig::enabled)
-            .ok_or(AuthorizationError::Denied)?;
-        Ok(Policy::default()
-            .with_github(config)
-            .with_mutation_rule(match self.mutations {
-                MutationRule::RequireApproval => PolicyDecision::RequireApproval,
-                MutationRule::Deny => PolicyDecision::Deny,
-            }))
+        if let Some(config) = self.github.clone().filter(GitHubConfig::enabled) {
+            return Ok(Policy::default().with_github(config).with_mutation_rule(
+                match self.mutations {
+                    MutationRule::RequireApproval => PolicyDecision::RequireApproval,
+                    MutationRule::Deny => PolicyDecision::Deny,
+                },
+            ));
+        }
+        Err(AuthorizationError::Denied)
     }
 }
 
@@ -124,7 +179,7 @@ impl Settings {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ProviderPin {
     pub(super) slot: String,
-    pub(super) binding: ProviderBinding,
+    pub(super) binding: AccountBinding,
     pub(super) scope: String,
     pub(super) device_key: [u8; 32],
 }
@@ -136,11 +191,7 @@ impl ProviderPin {
                 && s.bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         };
-        if !Self::valid_slot(&self.slot)
-            || !hex(&self.scope)
-            || self.device_key == [0; 32]
-            || !matches!(self.binding.role(), "github-read" | "github-write")
-        {
+        if !Self::valid_slot(&self.slot) || !hex(&self.scope) || self.device_key == [0; 32] {
             return Err(Error::Invalid);
         }
         Ok(())
@@ -291,7 +342,7 @@ mod tests {
     }
 
     pub(super) fn rules() -> Settings {
-        Settings::decode(br#"{"github":{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}],"approveUnverifiedRequests":false},"mutations":"requireApproval"}"#).unwrap()
+        Settings::decode(br#"{"github":{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one"}],"approveUnverifiedRequests":false},"githubCredential":{"itemId":"22222222-2222-4222-8222-222222222222"},"mutations":"requireApproval"}"#).unwrap()
     }
 
     pub(super) fn fixture() -> (EcdsaKeyPair, Manager) {
@@ -887,5 +938,29 @@ mod tests {
         manager.expire(30_000_002_000.into());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(manager.idle());
+    }
+
+    #[test]
+    fn github_credential_selection_validates_identity_name_and_authority_fields() {
+        let base = serde_json::json!({"github":null,"mutations":"requireApproval", "githubCredential":{"itemId":"22222222-2222-4222-8222-222222222222","itemName":"GitHub"}});
+        assert!(Settings::decode(&serde_json::to_vec(&base).unwrap()).is_ok());
+        for credential in [
+            serde_json::json!({"itemId":"invalid"}),
+            serde_json::json!({"itemId":"22222222-2222-4222-8222-222222222222","itemName":"x".repeat(1025)}),
+            serde_json::json!({"itemId":"22222222-2222-4222-8222-222222222222","role":"restic-password"}),
+        ] {
+            let mut invalid = base.clone();
+            invalid["githubCredential"] = credential;
+            assert!(Settings::decode(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_credential_binding_cannot_be_decoded_as_an_account_provider_pin() {
+        let mut pin = serde_json::to_value(pin()).unwrap();
+        pin["binding"]["item_id"] = serde_json::json!("22222222-2222-4222-8222-222222222222");
+        pin["binding"]["field"] = serde_json::json!("LoginPassword");
+        pin["binding"]["role"] = serde_json::json!("github-write");
+        assert!(serde_json::from_value::<ProviderPin>(pin).is_err());
     }
 }

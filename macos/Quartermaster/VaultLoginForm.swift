@@ -9,12 +9,12 @@ struct VaultLoginForm: View {
     @Binding var draft: EnrollmentDraft
     @Binding var password: String
     let cancel: (() -> Void)?
-    private enum Field { case server, email, item, password }
+    private enum Field { case server, email, password }
     @FocusState private var focus: Field?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Log in to your vault account, then review and approve the connection with Touch ID.")
+            Text("Log in to your vault account. You’ll choose items for each tool after connecting.")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             VStack(spacing: 12) {
@@ -26,11 +26,6 @@ struct VaultLoginForm: View {
                 PreferencesField(title: "Email", labelWidth: 110) {
                     TextField("you@example.com", text: $draft.email)
                         .textContentType(.username).focused($focus, equals: .email)
-                        .onSubmit { focus = .item }.disabled(editor.busy)
-                }
-                PreferencesField(title: "Login item", labelWidth: 110) {
-                    TextField("Item UUID (optional)", text: $draft.itemID)
-                        .focused($focus, equals: .item)
                         .onSubmit { focus = .password }.disabled(editor.busy)
                 }
                 PreferencesField(title: "Master password", labelWidth: 110) {

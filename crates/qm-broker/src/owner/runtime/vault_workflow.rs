@@ -19,6 +19,69 @@ enum Output {
     Updated(VaultSnapshot),
 }
 
+pub(super) async fn items(
+    connection: &ipc::PeerHandle,
+    shared: &Shared,
+    paths: &ServicePaths,
+) -> Result<Vec<qm_providers::VaultItemSummary>> {
+    let source = paths.vault_source()?;
+    let (revision, operation, snapshot) = {
+        let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+        state.ensure_interactive()?;
+        if !state.administration.manages_cache(connection) {
+            return Err(Fault::UiDisconnected.into());
+        }
+        let revision = state
+            .administration
+            .manager
+            .as_ref()
+            .unwrap()
+            .record()
+            .revision();
+        let (operation, snapshot) = state.provider.begin_refresh(&source.identity()?)?;
+        (revision, operation, snapshot)
+    };
+    let provider =
+        RbwProvider::new(snapshot.binding().clone(), vault::LIMITS).map_err(vault::Error::from)?;
+    let refreshed = match provider.sync_items(&snapshot).await {
+        Ok(refreshed) => refreshed,
+        Err(error) => {
+            shared
+                .0
+                .lock()
+                .map_err(|_| Fault::StateUnavailable)?
+                .provider
+                .release(&operation);
+            return Err(vault::Error::from(error).into());
+        }
+    };
+    let (operation, prepared) =
+        prepare_cache_update(shared, paths, operation, refreshed.source).await?;
+    let publication = vault::publication(&paths.vault_root()?, prepared)?;
+    let shared_publication = Arc::clone(shared);
+    tokio::task::spawn_blocking(move || {
+        finish_publication(publication, operation, &shared_publication)
+    })
+    .await??;
+    let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+    state.ensure_interactive()?;
+    if !state.administration.manages_cache(connection)
+        || state
+            .administration
+            .manager
+            .as_ref()
+            .unwrap()
+            .record()
+            .revision()
+            != revision
+    {
+        return Err(Fault::ProviderChanged.into());
+    }
+    refreshed
+        .items
+        .map_err(|error| vault::Error::from(error).into())
+}
+
 impl VaultWork {
     async fn execute(self) -> Result<Output, vault::Error> {
         match self {
@@ -282,7 +345,7 @@ mod tests {
                 let (operation, _) = state.provider.begin_refresh(&identity).unwrap();
                 let snapshot = crate::owner::test_support::vault::snapshot_at(
                     "github-write",
-                    identity.binding.item_id(),
+                    "22222222-2222-4222-8222-222222222222",
                     [9; 16],
                     identity.synchronized_at + Duration::from_secs(1),
                 );

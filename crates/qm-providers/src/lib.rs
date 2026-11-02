@@ -15,6 +15,7 @@ pub use approval::{
 pub use credential::EncryptedCredential;
 pub use kdf::{KdfAlgorithm, KdfLimits, KdfParameters, ValidatedKdfParameters, VaultIdentity};
 pub use vault::{
-    CacheError, CredentialField, EnrollmentPhase, ProviderBinding, ProviderError, RbwProvider,
-    SealedSnapshot, VaultEnrollment, VaultProvider, VaultSnapshot,
+    AccountBinding, CacheError, CredentialField, EnrollmentPhase, ItemRefresh, ProviderBinding,
+    ProviderError, RbwProvider, SealedSnapshot, SelectedCredential, SelectionRefresh,
+    VaultEnrollment, VaultItemSummary, VaultProvider, VaultSnapshot,
 };

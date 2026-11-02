@@ -728,7 +728,7 @@ mod tests {
         VerifiedPrincipal,
         OperationRegistry,
         crate::owner::operation::OperationId,
-        qm_providers::VaultSnapshot,
+        crate::owner::test_support::vault::CredentialFixture,
         crate::owner::dispatch::PreparedGitHubRequest,
     ) {
         let now = Instant::now()
@@ -805,7 +805,7 @@ mod tests {
         principal: VerifiedPrincipal,
         registry: OperationRegistry,
         id: crate::owner::operation::OperationId,
-        snapshot: qm_providers::VaultSnapshot,
+        snapshot: crate::owner::test_support::vault::CredentialFixture,
         prepared: crate::owner::dispatch::PreparedGitHubRequest,
         session: qm_providers::ApprovalSession,
         original: crate::owner::request::FrozenOperation,
@@ -816,7 +816,7 @@ mod tests {
         principal: VerifiedPrincipal,
         registry: OperationRegistry,
         id: crate::owner::operation::OperationId,
-        snapshot: qm_providers::VaultSnapshot,
+        snapshot: crate::owner::test_support::vault::CredentialFixture,
         session: qm_providers::ApprovalSession,
     }
 

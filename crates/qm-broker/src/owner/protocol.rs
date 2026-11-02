@@ -32,12 +32,11 @@ pub(super) enum Client {
         server: String,
         email: String,
         password: Zeroizing<String>,
-        #[serde(rename = "itemId")]
-        item_id: Option<String>,
     },
     VaultLock {},
     VaultUnlock {},
     VaultSync {},
+    VaultItems {},
     VaultDiscard {},
     RevokeReadGrants {},
     ReadGrants {},
@@ -74,8 +73,6 @@ pub(super) enum Client {
         server: String,
         email: String,
         password: Zeroizing<String>,
-        #[serde(rename = "itemId")]
-        item_id: Option<String>,
     },
     PrepareSettings {
         revision: super::settings::Revision,
@@ -141,7 +138,7 @@ pub(super) struct ProviderPresentation {
     pub(super) generation: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ApprovalReview {
     pub(super) id: String,
@@ -195,6 +192,7 @@ pub(super) enum Reply {
     Review {
         approval: ApprovalReview,
     },
+
     Challenge {
         authorization: ApprovalChallenge,
     },
@@ -207,7 +205,7 @@ pub(super) enum Reply {
         grants: Vec<super::grant::ReadGrantDisplay>,
     },
     SettingsStatus {
-        settings: super::settings::Snapshot,
+        settings: Box<super::settings::Snapshot>,
     },
     SettingsReview {
         review: super::settings::Review,
@@ -221,6 +219,7 @@ pub(super) enum Reply {
     EnrollmentStaged {
         ticket: String,
         provider: super::settings::ProviderPin,
+        catalogue: StagedItemCatalogue,
     },
     SettingsApplied {
         revision: super::settings::Revision,
@@ -228,8 +227,31 @@ pub(super) enum Reply {
     Error {
         code: ControlError,
     },
+    VaultItems {
+        items: Vec<qm_providers::VaultItemSummary>,
+    },
     #[serde(untagged)]
     VaultStatus(CacheStatus),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub(super) enum StagedItemCatalogue {
+    Available {
+        items: Vec<qm_providers::VaultItemSummary>,
+    },
+    Unavailable,
+}
+
+impl StagedItemCatalogue {
+    pub(super) fn bounded(items: Vec<qm_providers::VaultItemSummary>) -> Self {
+        let catalogue = Self::Available { items };
+        if serde_json::to_vec(&catalogue).is_ok_and(|bytes| bytes.len() <= MAX_PAYLOAD / 2) {
+            catalogue
+        } else {
+            Self::Unavailable
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +494,28 @@ mod tests {
         assert!(matches!(
             decode_client(&vec![b' '; MAX_PAYLOAD + 1]),
             Err(ControlError::InvalidMessage)
+        ));
+    }
+
+    #[test]
+    fn staged_catalogue_bounds_json_size_including_escaped_names() {
+        let items = (1..=1000)
+            .map(|index| qm_providers::VaultItemSummary {
+                id: format!("22222222-2222-4222-8222-{index:012}"),
+                name: "\u{0001}".repeat(1024),
+            })
+            .collect();
+        assert!(matches!(
+            StagedItemCatalogue::bounded(items),
+            StagedItemCatalogue::Unavailable
+        ));
+        let small = vec![qm_providers::VaultItemSummary {
+            id: "22222222-2222-4222-8222-222222222222".into(),
+            name: "Token".into(),
+        }];
+        assert!(matches!(
+            StagedItemCatalogue::bounded(small),
+            StagedItemCatalogue::Available { .. }
         ));
     }
 

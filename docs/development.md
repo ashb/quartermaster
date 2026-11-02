@@ -242,11 +242,10 @@ cache files; those files
 cannot select a vault or grant access. It refuses to reset while a backend still
 holds its lock.
 
-In **Settings → Vault**, verify your server, email, master password and selected
-vault item, then save with Touch ID and restore your GitHub rules. If the retained
-cache format is still supported, **Retained enrolments** can instead review and
-reauthorise the previous selection. Source vault items and repositories are
-unaffected.
+In **Settings → Vault**, verify your server, email and master password, then save
+with Touch ID. In **Tools → GitHub CLI**, choose its vault item and restore its
+rules. Account-cache format 2 requires re-enrolment; format 1 caches cannot be
+reused. Source vault items and repositories are unaffected.
 
 If signing reports no valid identity, check that the pinned certificate is valid
 and its private key is available. For missing or expired profiles, run

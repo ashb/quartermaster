@@ -96,6 +96,7 @@ pub(super) fn handle(
         Client::VaultLogin { .. }
         | Client::VaultUnlock {}
         | Client::VaultSync {}
+        | Client::VaultItems {}
         | Client::VaultDiscard {} => Err(Error::State(Fault::UnsupportedVaultCommand)),
         Client::SettingsRegister { .. }
         | Client::SettingsStatus {}
@@ -246,6 +247,26 @@ pub(super) fn handle_event(
         return Ok(Vec::new().into());
     };
     let request = decode_client(payload).map_err(Error::from);
+    if context.is_none() && matches!(&request, Ok(Client::VaultItems {})) {
+        let permit = Arc::clone(work_limit)
+            .try_acquire_owned()
+            .map_err(|_| Error::Provider(crate::owner::provider_lifecycle::Error::Busy))?;
+        let peer = connection.handle();
+        let shared = Arc::clone(shared);
+        let paths = paths.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        runtime.spawn(async move {
+            let _permit = permit;
+            let result = super::vault_workflow::items(&peer, &shared, &paths)
+                .await
+                .map(|items| Reply::VaultItems { items });
+            let _ = send.send(
+                encode_result(result)
+                    .unwrap_or_else(|_| br#"{"kind":"error","code":"unavailable"}"#.to_vec()),
+            );
+        });
+        return Ok(ipc::Response::Deferred(receive));
+    }
     if request.as_ref().is_ok_and(Client::is_settings) {
         return super::settings::message(
             request?,
@@ -481,11 +502,24 @@ mod tests {
         owner::{policy::Policy, runtime::tests::fixture},
         platform::macos::ipc::test_support::{Fixture, send, start_send},
     };
-    use std::time::{Duration, Instant};
     use std::{
         sync::{Condvar, Mutex, mpsc},
         thread,
+        time::{Duration, Instant},
     };
+
+    #[test]
+    fn vault_item_listing_cannot_bypass_the_authenticated_administration_path() {
+        let mut state = OwnerState::new().unwrap();
+        assert!(
+            handle(
+                Client::VaultItems {},
+                &mut state,
+                &Err(crate::owner::policy::AuthorizationError::InvalidPolicy)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn hello_reports_the_backends_startup_build_metadata() {
@@ -637,7 +671,7 @@ mod tests {
         let reply: serde_json::Value =
             serde_json::from_slice(&send(&client, br#"{"kind":"settingsStatus"}"#, None)).unwrap();
         assert_eq!(reply["kind"], "settingsStatus");
-        assert_eq!(reply["settings"]["revision"], 0);
+        assert_eq!(reply["settings"]["revision"], 1);
         assert!(shared.0.lock().unwrap().authorizer.policy_digest().is_err());
         client.invalidate();
     }

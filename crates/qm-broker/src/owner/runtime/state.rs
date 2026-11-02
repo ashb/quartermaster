@@ -96,6 +96,32 @@ impl OwnerState {
         })
     }
 
+    pub(super) fn github_binding(&self) -> Result<qm_providers::ProviderBinding> {
+        if let Some(manager) = &self.administration.manager {
+            let record = manager.record();
+            let pin = record.provider().ok_or(Fault::ProviderChanged)?;
+            return record
+                .settings()
+                .ok_or(Fault::ProviderChanged)?
+                .github_binding(&pin.binding)
+                .map_err(Into::into);
+        }
+        Err(Fault::ProviderChanged.into())
+    }
+
+    pub(super) fn github_selection(
+        &self,
+        snapshot: &qm_providers::VaultSnapshot,
+    ) -> Result<CredentialSelection> {
+        CredentialSelection::at_generation(
+            snapshot,
+            &self.github_binding()?,
+            self.provider.generation(),
+        )
+        .map_err(crate::owner::vault::Error::from)
+        .map_err(Into::into)
+    }
+
     pub(super) fn refresh_policy(&mut self, policy: &PolicyInput) -> Result<()> {
         self.synchronize_host_events()?;
         let (stamp, decoded) = match policy {
@@ -138,7 +164,7 @@ impl OwnerState {
         principal: &VerifiedPrincipal,
         mut request: http_request::FrozenOperation,
         policy: &PolicyInput,
-        binding: Result<Option<qm_providers::ProviderBinding>, crate::owner::vault::Error>,
+        binding: Result<Option<qm_providers::AccountBinding>, crate::owner::vault::Error>,
     ) -> Result<AuthorizationOutcome> {
         self.refresh_policy(policy)?;
         let now = Instant::now();
@@ -148,7 +174,7 @@ impl OwnerState {
         {
             self.github_resources.resolve(
                 &mut request,
-                CredentialSelection::at_generation(snapshot, self.provider.generation()),
+                self.github_selection(snapshot)?,
                 self.authorizer.policy_generation(),
                 configuration.digest(),
                 now,
@@ -161,8 +187,9 @@ impl OwnerState {
                 if let AuthorizationOutcome::Allowed(permit) = &outcome
                     && let Some(snapshot) = self.provider.snapshot()
                 {
-                    let selection =
-                        CredentialSelection::at_generation(snapshot, self.provider.generation());
+                    let selection = self
+                        .github_selection(snapshot)
+                        .map_err(|_| AuthorizationError::CredentialMismatch)?;
                     self.authorizer
                         .check_acquisition(permit, principal, &selection, now)?;
                 }
@@ -174,13 +201,13 @@ impl OwnerState {
                 | AuthorizationError::Expired
                 | AuthorizationError::CredentialMismatch,
             ) if request.is_reusable_read() => {
-                let role = match self.provider.snapshot() {
-                    Some(snapshot) => snapshot.binding().role().to_owned(),
-                    None => binding?
-                        .ok_or_else(|| Error::State(Fault::VaultLocked))?
-                        .role()
-                        .to_owned(),
-                };
+                let selected_binding = self.github_binding()?;
+                if let Some(account) = binding?
+                    && selected_binding.account() != account
+                {
+                    return Err(Fault::ProviderChanged.into());
+                }
+                let role = selected_binding.role().to_owned();
                 self.authorizer
                     .request_read_grant(principal, request, &role)
                     .map_err(Error::from)
@@ -208,8 +235,7 @@ impl OwnerState {
                 .authorizer
                 .github_configuration()
                 .ok_or(Error::State(Fault::ProviderChanged))?;
-            let selection =
-                CredentialSelection::at_generation(snapshot, self.provider.generation());
+            let selection = self.github_selection(snapshot)?;
             if !target.matches(
                 &selection,
                 self.authorizer.policy_generation(),
@@ -331,9 +357,10 @@ impl OwnerState {
 mod tests {
     use super::*;
     use crate::owner::{
-        dispatch::{CredentialSelection, PreparedOperation},
+        dispatch::PreparedOperation,
         runtime::tests::fixture,
-        test_support,
+        settings::Settings,
+        test_support::{self, vault},
         vault::Source,
     };
     use qm_macos::console_session::Error as ConsoleError;
@@ -397,6 +424,7 @@ mod tests {
     #[test]
     fn an_unstable_sample_blocks_interactive_work_until_a_stable_capture() {
         let mut state = OwnerState::new().unwrap();
+        state.administration.manager = Some(crate::owner::test_support::vault::manager());
         let mut unstable = true;
         state.console_capture = Some(Box::new(move || {
             if std::mem::take(&mut unstable) {
@@ -458,10 +486,9 @@ mod tests {
                 )
                 .unwrap();
             let read = state.operations.register(outcome, Instant::now()).unwrap();
-            let selection = CredentialSelection::at_generation(
-                state.provider.snapshot().unwrap(),
-                state.provider.generation(),
-            );
+            let selection = state
+                .github_selection(state.provider.snapshot().unwrap())
+                .unwrap();
             state
                 .operations
                 .select_credential(read, &principal, selection)
@@ -494,5 +521,43 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn github_uses_the_signed_selection_and_never_falls_back_to_another_account() {
+        let mut state = OwnerState::new().unwrap();
+        let snapshot = vault::catalogue(
+            vault::binding("github-write", "22222222-2222-4222-8222-222222222222"),
+            &[
+                "22222222-2222-4222-8222-222222222222",
+                "33333333-3333-4333-8333-333333333333",
+            ],
+        );
+        let settings = |item: Option<&str>| {
+            Settings::decode(&serde_json::to_vec(&serde_json::json!({
+                "github":null, "mutations":"requireApproval", "githubCredential":item.map(|item| serde_json::json!({"itemId":item}))
+            })).unwrap()).unwrap()
+        };
+        state.administration.manager = Some(vault::manager_with_settings(settings(None)));
+        assert!(state.github_binding().is_err());
+        assert!(state.github_selection(&snapshot).is_err());
+        state.administration.manager = Some(vault::manager_with_settings(settings(Some(
+            "22222222-2222-4222-8222-222222222222",
+        ))));
+        let original = state.github_selection(&snapshot).unwrap();
+        state.administration.manager = Some(vault::manager_with_settings(settings(Some(
+            "33333333-3333-4333-8333-333333333333",
+        ))));
+        let replacement = state.github_selection(&snapshot).unwrap();
+        assert_eq!(original.digest(), replacement.digest());
+        assert!(!original.same_credential(&replacement));
+        let other_account = vault::snapshot_for_account(
+            "github-write",
+            "33333333-3333-4333-8333-333333333333",
+            [3; 16],
+            snapshot.synchronized_at(),
+            "44444444-4444-4444-8444-444444444444",
+        );
+        assert!(state.github_selection(&other_account).is_err());
     }
 }

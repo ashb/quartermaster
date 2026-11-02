@@ -530,3 +530,13 @@ func loginIsHiddenFromTheCompactTreeButRetainedInFullAncestry(_ allowsSelection:
     #expect(containsFingerprint(content))
     #expect(dialog.controller.phase == .review)
 }
+
+@Test func vaultItemChooserEscapesNamesAndShowsUntitledItems() throws {
+    let item = try JSONDecoder().decode(
+        VaultItemSummary.self,
+        from: Data(#"{"id":"22222222-2222-4222-8222-222222222222","name":"Backup\n\u202epassword"}"#.utf8))
+    #expect(item.displayName == "Backup\\n\\u{202e}password")
+    let untitled = try JSONDecoder().decode(
+        VaultItemSummary.self, from: Data(#"{"id":"22222222-2222-4222-8222-222222222222","name":""}"#.utf8))
+    #expect(untitled.displayName == "Untitled item")
+}

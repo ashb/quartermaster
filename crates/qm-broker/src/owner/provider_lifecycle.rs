@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use qm_providers::{ProviderBinding, VaultSnapshot};
+use qm_providers::{AccountBinding, VaultSnapshot};
 use std::sync::{Arc, Weak};
 use time::OffsetDateTime;
 
@@ -18,7 +18,7 @@ pub(super) struct PersistedRevision(pub(super) [u8; 32]);
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct CacheIdentity {
-    pub(super) binding: ProviderBinding,
+    pub(super) binding: AccountBinding,
     pub(super) scope: String,
     pub(super) device_key: [u8; 32],
     pub(super) checkpoint: [u8; 16],
@@ -316,7 +316,9 @@ mod tests {
         let identity = identity(&snapshot);
         let mut state = ProviderState::default();
         let ticket = state.begin_unlock(identity.clone()).unwrap();
-        state.finish_unlock(ticket, &identity, snapshot).unwrap();
+        state
+            .finish_unlock(ticket, &identity, snapshot.into())
+            .unwrap();
         (state, identity)
     }
 
@@ -345,7 +347,7 @@ mod tests {
         let operation = state.begin_unlock(identity.clone()).unwrap();
         state.cancel_pending();
         assert!(matches!(
-            state.finish_unlock(operation, &identity, snapshot),
+            state.finish_unlock(operation, &identity, snapshot.into()),
             Err(Error::Superseded)
         ));
         assert!(state.snapshot().is_none());
@@ -359,7 +361,7 @@ mod tests {
         let ticket = state.begin_unlock(identity.clone()).unwrap();
 
         state.lock().unwrap();
-        let result = state.finish_unlock(ticket, &identity, snapshot);
+        let result = state.finish_unlock(ticket, &identity, snapshot.into());
 
         assert!(matches!(result, Err(Error::Superseded)));
         assert!(state.snapshot().is_none());
@@ -379,7 +381,11 @@ mod tests {
             state.begin_unlock(identity.clone()),
             Err(Error::Busy)
         ));
-        assert!(state.finish_unlock(ticket, &identity, snapshot).is_err());
+        assert!(
+            state
+                .finish_unlock(ticket, &identity, snapshot.into())
+                .is_err()
+        );
         assert!(state.begin_unlock(identity).is_ok());
     }
 
@@ -393,14 +399,12 @@ mod tests {
                 0 => changed.device_key[0] ^= 1,
                 1 => changed.scope = "fedcba9876543210fedcba9876543210".into(),
                 2 => {
-                    changed.binding = snapshot_at(
-                        "github-write",
+                    changed.binding = AccountBinding::new(
+                        original.binding.server(),
                         "33333333-3333-4333-8333-333333333333",
-                        [3; 16],
-                        original.synchronized_at,
+                        original.binding.email(),
                     )
-                    .binding()
-                    .clone()
+                    .unwrap();
                 }
                 3 => changed.checkpoint[0] ^= 1,
                 4 => changed.revision.0[0] ^= 1,
@@ -410,7 +414,9 @@ mod tests {
             let ticket = state.begin_unlock(original).unwrap();
 
             assert!(
-                state.finish_unlock(ticket, &changed, snapshot).is_err(),
+                state
+                    .finish_unlock(ticket, &changed, snapshot.into())
+                    .is_err(),
                 "case {case}"
             );
             assert!(state.snapshot().is_none());
@@ -429,7 +435,7 @@ mod tests {
         );
 
         assert!(matches!(
-            state.prepare_update(ticket, identity.revision, older),
+            state.prepare_update(ticket, identity.revision, older.into()),
             Err(Error::Stale)
         ));
         assert_eq!(state.snapshot().unwrap().checkpoint(), [3; 16]);
@@ -452,7 +458,7 @@ mod tests {
         state.lock().unwrap();
 
         assert!(matches!(
-            state.prepare_update(ticket, identity.revision, refreshed),
+            state.prepare_update(ticket, identity.revision, refreshed.into()),
             Err(Error::Superseded)
         ));
         assert!(state.snapshot().is_none());
@@ -473,7 +479,7 @@ mod tests {
         committed.revision = PersistedRevision([9; 32]);
 
         state
-            .prepare_update(ticket, original.revision, refreshed)
+            .prepare_update(ticket, original.revision, refreshed.into())
             .unwrap()
             .install(&mut state, committed.clone())
             .unwrap();
@@ -498,7 +504,7 @@ mod tests {
 
         drop(
             state
-                .prepare_update(ticket, identity.revision, refreshed)
+                .prepare_update(ticket, identity.revision, refreshed.into())
                 .unwrap(),
         );
 

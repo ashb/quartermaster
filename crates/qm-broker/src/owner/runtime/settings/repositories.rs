@@ -204,7 +204,7 @@ mod tests {
     use std::{thread, time::Instant};
 
     fn rules() -> Value {
-        json!({"github":{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true},"mutations":"requireApproval"})
+        json!({"github":{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true},"githubCredential":{"itemId":"22222222-2222-4222-8222-222222222222"},"mutations":"requireApproval"})
     }
 
     fn setup() -> Harness {

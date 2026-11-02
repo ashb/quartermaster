@@ -47,7 +47,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
         snapshot = try JSONDecoder().decode(
             SettingsSnapshot.self,
             from: Data(
-                #"{"state":"configured","revision":4,"session":"AQEBAQEBAQEBAQEBAQ==","settings":{"github":{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true},"mutations":"requireApproval"},"provider":{"slot":"dummy","binding":{"server":"https://vault.example.invalid","email":"dummy@example.invalid","account_id":"dummy","item_id":"dummy","field":"LoginPassword","role":"github-write"},"scope":"dummy","deviceKey":[1]},"migration":null}"#
+                #"{"state":"configured","revision":4,"session":"AQEBAQEBAQEBAQEBAQ==","settings":{"github":{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true},"mutations":"requireApproval"},"provider":{"slot":"dummy","binding":{"server":"https://vault.example.invalid","email":"dummy@example.invalid","account_id":"dummy"},"scope":"dummy","deviceKey":[1]},"migration":null}"#
                     .utf8))
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .secondsSince1970

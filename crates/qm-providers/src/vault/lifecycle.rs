@@ -1,4 +1,4 @@
-use super::{ProviderBinding, ProviderError};
+use super::{AccountBinding, ProviderError};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -14,7 +14,7 @@ pub enum EnrollmentPhase {
 #[serde(try_from = "Record")]
 pub struct VaultEnrollment {
     schema: u32,
-    binding: ProviderBinding,
+    binding: AccountBinding,
     scope: String,
     phase: EnrollmentPhase,
     identity: Option<[u8; 32]>,
@@ -26,7 +26,7 @@ pub struct VaultEnrollment {
 #[serde(deny_unknown_fields)]
 struct Record {
     schema: u32,
-    binding: ProviderBinding,
+    binding: AccountBinding,
     scope: String,
     phase: EnrollmentPhase,
     identity: Option<[u8; 32]>,
@@ -55,7 +55,7 @@ impl TryFrom<Record> for VaultEnrollment {
                 record.identity.is_some() && record.minimum_sync > OffsetDateTime::UNIX_EPOCH
             }
         };
-        if record.schema != 1 || !valid_scope(&record.scope) || !valid_phase {
+        if record.schema != 2 || !valid_scope(&record.scope) || !valid_phase {
             return Err("invalid_enrollment");
         }
         Ok(Self {
@@ -70,12 +70,12 @@ impl TryFrom<Record> for VaultEnrollment {
 }
 
 impl VaultEnrollment {
-    pub fn begin(binding: ProviderBinding, scope: String) -> Result<Self, ProviderError> {
+    pub fn begin(binding: AccountBinding, scope: String) -> Result<Self, ProviderError> {
         if !valid_scope(&scope) {
             return Err(ProviderError::InvalidBinding);
         }
         Ok(Self {
-            schema: 1,
+            schema: 2,
             binding,
             scope,
             phase: EnrollmentPhase::Intent,
@@ -121,7 +121,7 @@ impl VaultEnrollment {
     pub fn scope(&self) -> &str {
         &self.scope
     }
-    pub fn binding(&self) -> &ProviderBinding {
+    pub fn binding(&self) -> &AccountBinding {
         &self.binding
     }
     pub fn minimum_sync(&self) -> OffsetDateTime {
@@ -132,18 +132,14 @@ impl VaultEnrollment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CredentialField;
 
     const SCOPE: &str = "0123456789abcdef0123456789abcdef";
 
-    fn binding() -> ProviderBinding {
-        ProviderBinding::new(
+    fn binding() -> AccountBinding {
+        AccountBinding::new(
             "https://vault.example.invalid",
             "11111111-1111-4111-8111-111111111111",
             "dummy@example.invalid",
-            "22222222-2222-4222-8222-222222222222",
-            CredentialField::LoginPassword,
-            "github-write",
         )
         .unwrap()
     }
@@ -200,7 +196,7 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&enrollment.encode().unwrap()).unwrap();
         for (field, invalid) in [
-            ("schema", serde_json::json!(2)),
+            ("schema", serde_json::json!(1)),
             ("phase", serde_json::json!("ready")),
             ("identity", serde_json::json!(vec![7u8; 32])),
             ("minimum_sync", serde_json::json!(10)),

@@ -2,7 +2,7 @@ use super::error::{Error, Fault, Result};
 use super::{ServicePaths, Shared, approval::request_approval};
 use crate::owner::{
     deadline::Deadline,
-    dispatch::{self, CredentialSelection, PreparedOperation},
+    dispatch::{self, PreparedOperation},
     github::configuration::Mode,
     identity::VerifiedPrincipal,
     operation::OperationId,
@@ -200,8 +200,7 @@ pub(super) fn handle_verified_http(
                 .provider
                 .snapshot()
                 .ok_or_else(|| Error::State(Fault::VaultLocked))?;
-            let selection =
-                CredentialSelection::at_generation(snapshot, state.provider.generation());
+            let selection = state.github_selection(snapshot)?;
             state
                 .operations
                 .select_credential(id, principal, selection)?;
@@ -315,7 +314,7 @@ pub(super) fn execute_github(
         let observation = state.provider.snapshot().and_then(|snapshot| {
             crate::owner::github::resource_context::Observation::new(
                 state.operations.request(id, principal).ok()?.clone(),
-                CredentialSelection::at_generation(snapshot, state.provider.generation()),
+                state.github_selection(snapshot).ok()?,
                 state.authorizer.policy_generation(),
             )
         });

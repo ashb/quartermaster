@@ -46,7 +46,6 @@ pub(in crate::owner) enum Fault {
     ProviderChanged,
     VaultLocked,
     CacheOpening,
-    UnsupportedField,
     UnsupportedVaultCommand,
     InvalidOperation,
     RepositoryMismatch,
@@ -193,7 +192,6 @@ impl From<Error> for ControlError {
                 | Fault::UnexpectedContext
                 | Fault::Canceled
                 | Fault::VaultLocked
-                | Fault::UnsupportedField
                 | Fault::UnsupportedVaultCommand
                 | Fault::RepositoryMismatch
                 | Fault::RedirectDenied

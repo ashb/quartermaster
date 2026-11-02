@@ -47,9 +47,27 @@ public struct GitHubSettings: Codable, Equatable, Sendable {
 
 }
 
+public struct GitHubCredential: Codable, Equatable, Sendable {
+    public var itemId: String
+    public var itemName: String?
+
+    public init(itemId: String, itemName: String? = nil) {
+        self.itemId = itemId
+        self.itemName = itemName
+    }
+
+    public var validationMessage: String? {
+        guard let item = UUID(uuidString: itemId), item.uuidString != "00000000-0000-0000-0000-000000000000" else {
+            return "Choose the vault login item containing the GitHub token."
+        }
+        return nil
+    }
+}
+
 public struct BrokerSettings: Codable, Equatable, Sendable {
     public enum MutationRule: String, Codable, Sendable { case requireApproval, deny }
     public var github: GitHubSettings?
+    public var githubCredential: GitHubCredential?
     public var mutations: MutationRule = .requireApproval
 
     public init() {}

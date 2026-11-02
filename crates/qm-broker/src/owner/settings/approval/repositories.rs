@@ -170,7 +170,14 @@ impl<C> Manager<C> {
             .get(pending.lookup_next)
             .ok_or(Error::Stale)?
             .clone();
+        let binding = pending
+            .proposed
+            .settings()
+            .ok_or(Error::Invalid)?
+            .github_binding(snapshot.binding())?;
         let credential = snapshot
+            .select(&binding)
+            .map_err(|_| Error::Invalid)?
             .decrypt_selected_for_owner()
             .map_err(|_| Error::Invalid)?;
         dispatch::validate_token(&credential).map_err(|_| Error::Invalid)?;

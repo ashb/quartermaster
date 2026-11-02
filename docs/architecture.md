@@ -147,9 +147,11 @@ The initial provider uses `rbw` for Vaultwarden/Bitwarden protocol and crypto
 behind Quartermaster-owned interfaces. Provider adapters may be replaced without
 changing authorization semantics; a failure never silently selects another one.
 
-Enrolment pins the server, authenticated account, selected item and field.
+Enrolment pins the server and authenticated account.
 Vault edits happen through ordinary vault clients, followed by synchronization.
-The cache is a disposable encrypted snapshot of the selected credential state.
+The cache is a disposable encrypted snapshot of the vault account and its encrypted
+item catalogue. Each tool selects its own item UUID in signed settings; deleting
+one does not prevent refreshing the account or selecting another item.
 Rust owns its device-bound Secure Enclave unwrap key; the UI has a separate
 approval key and keychain group.
 

@@ -24,6 +24,32 @@ func helloReportsBuildAndAcceptsOlderBackendsWithoutMetadata() throws {
     #expect(missing == nil)
 }
 
+@Test func vaultItemLookupEncodesAndDecodesOnlyNamesAndIDs() throws {
+    let command = try #require(
+        JSONSerialization.jsonObject(with: BrokerCommand.vaultItems.encoded()) as? [String: String])
+    #expect(command == ["kind": "vaultItems"])
+    guard
+        case .vaultItems(let items) = try BrokerReply.decodeSuccess(
+            Data(
+                #"{"kind":"vaultItems","items":[{"id":"22222222-2222-4222-8222-222222222222","name":"Backup password"}]}"#
+                    .utf8))
+    else {
+        Issue.record("Expected vault item summaries")
+        return
+    }
+    #expect(items.count == 1)
+    #expect(items[0].id == "22222222-2222-4222-8222-222222222222")
+    #expect(items[0].name == "Backup password")
+}
+
+@Test(arguments: [
+    #"{"kind":"vaultItems"}"#, #"{"kind":"vaultItems","items":[{"id":"item"}]}"#,
+    #"{"kind":"vaultItems","items":[{"name":"Backup"}]}"#,
+])
+func vaultItemLookupRejectsMissingRequiredFields(_ json: String) {
+    #expect(throws: DecodingError.self) { try BrokerReply.decodeSuccess(Data(json.utf8)) }
+}
+
 @Test(arguments: [
     #"{"kind":"unknown"}"#,
     #"{"kind":"hello"}"#,
@@ -58,11 +84,7 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
         .presence(id: id, authenticated: try brokerTimestamp(105_000_000_000)),
         .proof(id: id, signature: Data([3, 4])), .cancel(id: id), .vaultStatus,
         .vaultLogin(
-            server: "https://vault.example.invalid", email: "dummy@example.invalid", password: "dummy master password",
-            itemID: nil),
-        .vaultLogin(
-            server: "https://vault.example.invalid", email: "dummy@example.invalid", password: "dummy master password",
-            itemID: "22222222-2222-4222-8222-222222222222"),
+            server: "https://vault.example.invalid", email: "dummy@example.invalid", password: "dummy master password"),
         .vaultLock, .vaultUnlock, .vaultSync, .vaultDiscard, .revokeReadGrants,
         .prepareVaultUnlock(revision: 4),
         .vaultUnlockPresence(id: id, authenticated: try brokerTimestamp(105_000_000_000)),
@@ -114,7 +136,8 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
             kind = "vaultUnlockReview"
             #expect(review.revision == 4)
             #expect(review.provider.binding.email == "dummy@example.invalid")
-        case .settingsStatus, .settingsReview, .settingsChallenge, .enrollmentStaged, .settingsApplied:
+        case .vaultItems, .settingsStatus, .settingsReview, .settingsChallenge, .enrollmentStaged,
+            .settingsApplied:
             Issue.record("Unexpected settings reply in the operation fixture")
             kind = "unexpectedSettings"
         case .error(let code):
@@ -125,8 +148,6 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
             #expect(status.state.rawValue == (fixture["state"] as? String))
             if status.state == .locked {
                 #expect(status.binding?.accountID == "11111111-1111-4111-8111-111111111111")
-                #expect(status.binding?.itemID == "22222222-2222-4222-8222-222222222222")
-                #expect(status.binding?.field == "LoginPassword")
                 #expect(status.lastSync == Date(timeIntervalSince1970: 123))
                 #expect(status.observation == .persistedCache)
             } else {
@@ -151,7 +172,7 @@ func brokerBackendRejectionsRetainTheirTypedError(_ code: BrokerControlError) th
 @Test func brokerCodecBoundsBothDirectionsWithoutReturningAPartialMessage() throws {
     let command = BrokerCommand.vaultLogin(
         server: "https://vault.example.invalid", email: "dummy@example.invalid",
-        password: String(repeating: "x", count: 1024 * 1024), itemID: nil)
+        password: String(repeating: "x", count: 1024 * 1024))
     #expect(throws: BrokerProtocolFailure.oversizedPayload) { try command.encoded() }
     #expect(throws: BrokerProtocolFailure.oversizedPayload) {
         try BrokerReply.decodeSuccess(Data(repeating: 32, count: 1024 * 1024 + 1))

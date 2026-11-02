@@ -94,7 +94,7 @@ impl Source {
         })
     }
 
-    pub(super) fn binding(&self) -> Option<qm_providers::ProviderBinding> {
+    pub(super) fn binding(&self) -> Option<qm_providers::AccountBinding> {
         self.manifest
             .as_ref()
             .map(|manifest| manifest.binding().clone())
@@ -455,16 +455,13 @@ pub(super) fn finish_unlock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qm_providers::{CredentialField, ProviderBinding};
+    use qm_providers::AccountBinding;
 
-    fn binding() -> ProviderBinding {
-        ProviderBinding::new(
+    fn binding() -> AccountBinding {
+        AccountBinding::new(
             "https://vault.example.invalid",
             "11111111-1111-4111-8111-111111111111",
             "dummy@example.invalid",
-            "22222222-2222-4222-8222-222222222222",
-            CredentialField::LoginPassword,
-            "github-write",
         )
         .unwrap()
     }
@@ -554,7 +551,7 @@ mod tests {
         provider.lock().unwrap();
 
         assert!(matches!(
-            finish_unlock(&root, &mut provider, operation, snapshot),
+            finish_unlock(&root, &mut provider, operation, snapshot.into()),
             Err(Error::Lifecycle(provider_lifecycle::Error::Superseded))
         ));
         assert!(provider.snapshot().is_none());
@@ -574,11 +571,13 @@ mod tests {
             let mut provider = ProviderState::default();
             let identity = source.identity().unwrap();
             let unlock = provider.begin_unlock(identity.clone()).unwrap();
-            provider.finish_unlock(unlock, &identity, snapshot).unwrap();
+            provider
+                .finish_unlock(unlock, &identity, snapshot.into())
+                .unwrap();
             let (refresh, _) = provider.begin_refresh(&identity).unwrap();
             let refreshed = crate::owner::test_support::vault::snapshot_at(
                 "github-write",
-                identity.binding.item_id(),
+                "22222222-2222-4222-8222-222222222222",
                 [9; 16],
                 identity.synchronized_at + std::time::Duration::from_secs(1),
             );
@@ -608,11 +607,13 @@ mod tests {
         let identity = source.identity().unwrap();
         let mut provider = ProviderState::default();
         let unlock = provider.begin_unlock(identity.clone()).unwrap();
-        provider.finish_unlock(unlock, &identity, snapshot).unwrap();
+        provider
+            .finish_unlock(unlock, &identity, snapshot.into())
+            .unwrap();
         let (refresh, _) = provider.begin_refresh(&identity).unwrap();
         let refreshed = crate::owner::test_support::vault::snapshot_at(
             "github-write",
-            identity.binding.item_id(),
+            "22222222-2222-4222-8222-222222222222",
             [9; 16],
             identity.synchronized_at + std::time::Duration::from_secs(1),
         );
@@ -648,11 +649,13 @@ mod tests {
         let identity = source.identity().unwrap();
         let mut provider = ProviderState::default();
         let unlock = provider.begin_unlock(identity.clone()).unwrap();
-        provider.finish_unlock(unlock, &identity, snapshot).unwrap();
+        provider
+            .finish_unlock(unlock, &identity, snapshot.into())
+            .unwrap();
         let (refresh, _) = provider.begin_refresh(&identity).unwrap();
         let refreshed = crate::owner::test_support::vault::snapshot_at(
             "github-write",
-            identity.binding.item_id(),
+            "22222222-2222-4222-8222-222222222222",
             [9; 16],
             identity.synchronized_at + std::time::Duration::from_secs(1),
         );
@@ -708,7 +711,11 @@ pub(in crate::owner) mod fixture {
         Source::capture(root).unwrap()
     }
 
-    pub(in crate::owner) fn prepared(root: &Path, snapshot: VaultSnapshot) -> PreparedCache {
+    pub(in crate::owner) fn prepared(
+        root: &Path,
+        snapshot: impl Into<VaultSnapshot>,
+    ) -> PreparedCache {
+        let snapshot = snapshot.into();
         PreparedCache {
             manifest: Source::capture(root).unwrap().manifest.unwrap(),
             sealed: SealedSnapshot::seal(&snapshot, &[6; 32], [7; 32], &[8; 113]).unwrap(),

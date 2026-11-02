@@ -50,7 +50,6 @@ private final class DocumentationClient: BrokerClient, Sendable {
     private static let binding = [
         "server": "https://vault.example.invalid", "email": "demo@example.invalid",
         "account_id": "11111111-1111-4111-8111-111111111111",
-        "item_id": "22222222-2222-4222-8222-222222222222", "field": "LoginPassword", "role": "github-write",
     ]
 
     private static func snapshot() throws -> SettingsSnapshot {
@@ -64,6 +63,9 @@ private final class DocumentationClient: BrokerClient, Sendable {
                         "version": 1, "mode": "github",
                         "repositories": [["id": 123, "owner": "example", "name": "project", "writes": false]],
                         "approveUnverifiedRequests": true,
+                    ],
+                    "githubCredential": [
+                        "itemId": "22222222-2222-4222-8222-222222222222", "itemName": "GitHub — example",
                     ],
                     "mutations": "requireApproval",
                 ],

@@ -1513,7 +1513,7 @@ mod read_grant_tests {
             session_id: [2; 16],
             policy_digest: old.policy_digest().unwrap(),
             request_digest,
-            credential_digest: snapshot.credential_digest(),
+            credential_digest: crate::owner::test_support::vault::selection(&snapshot).digest(),
         };
         let session = qm_providers::ApprovalSession::new(
             binding.session_id,
@@ -1580,8 +1580,8 @@ mod read_grant_tests {
             [3; 16],
         );
         assert_eq!(
-            snapshot.credential_digest(),
-            substituted.credential_digest()
+            crate::owner::test_support::vault::selection(&snapshot).digest(),
+            crate::owner::test_support::vault::selection(&substituted).digest()
         );
         assert!(
             owner
@@ -1672,7 +1672,7 @@ mod read_grant_tests {
                 .unwrap()
                 .authenticate(Instant::now(), Duration::ZERO)
                 .unwrap()
-                .bind_credential(snapshot.credential_digest())
+                .bind_credential(crate::owner::test_support::vault::selection(&snapshot).digest())
                 .unwrap();
             let bytes = pending.challenge().unwrap();
             let signature = key.sign(&SystemRandom::new(), &bytes).unwrap();

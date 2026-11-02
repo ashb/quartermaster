@@ -518,7 +518,8 @@ is not corruption and must not discard it.
 The configured Vaultwarden server controls redirect routing under the accepted
 [redirect decision](decisions/0002-vaultwarden-redirects.md): normal `rbw` behaviour,
 including 307 method/body preservation, TLS validation and sensitive-header
-handling. Validate the resulting account and selected item before accepting a snapshot.
+handling. Validate the authenticated account before accepting a snapshot; validate
+the exact item and field when selecting a credential for use.
 
 ## Development changes distribution trust, not authorization
 
@@ -586,10 +587,13 @@ in a way that breaks the approved CLI/Compose protocol.
 
 ## Cache and diagnostic protection
 
-Authenticate cache contents and metadata together: configured account, selected
-item/field/role, device key and freshness. Unverified headers cannot supply identity.
-Check resource limits before KDF or decryption. Refresh cannot change selection or
-regress its sync checkpoint. Use private, symlink-safe storage and atomic replacement.
+Authenticate cache contents and metadata together: configured account, encrypted
+item catalogue, device key and freshness. Account enrolment and refresh must not
+depend on any selected item existing. Signed tool settings independently select
+each item and field; bind the resolved account/item/field/role and credential digest
+to use or release authority. Unverified headers cannot supply identity.
+Check resource limits before KDF or decryption. Refresh cannot change a tool's
+selection or regress its sync checkpoint. Use private, symlink-safe storage and atomic replacement.
 
 Apply and verify Time Machine exclusion after every replacement; it cannot prevent APFS
 snapshots, so encryption protects confidentiality. A local checkpoint cannot detect
@@ -632,3 +636,10 @@ Recipients can copy credentials or pass them to descendants. Quartermaster canno
 restrict subsequent requests or retract copies; release-grant expiry and process
 exit do not expire credentials. Further limits need upstream scope, expiry or
 revocation. Strict profiles prohibiting export deny handoff.
+
+Account enrolment can expose bounded authenticated item UUID/name metadata for
+choosing a tool credential before publication. The catalogue belongs to its
+login ticket and account, conveys no credential authority and is discarded when
+the draft is replaced, cancelled or disconnected. A failed or oversized catalogue
+is unavailable metadata, not failed account authentication or an empty vault.
+Selecting an item still requires signed settings review before use.

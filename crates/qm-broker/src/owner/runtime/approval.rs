@@ -1,7 +1,6 @@
 use super::error::{Error, Fault, Result};
 use super::{ServicePaths, Shared, state::OwnerState};
 use crate::owner::{
-    dispatch::CredentialSelection,
     identity::VerifiedPrincipal,
     operation::OperationId,
     protocol::{ApprovalChallenge, ApprovalReview, Reply},
@@ -41,8 +40,11 @@ pub(super) struct ApprovalDelivery {
 pub(super) use crate::owner::protocol::ProviderPresentation;
 
 impl ProviderPresentation {
-    pub(super) fn new(identity: &CacheIdentity, generation: ProviderGeneration) -> Self {
-        let binding = &identity.binding;
+    pub(super) fn new(
+        identity: &CacheIdentity,
+        generation: ProviderGeneration,
+        binding: &qm_providers::ProviderBinding,
+    ) -> Self {
         Self {
             server: binding.server().into(),
             account: binding.account_id().into(),
@@ -209,16 +211,13 @@ pub(super) fn request_approval(
     check_frontend(frontend_requirement.as_deref(), &paths.app)?;
     let source = paths.vault_source()?;
     let identity = source.identity()?;
-    let (operation, authorization, read_roots, frozen) = {
+    let (operation, authorization, read_roots, frozen, binding) = {
         let state = shared
             .0
             .lock()
             .map_err(|_| Error::State(Fault::StateUnavailable))?;
         if state.provider.generation() != generation {
             return Err(Error::State(Fault::ProviderChanged));
-        }
-        if identity.binding.field() != &qm_providers::CredentialField::LoginPassword {
-            return Err(Error::State(Fault::UnsupportedField));
         }
         (
             state.operations.request(id, principal)?.clone(),
@@ -229,11 +228,12 @@ pub(super) fn request_approval(
                 identity,
                 generation,
             },
+            state.github_binding()?,
         )
     };
     peer.observe_display_context();
     let context = ReviewContext {
-        provider: ProviderPresentation::new(&frozen.identity, frozen.generation),
+        provider: ProviderPresentation::new(&frozen.identity, frozen.generation, &binding),
         operation_id: id.to_string(),
         created,
         read_roots,
@@ -428,7 +428,7 @@ pub(super) fn complete_native_presence(
     if frozen.generation != state.provider.generation() || current != frozen.identity {
         return Err(Error::State(Fault::ProviderChanged));
     }
-    let selection = CredentialSelection::at_generation(snapshot, state.provider.generation());
+    let selection = state.github_selection(snapshot)?;
     let challenge = state
         .operations
         .challenge(id, &pending.principal, selection)?;

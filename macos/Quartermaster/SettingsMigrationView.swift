@@ -15,7 +15,7 @@ struct SettingsMigrationView: View {
                 if let provider = migration.provider {
                     Text(verbatim: provider.binding.email).fontWeight(.semibold)
                     Text(verbatim: provider.binding.server).foregroundStyle(.secondary)
-                    Text(verbatim: "Login item: \(provider.binding.itemID)")
+                    Text(verbatim: "Account: \(provider.binding.accountID)")
                         .font(.caption.monospaced())
                 } else {
                     Text("No vault selected")

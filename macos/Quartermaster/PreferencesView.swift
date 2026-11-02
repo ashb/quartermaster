@@ -30,6 +30,7 @@ struct PreferencesView: View {
     @State private var selection: Pane = .vault
     @State private var showingGitHub = false
     @State private var showingEnrollment = false
+    @State private var showingGitHubItems = false
     @State private var vaultDraft: EnrollmentDraft
     @Environment(\.colorScheme) private var colorScheme
     @State private var password = ""
@@ -62,7 +63,11 @@ struct PreferencesView: View {
                             switch selection {
                             case .vault: vault
                             case .tools:
-                                if showingGitHub { github } else { tools }
+                                if showingGitHub {
+                                    github
+                                } else {
+                                    tools
+                                }
                             case .access: access
                             }
                         }
@@ -135,7 +140,9 @@ struct PreferencesView: View {
                 }
                 Text(
                     editor.snapshot?.migration != nil
-                        ? "Import settings" : showingGitHub && selection == .tools ? "GitHub CLI" : selection.rawValue
+                        ? "Import settings"
+                        : showingGitHub && selection == .tools
+                            ? "GitHub CLI" : selection.rawValue
                 )
                 .font(.system(size: 26, weight: .semibold))
                 Spacer()
@@ -409,8 +416,9 @@ struct PreferencesView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("GitHub credential").font(.system(size: 14, weight: .semibold))
                     if let provider = editor.stagedProvider ?? editor.snapshot?.provider {
-                        Text(verbatim: "\(provider.binding.email) · Login password")
+                        Text(verbatim: editor.draft.githubCredential?.displayName ?? "No vault item selected")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
+                        Text(verbatim: provider.binding.email).font(.caption).foregroundStyle(.secondary)
                         if editor.stagedProvider != nil {
                             Text("Verified replacement · awaiting approval")
                                 .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -420,9 +428,14 @@ struct PreferencesView: View {
                     }
                 }
                 Spacer()
-                Button("Change in Vault…", action: openVaultEditor)
+                Button("Change…") { showingGitHubItems = true }
                     .buttonStyle(CompactButtonStyle()).font(.system(size: 12))
+                    .disabled(!editor.canChooseVaultItems)
             }.padding(.horizontal, 10).padding(.vertical, 8)
+        }.sheet(isPresented: $showingGitHubItems) {
+            VaultItemPicker(
+                application: application, selectedID: editor.draft.githubCredential?.itemId,
+                choose: editor.selectGitHubItem)
         }
     }
 

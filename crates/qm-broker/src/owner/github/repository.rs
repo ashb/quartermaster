@@ -146,8 +146,8 @@ impl PreparedMetadata {
         if !lookup.selection.matches_snapshot(snapshot) {
             return Err(dispatch::Error::CredentialMismatch);
         }
-        let credential = snapshot
-            .decrypt_selected_for_owner()
+        let credential = selection
+            .decrypt(snapshot)
             .map_err(dispatch::Error::Provider)?;
         dispatch::validate_token(&credential)?;
         let mut bytes = Zeroizing::new(

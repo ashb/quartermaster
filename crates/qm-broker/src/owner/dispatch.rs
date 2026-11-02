@@ -24,13 +24,18 @@ impl CredentialSelection {
     pub(super) fn same_credential(&self, other: &Self) -> bool {
         self.binding == other.binding && self.digest == other.digest
     }
-    pub(super) fn at_generation(snapshot: &VaultSnapshot, generation: ProviderGeneration) -> Self {
-        Self {
+    pub(super) fn at_generation(
+        snapshot: &VaultSnapshot,
+        binding: &ProviderBinding,
+        generation: ProviderGeneration,
+    ) -> Result<Self, ProviderError> {
+        let selected = snapshot.select(binding)?;
+        Ok(Self {
             generation,
-            binding: snapshot.binding().clone(),
+            binding: binding.clone(),
             checkpoint: snapshot.checkpoint(),
-            digest: snapshot.credential_digest(),
-        }
+            digest: selected.credential_digest(),
+        })
     }
 
     pub(super) fn generation(&self) -> ProviderGeneration {
@@ -38,9 +43,17 @@ impl CredentialSelection {
     }
 
     pub(super) fn matches_snapshot(&self, snapshot: &VaultSnapshot) -> bool {
-        self.binding == *snapshot.binding()
-            && self.checkpoint == snapshot.checkpoint()
-            && self.digest == snapshot.credential_digest()
+        self.checkpoint == snapshot.checkpoint()
+            && snapshot
+                .select(&self.binding)
+                .is_ok_and(|selected| self.digest == selected.credential_digest())
+    }
+
+    pub(super) fn decrypt(
+        &self,
+        snapshot: &VaultSnapshot,
+    ) -> Result<Zeroizing<Vec<u8>>, ProviderError> {
+        snapshot.select(&self.binding)?.decrypt_selected_for_owner()
     }
 
     pub(super) fn digest(&self) -> [u8; 32] {
@@ -176,7 +189,8 @@ impl PreparedRequest {
             .check_acquisition(operation, principal, selection, now)
             .map_err(Error::Authorization)?;
         let credential = snapshot
-            .decrypt_selected_for_owner()
+            .select(&selection.binding)
+            .and_then(|selected| selected.decrypt_selected_for_owner())
             .map_err(Error::Provider)?;
         validate_token(&credential)?;
         let request = operation.request();
@@ -383,7 +397,7 @@ mod tests {
         VerifiedPrincipal,
         OperationRegistry,
         OperationId,
-        qm_providers::VaultSnapshot,
+        crate::owner::test_support::vault::CredentialFixture,
         Instant,
     ) {
         let now = Instant::now();
@@ -491,10 +505,9 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_rejects_a_different_item_role_or_cache_checkpoint() {
+    fn acquisition_rejects_a_missing_selected_item_or_changed_cache_checkpoint() {
         let (authorizer, principal, registry, id, _snapshot, now) = fixture("github-read");
         for changed in [
-            snapshot("github-write"),
             snapshot_with(
                 "github-read",
                 "33333333-3333-4333-8333-333333333333",

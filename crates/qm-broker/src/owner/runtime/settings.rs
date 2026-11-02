@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     owner::{
-        protocol::{Client, ControlError, Reply},
+        protocol::{Client, ControlError, Reply, StagedItemCatalogue},
         provider_lifecycle::{CacheIdentity, ProviderGeneration},
         settings::{Manager, Proposal, ProviderChoice, ProviderPin, Revision, Snapshot},
         vault::{self, Source},
@@ -186,7 +186,9 @@ pub(super) fn status(
         provider: record.and_then(|record| record.provider()).cloned(),
         migration: admin.manager.as_ref().and_then(Manager::migration).cloned(),
     };
-    Ok(Reply::SettingsStatus { settings })
+    Ok(Reply::SettingsStatus {
+        settings: Box::new(settings),
+    })
 }
 
 pub(super) fn message(
@@ -320,10 +322,9 @@ pub(super) fn message(
                 server,
                 email,
                 password,
-                item_id,
             } => {
                 eprintln!("Vault login requested");
-                let result = stage(server, email, password, item_id, &peer, &shared, &paths).await;
+                let result = stage(server, email, password, &peer, &shared, &paths).await;
                 if let Err(error) = &result {
                     match error {
                         Error::Vault(error) => eprintln!("Vault login failed: {error:?}"),
@@ -738,7 +739,6 @@ async fn stage(
     server: String,
     email: String,
     password: zeroize::Zeroizing<String>,
-    item_id: Option<String>,
     peer: &ipc::PeerHandle,
     shared: &Shared,
     paths: &ServicePaths,
@@ -749,30 +749,9 @@ async fn stage(
             eprintln!("Vault login rejected: password is empty or exceeds the size limit");
             return Err(ControlError::Denied.into());
         }
-        let snapshot = match item_id {
-            Some(item) => {
-                RbwProvider::enroll_selected_login(
-                    &server,
-                    &email,
-                    &item,
-                    password.as_bytes(),
-                    vault::LIMITS,
-                    "github-write",
-                )
-                .await
-            }
-            None => {
-                RbwProvider::enroll_sole_login(
-                    &server,
-                    &email,
-                    password.as_bytes(),
-                    vault::LIMITS,
-                    "github-write",
-                )
-                .await
-            }
-        }
-        .map_err(vault::Error::from)?;
+        let snapshot = RbwProvider::enroll(&server, &email, password.as_bytes(), vault::LIMITS)
+            .await
+            .map_err(vault::Error::from)?;
         drop(password);
         {
             let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
@@ -851,6 +830,10 @@ fn finish_enrollment(
     valid?;
     let reservation = reservation.ok_or(Fault::Canceled)?;
     let staged = result?;
+    let catalogue = staged.snapshot.item_summaries().map_or(
+        StagedItemCatalogue::Unavailable,
+        StagedItemCatalogue::bounded,
+    );
     let pin = ProviderPin {
         slot: staged.slot,
         binding: staged.identity.binding.clone(),
@@ -871,6 +854,7 @@ fn finish_enrollment(
     Ok(Reply::EnrollmentStaged {
         ticket,
         provider: pin,
+        catalogue,
     })
 }
 
@@ -1010,7 +994,7 @@ mod tests {
             vault::StagedCache {
                 slot,
                 identity,
-                snapshot,
+                snapshot: snapshot.into(),
             }
         }
 
@@ -1076,6 +1060,51 @@ mod tests {
     }
 
     #[test]
+    fn a_large_account_still_stages_when_picker_metadata_is_unavailable() {
+        let harness = Harness::new();
+        let peer = harness.peer();
+        let id = begin_enrollment(&peer, &harness.shared).unwrap();
+        let items: Vec<_> = (1..=1001)
+            .map(|index| format!("22222222-2222-4222-8222-{index:012}"))
+            .collect();
+        let credential = crate::owner::test_support::vault::snapshot("github-write").credential;
+        let snapshot = crate::owner::test_support::vault::catalogue(
+            credential,
+            &items.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let mut staged = harness.staged_cache();
+        staged.identity = vault::fixture::put(
+            &harness.paths.root.join("enrollments").join(&staged.slot),
+            &snapshot,
+        )
+        .identity()
+        .unwrap();
+        staged.snapshot = snapshot.into();
+
+        let reply = finish_enrollment(id, Ok(staged), &peer, &harness.shared).unwrap();
+        assert!(matches!(
+            reply,
+            Reply::EnrollmentStaged {
+                catalogue: StagedItemCatalogue::Unavailable,
+                ..
+            }
+        ));
+        assert!(crate::owner::protocol::encode_reply(&reply).is_ok());
+        let state = harness.shared.0.lock().unwrap();
+        assert!(state.administration.staged.is_some());
+        assert!(
+            state
+                .administration
+                .manager
+                .as_ref()
+                .unwrap()
+                .record()
+                .provider()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn console_changes_during_enrollment_force_a_cold_completion_without_selecting_a_provider() {
         let harness = Harness::new();
         let peer = harness.peer();
@@ -1092,11 +1121,24 @@ mod tests {
 
         let reply = finish_enrollment(id, Ok(staged), &peer, &harness.shared).unwrap();
 
-        let Reply::EnrollmentStaged { ticket, provider } = reply else {
+        let Reply::EnrollmentStaged {
+            ticket,
+            provider,
+            catalogue,
+        } = reply
+        else {
             panic!("expected an inactive enrollment");
         };
         let state = harness.shared.0.lock().unwrap();
         let staged = state.administration.staged.as_ref().unwrap();
+        let StagedItemCatalogue::Available { items } = catalogue else {
+            panic!("expected selectable item metadata");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "22222222-2222-4222-8222-222222222222");
+        let encoded = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(encoded.as_object().unwrap().len(), 2);
+        assert!(encoded["name"].is_string());
         assert_eq!(staged.ticket, ticket);
         assert!(staged.pin == provider);
         assert!(staged.snapshot.is_none());
@@ -1236,14 +1278,8 @@ mod tests {
                 match changed {
                     "provider" => state.provider.lock().unwrap(),
                     "revision" => {
-                        state.administration.manager = Harness::configured_locked()
-                            .shared
-                            .0
-                            .lock()
-                            .unwrap()
-                            .administration
-                            .manager
-                            .take()
+                        state.administration.manager =
+                            Some(crate::owner::test_support::vault::manager())
                     }
                     "session" => {
                         state.administration.session.as_mut().unwrap().id = random().unwrap()
@@ -1651,7 +1687,13 @@ mod tests {
         let pin: ProviderPin = serde_json::from_value(migration["provider"].clone()).unwrap();
         vault::fixture::put(
             &pin.root(&harness.paths.root),
-            &crate::owner::test_support::vault::snapshot("github-read"),
+            &crate::owner::test_support::vault::snapshot_for_account(
+                "github-write",
+                "22222222-2222-4222-8222-222222222222",
+                [3; 16],
+                crate::owner::test_support::wall(1_792_483_200),
+                "33333333-3333-4333-8333-333333333333",
+            ),
         );
         assert_eq!(
             harness.call(

@@ -106,7 +106,7 @@ pub struct CacheStatus {
     kind: StatusKind,
     state: VaultState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    binding: Option<qm_providers::ProviderBinding>,
+    binding: Option<qm_providers::AccountBinding>,
     #[serde(
         with = "time::serde::timestamp::option",
         skip_serializing_if = "Option::is_none"

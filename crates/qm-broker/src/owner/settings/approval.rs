@@ -333,6 +333,7 @@ impl<C> Manager<C> {
                 revision: self.record.revision(),
                 settings: super::Settings {
                     github: None,
+                    github_credential: None,
                     mutations: super::MutationRule::RequireApproval,
                 },
                 provider: None,

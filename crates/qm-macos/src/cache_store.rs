@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
 
-const MAX_CACHE: usize = 262144;
+const MAX_CACHE: usize = qm_types::VAULT_CACHE_BYTES;
 const CACHE: &CStr = c"vault.cache";
 const PENDING: &CStr = c".vault.pending";
 const ENROLLMENT: &CStr = c"enrollment.json";
@@ -365,15 +365,25 @@ mod tests {
         fs::set_permissions(root.join("vault.cache"), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(store.load().is_err());
         fs::set_permissions(root.join("vault.cache"), fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(root.join("vault.cache"), vec![0; 262145]).unwrap();
+        fs::write(root.join("vault.cache"), vec![0; MAX_CACHE + 1]).unwrap();
         assert!(store.load().is_err());
         assert!(store.save(&[]).is_err());
-        assert!(store.save(&vec![0; 262145]).is_err());
+        assert!(store.save(&vec![0; MAX_CACHE + 1]).is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"preserve");
         symlink(&root, root.join("alias")).unwrap();
         assert!(CacheStore::open(&root.join("alias"), BackupFixture::default()).is_err());
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(CacheStore::open(&root, BackupFixture::default()).is_err());
+    }
+
+    #[test]
+    fn account_catalogues_larger_than_the_old_single_item_cache_round_trip() {
+        let directory = directory();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CacheStore::open(&root, BackupFixture::default()).unwrap();
+        let catalogue = vec![7; 512 * 1024];
+        store.save(&catalogue).unwrap();
+        assert_eq!(store.load().unwrap().unwrap(), catalogue);
     }
 
     #[test]
