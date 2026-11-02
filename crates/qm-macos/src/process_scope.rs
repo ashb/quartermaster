@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod native;
 pub(crate) use native::peer_token;
+pub use native::{NativeChild, NativeStdio};
 
 const MAX_PROCESSES: usize = 32;
 const VALIDATION_BUDGET: Duration = Duration::from_millis(100);
@@ -28,6 +29,116 @@ pub struct ProcessRoot {
     identity: ExecutionIdentity,
     executable: String,
     watch: Mutex<Option<native::Watch>>,
+}
+
+pub struct OwnedChildIdentity {
+    observation: Observation,
+    parent: ExecutionIdentity,
+    executable: String,
+    requirement: String,
+    watch: Mutex<Option<native::Watch>>,
+}
+
+impl OwnedChildIdentity {
+    pub fn capture(
+        child: &std::process::Child,
+        executable: &std::path::Path,
+        expected_requirement: &str,
+    ) -> io::Result<Self> {
+        Self::capture_pid(child.id(), executable, expected_requirement)
+    }
+
+    pub fn capture_native(
+        child: &NativeChild,
+        executable: &std::path::Path,
+        expected_requirement: &str,
+    ) -> io::Result<Self> {
+        Self::capture_pid(child.id(), executable, expected_requirement)
+    }
+
+    fn capture_pid(
+        pid: u32,
+        executable: &std::path::Path,
+        expected_requirement: &str,
+    ) -> io::Result<Self> {
+        if !executable.is_absolute()
+            || crate::peer_identity::requirement_for_path(executable)? != expected_requirement
+        {
+            return Err(unavailable());
+        }
+        let executable = executable
+            .canonicalize()?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| unavailable())?;
+        let started = Instant::now();
+        let parent = native::observe(std::process::id())?.identity;
+        let observation = native::observe(pid)?;
+        if observation.identity.uid != unsafe { libc::geteuid() }
+            || observation.identity.uid != parent.uid
+            || observation.parent_pid != parent.pid
+            || observation.parent_unique_id != parent.unique_id
+            || observation.parent_generation != parent.generation
+        {
+            return Err(unavailable());
+        }
+        let watch = native::Watch::new()?;
+        watch.register(observation.identity.pid)?;
+        let identity = Self {
+            observation,
+            parent,
+            executable,
+            requirement: expected_requirement.to_owned(),
+            watch: Mutex::new(Some(watch)),
+        };
+        identity.revalidate()?;
+        within_budget(started)?;
+        Ok(identity)
+    }
+
+    pub fn identity(&self) -> ExecutionIdentity {
+        self.observation.identity
+    }
+
+    pub fn executable(&self) -> &str {
+        &self.executable
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.revalidate_with(|| {
+            native::verify_running_code(
+                self.observation.identity.pid,
+                &self.executable,
+                &self.requirement,
+            )
+        })
+    }
+
+    fn revalidate_with(&self, check_code: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let started = Instant::now();
+        let mut watch = self.watch.lock().map_err(|_| unavailable())?;
+        let result = (|| {
+            let watch = watch.as_ref().ok_or_else(unavailable)?;
+            self.check_observation()?;
+            check_code()?;
+            self.check_observation()?;
+            watch.unchanged()?;
+            within_budget(started)
+        })();
+        if result.is_err() {
+            *watch = None;
+        }
+        result
+    }
+
+    fn check_observation(&self) -> io::Result<()> {
+        if native::observe(self.observation.identity.pid)? != self.observation
+            || native::observe(self.parent.pid)?.identity != self.parent
+        {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
 }
 
 impl ProcessPeer {

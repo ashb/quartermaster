@@ -55,6 +55,7 @@ pub(in crate::owner) enum Fault {
     RedirectLimit,
     LaunchFailed,
     SessionEnded,
+    ResticDisabled,
 }
 
 impl Error {
@@ -63,6 +64,7 @@ impl Error {
             Self::Dispatch(dispatch::Error::InvalidCredential) => {
                 OperationResponse::InvalidCredential
             }
+            Self::State(Fault::ApprovalPending) => OperationResponse::ApprovalBusy,
             Self::State(Fault::FrontendChanged) => OperationResponse::FrontendChanged,
             Self::State(Fault::UiDisconnected | Fault::LaunchFailed) => {
                 OperationResponse::ApprovalUnavailable
@@ -272,6 +274,7 @@ mod tests {
             Fault::UiDisconnected,
             Fault::LaunchFailed,
             Fault::FrontendChanged,
+            Fault::ApprovalPending,
         ] {
             let response = Error::State(fault).http_response();
             let (status, body) = response.public_parts();

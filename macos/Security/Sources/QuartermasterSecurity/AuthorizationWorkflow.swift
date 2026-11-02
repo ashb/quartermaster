@@ -60,7 +60,7 @@ public struct AuthorizationWorkflow: Sendable {
             let created: MonotonicTimestamp
         }
         guard review.id.count == 32, review.id.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
-            !review.created.isZero, let age = try? now.duration(since: review.created), age < .seconds(120),
+            !review.created.isZero, let age = try? now.duration(since: review.created),
             review.session.count == 16, review.policy.count == 32, review.nonce.count == 32,
             review.nonce.contains(where: { $0 != 0 }), review.request.count <= BrokerLimits.reviewBytes,
             Data(SHA256.hash(data: review.request)) == review.requestDigest,
@@ -72,6 +72,7 @@ public struct AuthorizationWorkflow: Sendable {
         else {
             throw Failure.invalidReview
         }
+        guard age < .seconds(120) else { throw Failure.expired }
         guard let claims = try? JSONDecoder().decode(RequestClaims.self, from: review.request),
             claims.provider == review.provider, claims.operationId == review.id, claims.created == review.created
         else {

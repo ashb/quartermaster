@@ -61,6 +61,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
     private let loadApprovalKey: () throws -> Data
     private let acquirePresentation: () throws -> Int32
     private let makeUnlockWindow: (VaultUnlockReview, any VaultUnlockBackend, Bool) -> any VaultUnlockWindow
+    private let makeHandoffWindow: (CredentialHandoffRequest, any ApprovalBackend) -> any ApprovalWindow
     private let controls = ApprovalControlWorkflow()
     lazy var preferences = SettingsEditor { [weak self] command in
         guard let client = self?.client else { throw BrokerFailure.disconnected }
@@ -79,6 +80,9 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         acquirePresentation: @escaping () throws -> Int32 = { try DialogPresentationLease.acquire() },
         makeUnlockWindow: @escaping (VaultUnlockReview, any VaultUnlockBackend, Bool) -> any VaultUnlockWindow = {
             VaultUnlockDialog(review: $0, backend: $1, forSync: $2)
+        },
+        makeHandoffWindow: @escaping (CredentialHandoffRequest, any ApprovalBackend) -> any ApprovalWindow = {
+            CredentialHandoffDialog(request: $0, backend: $1)
         }
     ) {
         self.setActivationPolicy = setActivationPolicy
@@ -87,6 +91,7 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         self.loadApprovalKey = loadApprovalKey
         self.acquirePresentation = acquirePresentation
         self.makeUnlockWindow = makeUnlockWindow
+        self.makeHandoffWindow = makeHandoffWindow
         super.init()
     }
 
@@ -188,7 +193,9 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
         while !Task.isCancelled {
             guard !connection.disconnected else { throw BrokerFailure.disconnected }
             if active == nil && !controls.busy && !preferences.busy && !vaultActivity.busy,
-                preferences.snapshot?.provider != nil, preferences.snapshot?.settings?.github?.enabled == true
+                preferences.snapshot?.provider != nil,
+                preferences.snapshot?.settings?.github?.enabled == true
+                    || preferences.snapshot?.settings?.restic?.enabled == true
             {
                 do { try await poll(connection, key: key) } catch let error as BrokerControlError
                     where [.denied, .sessionEnded, .expired, .busy, .providerChanged].contains(error)
@@ -253,11 +260,23 @@ final class BrokerApplication: NSObject, NSApplicationDelegate, ObservableObject
                         apiRequest: pending.apiRequest, readScope: pending.readScope), backend: pending,
                     selectRoot: { root in try await pending.selectRoot(root) })
                 present(dialog)
+            case .handoffReview(let review):
+                guard active == nil, !controls.busy, !preferences.busy, !vaultActivity.busy else {
+                    deferredReview = reply
+                    return
+                }
+                let pending = try BrokerHandoffPending(
+                    client: connection, review: review)
+                do { presentation = try acquirePresentation() } catch DialogPresentationLease.Failure.alreadyPresented {
+                    deferredReview = reply
+                    return
+                }
+                present(makeHandoffWindow(pending.request, pending))
             default: throw BrokerFailure.invalidMessage
             }
         } catch {
             switch reply {
-            case .review(let review):
+            case .review(let review), .handoffReview(let review):
                 _ = try? await connection.call(.cancel(id: review.id))
             default: break
             }

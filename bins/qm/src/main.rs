@@ -1,4 +1,5 @@
 mod paths;
+mod restic;
 
 use std::{
     ffi::OsString,
@@ -18,12 +19,13 @@ use tokio::{
     signal::unix::{Signal, SignalKind, signal},
 };
 
-const USAGE: &str = "Usage: qm run gh -- [gh arguments]\n\nRun gh through Quartermaster using temporary configuration.";
+const USAGE: &str = "Usage: qm run gh -- [gh arguments]\n       qm run restic -- [restic arguments]\n\nRoute GitHub requests through Quartermaster or approve a password release to Restic.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Invocation {
     Help,
     Gh(Vec<OsString>),
+    Restic(Vec<OsString>),
 }
 
 fn parse(args: &[OsString]) -> io::Result<Invocation> {
@@ -32,6 +34,11 @@ fn parse(args: &[OsString]) -> io::Result<Invocation> {
         [help] if help == "--help" || help == "-h" => Ok(Invocation::Help),
         [run, gh, separator, rest @ ..] if run == "run" && gh == "gh" && separator == "--" => {
             Ok(Invocation::Gh(rest.to_vec()))
+        }
+        [run, tool, separator, rest @ ..]
+            if run == "run" && tool == "restic" && separator == "--" =>
+        {
+            Ok(Invocation::Restic(rest.to_vec()))
         }
         _ => Err(io::Error::other(USAGE)),
     }
@@ -44,7 +51,7 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Ok(Invocation::Gh(args)) => args,
+        Ok(invocation) => invocation,
         Err(error) => {
             eprintln!("{error}");
             return ExitCode::from(2);
@@ -55,7 +62,20 @@ fn main() -> ExitCode {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(run(&args, &paths))
+        runtime.block_on(async {
+            match args {
+                Invocation::Gh(args) => run(&args, &paths).await,
+                Invocation::Restic(args) => {
+                    let socket = paths.socket.with_file_name("handoff.sock");
+                    if let Some(code) = start_backend(&paths, &mut Signals::new()?, &socket).await?
+                    {
+                        return Ok(code);
+                    }
+                    restic::run(&args, &socket).await
+                }
+                Invocation::Help => unreachable!(),
+            }
+        })
     })();
     match result {
         Ok(code) => ExitCode::from(code),
@@ -68,18 +88,37 @@ fn main() -> ExitCode {
 
 async fn run(args: &[OsString], paths: &paths::Paths) -> io::Result<u8> {
     let mut signals = Signals::new()?;
+    if let Some(code) = start_backend(paths, &mut signals, &paths.socket).await? {
+        return Ok(code);
+    }
+    let mut gh = Command::new("gh");
+    gh.args(args);
+    run_gh(&paths.socket, &std::env::temp_dir(), &mut gh, &mut signals)
+        .await
+        .map(exit_code)
+}
+
+async fn start_backend(
+    paths: &paths::Paths,
+    signals: &mut Signals,
+    socket: &Path,
+) -> io::Result<Option<u8>> {
     let mut backend = Command::new(&paths.backend);
     backend
         .arg("start")
         .stdout(Stdio::null())
         .kill_on_drop(true);
-    let status = supervise(&mut backend.spawn()?, &mut signals).await?;
+    let status = supervise(&mut backend.spawn()?, signals).await?;
     if !status.success() {
         return Err(io::Error::other("could not start Quartermaster"));
     }
+    wait_for_socket(socket, signals).await
+}
+
+async fn wait_for_socket(socket: &Path, signals: &mut Signals) -> io::Result<Option<u8>> {
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if tokio::net::UnixStream::connect(&paths.socket).await.is_ok() {
+            if tokio::net::UnixStream::connect(socket).await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -87,13 +126,9 @@ async fn run(args: &[OsString], paths: &paths::Paths) -> io::Result<u8> {
     });
     tokio::select! {
         result = ready => result.map_err(|_| io::Error::other("Quartermaster socket did not become ready"))?,
-        signal = signals.next() => return Ok(128 + signal as u8),
+        signal = signals.next() => return Ok(Some(128 + signal as u8)),
     }
-    let mut gh = Command::new("gh");
-    gh.args(args);
-    run_gh(&paths.socket, &std::env::temp_dir(), &mut gh, &mut signals)
-        .await
-        .map(exit_code)
+    Ok(None)
 }
 
 struct GhConfig {
@@ -197,6 +232,41 @@ fn exit_code(status: ExitStatus) -> u8 {
 mod tests {
     use super::*;
     use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::Path, time::Instant};
+
+    #[tokio::test]
+    async fn restic_waits_for_handoff_socket_even_when_github_is_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let _github = tokio::net::UnixListener::bind(directory.path().join("github.sock")).unwrap();
+        let socket = directory.path().join("handoff.sock");
+        let bind = socket.clone();
+        let listener = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            tokio::net::UnixListener::bind(bind).unwrap()
+        });
+        let start = Instant::now();
+        assert_eq!(
+            wait_for_socket(&socket, &mut Signals::new().unwrap())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(start.elapsed() >= Duration::from_millis(80));
+        drop(listener.await.unwrap());
+    }
+
+    #[test]
+    fn restic_selects_handoff_without_interpreting_arguments() {
+        let args: Vec<OsString> = [
+            "run", "restic", "--", "--repo", "/tmp/a b", "backup", "$(inert)",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(
+            parse(&args).unwrap(),
+            Invocation::Restic(args[3..].to_vec())
+        );
+    }
 
     #[test]
     fn gh_arguments_are_forwarded_without_shell_interpretation() {

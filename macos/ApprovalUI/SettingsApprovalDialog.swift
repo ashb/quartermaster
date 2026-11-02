@@ -45,7 +45,7 @@ private struct SettingsApprovalView: View {
                 }.frame(maxWidth: .infinity, alignment: .leading).padding()
             }.frame(height: 330).luminareSurface()
             Text(
-                "This selects the vault and rules. API requests still require their own applicable authorisation."
+                "This selects the vault and rules. API requests and credential handoffs still require their own applicable authorisation."
             )
             .font(.caption).foregroundStyle(.secondary)
             HStack {
@@ -90,7 +90,7 @@ private struct SettingsApprovalView: View {
                 if let credential = record.settings?.githubCredential {
                     Text(
                         verbatim:
-                            "Login item: \(credential.displayName) · \(escapeApprovalText(credential.itemId))"
+                            "Login item: \(credential.displayName) · \(CredentialHandoffRequest.escaped(credential.itemId))"
                     )
                     .font(.caption.monospaced())
                 } else {
@@ -113,7 +113,20 @@ private struct SettingsApprovalView: View {
             Text(
                 record.settings?.mutations == .deny
                     ? "Recognised writes: denied" : "Recognised writes: fingerprint per use")
-
+            if let restic = record.settings?.restic {
+                Text("Restic \(restic.enabled ? "enabled" : "disabled") · password handoff")
+                Text(
+                    verbatim:
+                        "Executable: \(CredentialHandoffRequest.escaped(restic.executable))\nLogin item: \(CredentialHandoffRequest.escaped(restic.itemId))"
+                )
+                .font(.caption.monospaced())
+                Text(
+                    "Each approval releases the password once to the Restic process. Delivered passwords cannot be retracted."
+                )
+                .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Restic disabled")
+            }
         }.textSelection(.enabled)
     }
 }

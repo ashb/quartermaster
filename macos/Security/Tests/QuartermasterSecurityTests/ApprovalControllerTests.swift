@@ -387,3 +387,18 @@ func changingScopeWhileWaitingForTouchIDRejectsTheOldAuthentication(_ fails: Boo
     #expect(controller.phase == .approved)
     #expect(backend.signatures == [Data([1])])
 }
+
+@Test @MainActor func approvalStartsNativeAuthenticationWithoutAnExtraAction() async throws {
+    let storage = MemoryKeyStorage()
+    let keys = ApprovalKeyStore(storage: storage)
+    _ = try keys.loadOrCreate()
+    let now = MonotonicTimestamp.now
+    let authentication = AuthenticationFixture(timestamp: now)
+    let backend = ApprovalBackendFixture(created: now)
+    let controller = ApprovalController(
+        backend: backend, reason: "Queued request", authentication: authentication, keys: keys, now: { now })
+    await controller.approve()
+    #expect(authentication.requests == 1)
+    #expect(backend.signatures.count == 1)
+    #expect(controller.phase == .approved)
+}

@@ -675,9 +675,12 @@ func lateCancellationRepliesCannotRestoreASessionOrEraseItsConnectionError(_ alr
     #expect(editor.vaultItemSource != originalSource)
     let previous = editor.draft
     editor.selectGitHubItem(first)
+    editor.selectResticItem(first)
     #expect(editor.draft == previous)
     if change == "replacementSuccess" {
         #expect(try await editor.loadVaultItems() == [second])
+        editor.selectResticItem(second)
+        #expect(editor.draft.restic?.itemId == second.id)
         #expect(editor.draft.githubCredential == nil)
     } else {
         await #expect(throws: (any Error).self) { try await editor.loadVaultItems() }

@@ -213,10 +213,23 @@ impl CacheCompletion {
     }
 }
 
-fn finish_publication<B: qm_macos::cache_store::BackupExclusion>(
+pub(super) fn finish_publication<B: qm_macos::cache_store::BackupExclusion>(
+    publication: vault::Publication<B>,
+    operation: ProviderOperation,
+    shared: &Shared,
+) -> Result<()> {
+    finish_publication_with(publication, operation, shared, |_, _, _| Ok(()))
+}
+
+pub(super) fn finish_publication_with<B: qm_macos::cache_store::BackupExclusion>(
     mut publication: vault::Publication<B>,
     operation: ProviderOperation,
     shared: &Shared,
+    committed: impl FnOnce(
+        &mut super::OwnerState,
+        crate::owner::provider_lifecycle::ProviderGeneration,
+        crate::owner::provider_lifecycle::CacheIdentity,
+    ) -> Result<()>,
 ) -> Result<()> {
     let update = {
         let mut state = shared
@@ -232,11 +245,12 @@ fn finish_publication<B: qm_macos::cache_store::BackupExclusion>(
         .lock()
         .map_err(|_| Error::State(Fault::StateUnavailable))?;
     state.ensure_host_session()?;
-    update.install(&mut state.provider, identity)?;
-    Ok(())
+    let previous = state.provider.generation();
+    update.install(&mut state.provider, identity.clone())?;
+    committed(&mut state, previous, identity)
 }
 
-async fn prepare_cache_update(
+pub(super) async fn prepare_cache_update(
     shared: &Shared,
     paths: &ServicePaths,
     mut operation: crate::owner::provider_lifecycle::ProviderOperation,

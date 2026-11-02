@@ -28,13 +28,74 @@ pub(super) struct FrozenProvider {
 pub(super) struct ApprovalDelivery {
     pub(super) id: OperationId,
     pub(super) principal: Arc<VerifiedPrincipal>,
-    pub(super) request: crate::owner::review::ReviewDocument<ReviewContext>,
     pub(super) provider: FrozenProvider,
     pub(super) context_lease: Option<ipc::ContextLease>,
     pub(super) delivered: bool,
-    pub(super) completion: mpsc::SyncSender<ApprovalCompletion>,
+    pub(super) action: ApprovalAction,
     pub(super) _queue_ticket: Option<Arc<crate::owner::approval_queue::Ticket>>,
     pub(super) authenticated: Option<MonotonicTimestamp>,
+    pub(super) resolving_credential: bool,
+}
+
+pub(super) enum ApprovalAction {
+    Http(Box<HttpApproval>),
+    Handoff(Box<super::handoff::Dispatch>),
+}
+
+pub(super) struct HttpApproval {
+    pub(super) request: crate::owner::review::ReviewDocument<ReviewContext>,
+    pub(super) completion: mpsc::SyncSender<ApprovalCompletion>,
+}
+
+impl ApprovalDelivery {
+    pub(super) fn check(&self, state: &OwnerState) -> Result<()> {
+        self.check_deadline(presence_now()?)?;
+        if self.provider.generation != state.provider.generation() {
+            return Err(Fault::ProviderChanged.into());
+        }
+        match &self.action {
+            ApprovalAction::Http(_) => Ok(()),
+            ApprovalAction::Handoff(handoff) => handoff.check(self, state),
+        }
+    }
+
+    fn check_deadline(&self, now: MonotonicTimestamp) -> Result<()> {
+        if let Some(authenticated) = self.authenticated {
+            check_authenticated_deadline(authenticated, now)
+        } else if now
+            .checked_duration_since(self.created())
+            .is_none_or(|age| age >= Duration::from_secs(120))
+        {
+            Err(Fault::ApprovalExpired.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn http(&self) -> Result<&HttpApproval> {
+        match &self.action {
+            ApprovalAction::Http(http) => Ok(http),
+            _ => Err(Fault::InvalidOperation.into()),
+        }
+    }
+    pub(super) fn http_mut(&mut self) -> Result<&mut HttpApproval> {
+        match &mut self.action {
+            ApprovalAction::Http(http) => Ok(http),
+            _ => Err(Fault::InvalidOperation.into()),
+        }
+    }
+    pub(super) fn handoff(&self) -> Result<&super::handoff::Dispatch> {
+        match &self.action {
+            ApprovalAction::Handoff(handoff) => Ok(handoff),
+            _ => Err(Fault::InvalidOperation.into()),
+        }
+    }
+    pub(super) fn handoff_mut(&mut self) -> Result<&mut super::handoff::Dispatch> {
+        match &mut self.action {
+            ApprovalAction::Handoff(handoff) => Ok(handoff),
+            _ => Err(Fault::InvalidOperation.into()),
+        }
+    }
 }
 
 pub(super) use crate::owner::protocol::ProviderPresentation;
@@ -76,29 +137,11 @@ impl crate::owner::review::CredentialContext for ReviewContext {
 }
 
 impl ApprovalDelivery {
-    pub(super) fn check(&self, state: &OwnerState) -> Result<()> {
-        self.check_deadline(presence_now()?)?;
-        if self.provider.generation != state.provider.generation() {
-            return Err(Fault::ProviderChanged.into());
-        }
-        Ok(())
-    }
-
-    fn check_deadline(&self, now: MonotonicTimestamp) -> Result<()> {
-        if let Some(authenticated) = self.authenticated {
-            check_authenticated_deadline(authenticated, now)
-        } else if now
-            .checked_duration_since(self.created())
-            .is_none_or(|age| age >= Duration::from_secs(120))
-        {
-            Err(Fault::ApprovalExpired.into())
-        } else {
-            Ok(())
-        }
-    }
-
     pub(super) fn created(&self) -> MonotonicTimestamp {
-        self.request.context().created
+        match &self.action {
+            ApprovalAction::Http(http) => http.request.context().created,
+            ApprovalAction::Handoff(handoff) => handoff.wire.created,
+        }
     }
 
     pub(super) fn review(
@@ -107,15 +150,19 @@ impl ApprovalDelivery {
         policy: [u8; 32],
         nonce: [u8; 32],
     ) -> ApprovalReview {
+        let request = match &self.action {
+            ApprovalAction::Http(http) => &http.request,
+            ApprovalAction::Handoff(handoff) => return handoff.wire.clone(),
+        };
         ApprovalReview {
             id: self.id.to_string(),
             created: self.created(),
             session: BASE64.encode(ui.session.id()),
             policy: BASE64.encode(policy),
             nonce: BASE64.encode(nonce),
-            request: BASE64.encode(self.request.bytes()),
-            request_digest: BASE64.encode(digest(&SHA256, self.request.bytes())),
-            provider: self.request.context().provider.clone(),
+            request: BASE64.encode(request.bytes()),
+            request_digest: BASE64.encode(digest(&SHA256, request.bytes())),
+            provider: request.context().provider.clone(),
         }
     }
 }
@@ -126,9 +173,10 @@ pub(super) struct ApprovalCompletion {
 pub(super) struct UiSession {
     pub(super) session: ApprovalSession,
     pub(super) connection: Option<ConnectionId>,
+    pub(super) peer: Option<ipc::PeerHandle>,
 }
 
-fn check_frontend(expected: Option<&str>, app: &std::path::Path) -> Result<()> {
+pub(super) fn check_frontend(expected: Option<&str>, app: &std::path::Path) -> Result<()> {
     let expected = expected.ok_or(Error::State(Fault::UiDisconnected))?;
     let installed = qm_macos::peer_identity::requirement_for_path(app)
         .map_err(|_| Error::State(Fault::UiDisconnected))?;
@@ -171,7 +219,10 @@ pub(super) fn wait_for_turn(
         if !state.approval_queue.contains(&ticket) {
             return Err(Fault::Canceled.into());
         }
-        if state.pending.is_none() && state.approval_queue.is_front(&ticket) {
+        if state.pending.is_none()
+            && state.approval_starting.is_none()
+            && state.approval_queue.is_front(&ticket)
+        {
             return Ok(ticket);
         }
         drop(
@@ -219,6 +270,10 @@ pub(super) fn request_approval(
         if state.provider.generation() != generation {
             return Err(Error::State(Fault::ProviderChanged));
         }
+        let binding = state.github_binding()?;
+        if binding.account() != identity.binding {
+            return Err(Fault::ProviderChanged.into());
+        }
         (
             state.operations.request(id, principal)?.clone(),
             state.operations.grant_claims(id, principal)?,
@@ -228,7 +283,7 @@ pub(super) fn request_approval(
                 identity,
                 generation,
             },
-            state.github_binding()?,
+            binding,
         )
     };
     peer.observe_display_context();
@@ -267,7 +322,7 @@ pub(super) fn request_approval(
     if !state.approval_queue.is_front(&slot) {
         return Err(Fault::Canceled.into());
     }
-    if state.pending.is_some() {
+    if state.pending.is_some() || state.approval_starting.is_some() {
         return Err(Error::State(Fault::ApprovalPending));
     }
     if state.provider.generation() != frozen.generation
@@ -285,13 +340,16 @@ pub(super) fn request_approval(
     state.pending = Some(ApprovalDelivery {
         id,
         _queue_ticket: Some(slot),
-        authenticated: None,
         principal: Arc::clone(principal),
-        request: document,
+        action: ApprovalAction::Http(Box::new(HttpApproval {
+            request: document,
+            completion,
+        })),
+        authenticated: None,
+        resolving_credential: false,
         provider: frozen,
         context_lease: None,
         delivered: false,
-        completion,
     });
     Ok(receive)
 }
@@ -320,6 +378,19 @@ pub(super) fn proof(id: &str, signature: &[u8], state: &mut OwnerState) -> Resul
     pending.check(state)?;
     let authenticated = pending.authenticated.ok_or(Fault::ReviewNotPresented)?;
     check_authenticated_deadline(authenticated, presence_now()?)?;
+    if matches!(pending.action, ApprovalAction::Handoff(_)) {
+        let pending = state.pending.take().unwrap();
+        let ApprovalAction::Handoff(handoff) = pending.action else {
+            unreachable!()
+        };
+        return handoff.dispatch(
+            signature,
+            pending.provider,
+            &pending.principal,
+            authenticated,
+            state,
+        );
+    }
     state.operations.proof(
         id,
         &pending.principal,
@@ -330,6 +401,7 @@ pub(super) fn proof(id: &str, signature: &[u8], state: &mut OwnerState) -> Resul
     let pending = state.pending.as_mut().unwrap();
     pending.context_lease.take();
     pending
+        .http()?
         .completion
         .send(ApprovalCompletion {
             id,
@@ -379,9 +451,14 @@ pub(super) fn begin_native_presence(
     let at = anchor
         .checked_sub(age + Duration::from_millis(1))
         .ok_or_else(|| Error::State(Fault::InvalidClock))?;
-    state
-        .operations
-        .authentication(id, &pending.principal, at, anchor, offset)?;
+    match &mut pending.action {
+        ApprovalAction::Http(_) => {
+            state
+                .operations
+                .authentication(id, &pending.principal, at, anchor, offset)?
+        }
+        ApprovalAction::Handoff(handoff) => handoff.signing.authenticate(at, offset)?,
+    }
     pending.authenticated = Some(authenticated);
     if state.provider.snapshot().is_some() {
         state.provider.snapshot_for(&frozen.identity)?;
@@ -406,51 +483,36 @@ pub(super) fn complete_native_presence(
     let pending = state
         .pending
         .as_ref()
-        .filter(|pending| pending.id == id)
-        .ok_or_else(|| Error::State(Fault::Canceled))?;
+        .filter(|p| p.id == id)
+        .ok_or(Fault::Canceled)?;
     pending.check(state)?;
-    let offset = state
-        .operations
-        .authentication_offset(id, &pending.principal)?;
-    let authenticated = pending
-        .created()
-        .checked_add(offset)
-        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
-    if presence_now()?
-        .checked_duration_since(authenticated)
-        .is_none_or(|age| age >= Duration::from_secs(30))
-    {
-        return Err(Error::State(Fault::ApprovalExpired));
-    }
+    let authenticated = pending.authenticated.ok_or(Fault::ReviewNotPresented)?;
+    check_authenticated_deadline(authenticated, presence_now()?)?;
     let frozen = &pending.provider;
     let snapshot = state.provider.snapshot_for(&frozen.identity)?;
-    let current = current?;
-    if frozen.generation != state.provider.generation() || current != frozen.identity {
-        return Err(Error::State(Fault::ProviderChanged));
+    if current? != frozen.identity {
+        return Err(Fault::ProviderChanged.into());
     }
     let selection = state.github_selection(snapshot)?;
     let challenge = state
         .operations
         .challenge(id, &pending.principal, selection)?;
-    let authenticated = pending
-        .created()
-        .checked_add(challenge.offset)
-        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
-    let ui = state
-        .ui
-        .as_ref()
-        .ok_or_else(|| Error::State(Fault::UiDisconnected))?;
-    let policy = state.authorizer.policy_digest()?;
-    let nonce = state.operations.approval_nonce(id, &pending.principal)?;
-    let expires = authenticated
-        .checked_add(Duration::from_secs(30))
-        .ok_or_else(|| Error::State(Fault::InvalidClock))?;
+    if pending.created().checked_add(challenge.offset) != Some(authenticated) {
+        return Err(Fault::InvalidClock.into());
+    }
+    let ui = state.ui.as_ref().ok_or(Fault::UiDisconnected)?;
     Ok(Reply::Challenge {
         authorization: ApprovalChallenge {
-            review: pending.review(ui, policy, nonce),
+            review: pending.review(
+                ui,
+                state.authorizer.policy_digest()?,
+                state.operations.approval_nonce(id, &pending.principal)?,
+            ),
             credential_digest: BASE64.encode(challenge.credential_digest),
             authenticated,
-            expires,
+            expires: authenticated
+                .checked_add(Duration::from_secs(30))
+                .ok_or(Fault::InvalidClock)?,
             bytes: BASE64.encode(challenge.bytes),
         },
     })
@@ -463,7 +525,8 @@ pub(super) fn native_presence(
     connection: &ipc::Connection<'_>,
     shared: &Shared,
     paths: &ServicePaths,
-) -> Result<Reply> {
+    runtime: &tokio::runtime::Handle,
+) -> Result<ipc::Response> {
     let id = OperationId::parse(id)?;
     let result = (|| {
         let deadline = authenticated
@@ -515,13 +578,58 @@ pub(super) fn native_presence(
                 }
             }
         }
+        let binding = {
+            let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+            state.ensure_interactive()?;
+            let pending = state
+                .pending
+                .as_ref()
+                .filter(|p| p.id == id)
+                .ok_or(Fault::Canceled)?;
+            pending.check(&state)?;
+            let pending = state.pending.as_mut().unwrap();
+            match &pending.action {
+                ApprovalAction::Http(_) => None,
+                ApprovalAction::Handoff(handoff) => {
+                    let binding = handoff.binding.clone();
+                    pending.resolving_credential = true;
+                    Some(binding)
+                }
+            }
+        };
+        if let Some(binding) = binding {
+            let shared = Arc::clone(shared);
+            let paths = paths.clone();
+            let (send, receive) = mpsc::sync_channel(1);
+            runtime.spawn(async move {
+                let selected = super::handoff::selection(id, &shared, &paths, &binding).await;
+                let result = (|| {
+                    let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
+                    complete_handoff_presence(
+                        id,
+                        authenticated,
+                        &binding,
+                        selected,
+                        &mut state,
+                        &paths.load_policy(),
+                    )
+                })();
+                shared.1.notify_all();
+                let _ = send.send(
+                    super::control::encode_result(result)
+                        .unwrap_or_else(|_| br#"{"kind":"error","code":"unavailable"}"#.to_vec()),
+                );
+            });
+            return Ok(ipc::Response::Deferred(receive));
+        }
         let current = paths.vault_source().and_then(|source| source.identity());
         let policy = paths.load_policy();
         let mut state = shared
             .0
             .lock()
             .map_err(|_| Error::State(Fault::StateUnavailable))?;
-        complete_native_presence(id, &mut state, &policy, current)
+        let reply = complete_native_presence(id, &mut state, &policy, current)?;
+        super::control::encode_result(Ok(reply)).map(Into::into)
     })();
     if result.is_err() {
         let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
@@ -534,6 +642,85 @@ pub(super) fn native_presence(
         }
     }
     result
+}
+
+pub(super) fn adopt_refreshed_source(
+    id: OperationId,
+    state: &mut OwnerState,
+    previous: ProviderGeneration,
+    identity: CacheIdentity,
+) -> Result<()> {
+    let pending = state
+        .pending
+        .as_mut()
+        .filter(|p| p.id == id)
+        .ok_or(Fault::Canceled)?;
+    let frozen = &mut pending.provider;
+    if !pending.resolving_credential
+        || frozen.generation != previous
+        || identity.binding != frozen.identity.binding
+        || identity.scope != frozen.identity.scope
+        || identity.device_key != frozen.identity.device_key
+    {
+        return Err(Fault::ProviderChanged.into());
+    }
+    frozen.identity = identity;
+    frozen.generation = state.provider.generation();
+    frozen.source = None;
+    pending.resolving_credential = false;
+    state.pending.as_ref().unwrap().check(state)
+}
+
+fn complete_handoff_presence(
+    id: OperationId,
+    authenticated: MonotonicTimestamp,
+    binding: &qm_providers::ProviderBinding,
+    result: Result<(
+        qm_providers::SelectedCredential,
+        CacheIdentity,
+        ProviderGeneration,
+    )>,
+    state: &mut OwnerState,
+    policy: &super::PolicyInput,
+) -> Result<Reply> {
+    let complete = (|| {
+        state.refresh_policy(policy)?;
+        state.ensure_interactive()?;
+        let pending = state
+            .pending
+            .as_ref()
+            .filter(|p| p.id == id)
+            .ok_or(Fault::Canceled)?;
+        pending.check(state)?;
+        let (selected, identity, generation) = result?;
+        let frozen = &pending.provider;
+        if generation != frozen.generation
+            || identity != frozen.identity
+            || selected.binding() != binding
+        {
+            return Err(Fault::ProviderChanged.into());
+        }
+        state.provider.snapshot_for(&identity)?;
+        let pending = state.pending.as_mut().unwrap();
+        let handoff = pending.handoff_mut()?;
+        let credential_digest = selected.credential_digest();
+        let bytes = handoff.signing.challenge(selected, credential_digest)?;
+        Ok(Reply::Challenge {
+            authorization: ApprovalChallenge {
+                review: handoff.wire.clone(),
+                credential_digest: BASE64.encode(credential_digest),
+                authenticated,
+                expires: authenticated
+                    .checked_add(Duration::from_secs(30))
+                    .ok_or(Fault::InvalidClock)?,
+                bytes: BASE64.encode(bytes),
+            },
+        })
+    })();
+    if complete.is_err() && state.pending.as_ref().is_some_and(|p| p.id == id) {
+        state.cancel_pending();
+    }
+    complete
 }
 
 #[cfg(test)]

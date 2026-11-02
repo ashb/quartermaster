@@ -11,11 +11,11 @@ the caller, request, destination and policy before obtaining credentials and
 dispatching. A reusable grant can cover eligible requests; other operations need
 their own approval. The caller receives the result, not the credential.
 
-Credential handoff is the planned compatibility mode for other tools. The
-broker authorizes release of a selected credential and launches the tool with
-it in its environment. The tool then owns its API communication and has the
-credential's upstream permissions. The release boundary is distinct from
-mediated requests; see [credential handoff](security-boundaries.md#credential-handoff-planned).
+Credential handoff lets other tools receive a selected credential. For Restic,
+the broker launches the configured executable and releases a repository password
+through a private pipe after approval. The tool then owns credential use; QM
+cannot enforce individual operations or retract copies. See
+[credential handoff](security-boundaries.md#credential-handoff).
 
 Quartermaster governs the access routed through it. Applications using their own
 credentials and network routes remain outside that boundary.

@@ -202,6 +202,10 @@ fn random<const N: usize>() -> Result<[u8; N], Error> {
 }
 
 impl<C> Manager<C> {
+    #[cfg(test)]
+    pub(in crate::owner) fn unconfigured_fixture(public_key: &[u8]) -> Self {
+        Self::new(super::Record::unconfigured(public_key).unwrap())
+    }
     pub(super) fn new(record: Record) -> Self {
         Self {
             record,
@@ -335,6 +339,7 @@ impl<C> Manager<C> {
                     github: None,
                     github_credential: None,
                     mutations: super::MutationRule::RequireApproval,
+                    restic: None,
                 },
                 provider: None,
             },

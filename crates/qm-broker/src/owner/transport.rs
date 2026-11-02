@@ -23,6 +23,7 @@ pub(super) enum OperationResponse {
     Denied,
     InvalidCredential,
     ApprovalUnavailable,
+    ApprovalBusy,
     FrontendChanged,
     Uncertain,
     Github(super::github::response::PublicResponse),
@@ -57,6 +58,10 @@ impl OperationResponse {
             Self::ApprovalUnavailable => (
                 "503 Service Unavailable".into(),
                 b"{\"message\":\"Quartermaster could not connect to its approval window. Open Quartermaster and retry.\"}",
+            ),
+            Self::ApprovalBusy => (
+                "503 Service Unavailable".into(),
+                b"{\"message\":\"Quartermaster's approval queue is full. Wait for a pending request to finish, then retry.\"}",
             ),
             Self::FrontendChanged => (
                 "503 Service Unavailable".into(),

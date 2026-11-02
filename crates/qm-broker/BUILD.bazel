@@ -41,11 +41,36 @@ rust_library(
 
 rust_test(
     name = "qm_broker_test",
+    # Process creation must not overlap cache-lock fixtures in the same process.
+    args = [
+        "--skip=owner::runtime::restic_process::tests::",
+        "--skip=owner::runtime::handoff::tests::native::",
+    ],
     compile_data = ["Cargo.toml"],
     crate = ":qm_broker",
     edition = "2024",
     tags = ["local"],
     deps = all_crate_deps(normal_dev = True),  # keep
+)
+
+rust_test(
+    name = "restic_process_test",
+    args = ["owner::runtime::restic_process::tests::"],
+    compile_data = ["Cargo.toml"],
+    crate = ":qm_broker",
+    edition = "2024",
+    tags = ["local"],
+    deps = all_crate_deps(normal_dev = True),  # keep
+)
+
+rust_test(
+    name = "handoff_native_test",
+    args = ["owner::runtime::handoff::tests::native::"],
+    compile_data = ["Cargo.toml"],
+    crate = ":qm_broker",
+    edition = "2024",
+    tags = ["local"],
+    deps = all_crate_deps(normal_dev = True),
 )
 
 rust_test(

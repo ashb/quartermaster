@@ -35,6 +35,8 @@ pub(super) struct OwnerState {
     pub(super) approval_public_key: Option<Vec<u8>>,
     pub(super) pending: Option<ApprovalDelivery>,
     pub(super) approval_queue: crate::owner::approval_queue::Queue,
+    pub(super) approval_starting: Option<String>,
+    pub(super) admitted_approval: Option<(String, [u8; 16])>,
     pub(super) provider: ProviderState,
     pub(super) authorizer: Authorizer,
     pub(super) session_policy: SessionPolicy,
@@ -81,6 +83,8 @@ impl OwnerState {
             approval_public_key: None,
             pending: None,
             approval_queue: Default::default(),
+            approval_starting: None,
+            admitted_approval: None,
             provider: ProviderState::default(),
             authorizer: Authorizer::new(random()?),
             session_policy: SessionPolicy::default(),
@@ -248,6 +252,7 @@ impl OwnerState {
     }
 
     pub(super) fn cancel_pending(&mut self) {
+        self.approval_starting.take();
         if let Some(pending) = self.pending.take() {
             self.operations.cancel(pending.id, &pending.principal);
         }
@@ -260,6 +265,7 @@ impl OwnerState {
 
     fn disconnect_approval_ui(&mut self) {
         self.approval_queue.clear();
+        self.admitted_approval.take();
         if let Some(ui) = self.ui.take() {
             self.operations.cancel_interactive_session(ui.session.id());
         }
@@ -524,7 +530,50 @@ mod tests {
     }
 
     #[test]
-    fn github_uses_the_signed_selection_and_never_falls_back_to_another_account() {
+    fn signed_tool_selections_are_independent_and_missing_items_fail_only_their_tool() {
+        const GITHUB: &str = "22222222-2222-4222-8222-222222222222";
+        const RESTIC: &str = "33333333-3333-4333-8333-333333333333";
+        for items in [vec![GITHUB, RESTIC], vec![GITHUB], vec![RESTIC]] {
+            let settings = Settings::decode(
+                &serde_json::to_vec(&serde_json::json!({
+                    "github": null, "mutations": "requireApproval",
+                    "githubCredential": {"itemId": GITHUB},
+                    "restic": {"enabled":true,"executable":"/bin/restic","itemId":RESTIC}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut state = OwnerState::new().unwrap();
+            state.administration.manager = Some(vault::manager_with_settings(settings));
+            vault::install(
+                &mut state.provider,
+                vault::catalogue(vault::binding("github-write", GITHUB), &items),
+            );
+            let snapshot = state.provider.snapshot().unwrap();
+            assert_eq!(
+                state.github_selection(snapshot).is_ok(),
+                items.contains(&GITHUB)
+            );
+            let record = state.administration.manager.as_ref().unwrap().record();
+            let restic_binding = record
+                .settings()
+                .unwrap()
+                .restic_binding(&record.provider().unwrap().binding)
+                .unwrap();
+            let restic = snapshot.select(&restic_binding);
+            assert_eq!(restic.is_ok(), items.contains(&RESTIC));
+            if let Ok(selected) = restic {
+                assert_eq!(
+                    selected.decrypt_selected_for_owner().unwrap().as_slice(),
+                    b"quartermaster-dummy-canary"
+                );
+            }
+            assert!(state.provider.snapshot().is_some());
+        }
+    }
+
+    #[test]
+    fn github_uses_the_signed_selection_and_never_falls_back_to_restic_or_another_account() {
         let mut state = OwnerState::new().unwrap();
         let snapshot = vault::catalogue(
             vault::binding("github-write", "22222222-2222-4222-8222-222222222222"),
@@ -535,7 +584,8 @@ mod tests {
         );
         let settings = |item: Option<&str>| {
             Settings::decode(&serde_json::to_vec(&serde_json::json!({
-                "github":null, "mutations":"requireApproval", "githubCredential":item.map(|item| serde_json::json!({"itemId":item}))
+                "github":null, "mutations":"requireApproval", "githubCredential":item.map(|item| serde_json::json!({"itemId":item})),
+                "restic":{"enabled":true,"executable":"/bin/restic","itemId":"33333333-3333-4333-8333-333333333333"}
             })).unwrap()).unwrap()
         };
         state.administration.manager = Some(vault::manager_with_settings(settings(None)));

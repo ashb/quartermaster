@@ -5,6 +5,7 @@ rust_binary(
     srcs = [
         "src/main.rs",
         "src/paths.rs",
+        "src/restic.rs",
     ],
     compile_data = ["Cargo.toml"],
     edition = "2024",

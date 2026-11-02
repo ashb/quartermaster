@@ -29,6 +29,7 @@ struct PreferencesView: View {
     @ObservedObject var application: BrokerApplication
     @State private var selection: Pane = .vault
     @State private var showingGitHub = false
+    @State private var showingRestic = false
     @State private var showingEnrollment = false
     @State private var showingGitHubItems = false
     @State private var vaultDraft: EnrollmentDraft
@@ -65,6 +66,10 @@ struct PreferencesView: View {
                             case .tools:
                                 if showingGitHub {
                                     github
+                                } else if showingRestic {
+                                    ResticPreferencesView(editor: editor, application: application) {
+                                        selection = .vault
+                                    }
                                 } else {
                                     tools
                                 }
@@ -108,6 +113,7 @@ struct PreferencesView: View {
                     closeVaultEditor()
                     selection = pane
                     showingGitHub = false
+                    showingRestic = false
                 } label: {
                     HStack(spacing: 12) {
                         Image(systemName: pane.symbol).font(.system(size: 15)).frame(width: 20)
@@ -129,10 +135,11 @@ struct PreferencesView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 10) {
-                if selection == .tools && showingGitHub && editor.snapshot?.migration == nil {
+                if selection == .tools && (showingGitHub || showingRestic) && editor.snapshot?.migration == nil {
                     Button {
                         closeVaultEditor()
                         showingGitHub = false
+                        showingRestic = false
                     } label: {
                         Image(systemName: "chevron.left").font(.system(size: 15, weight: .medium))
                             .frame(width: 24, height: 28)
@@ -142,7 +149,7 @@ struct PreferencesView: View {
                     editor.snapshot?.migration != nil
                         ? "Import settings"
                         : showingGitHub && selection == .tools
-                            ? "GitHub CLI" : selection.rawValue
+                            ? "GitHub CLI" : showingRestic && selection == .tools ? "Restic" : selection.rawValue
                 )
                 .font(.system(size: 26, weight: .semibold))
                 Spacer()
@@ -157,6 +164,13 @@ struct PreferencesView: View {
                     .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
                     .fixedSize().disabled(editor.busy)
                 }
+                if selection == .tools && showingRestic && editor.snapshot?.migration == nil {
+                    Toggle(
+                        "Enable Restic",
+                        isOn: Binding(get: { editor.resticEnabled }, set: { editor.resticEnabled = $0 })
+                    )
+                    .toggleStyle(.switch).controlSize(.small).font(.system(size: 12)).fixedSize().disabled(editor.busy)
+                }
             }
             if editor.snapshot?.migration == nil {
                 if selection == .tools && showingGitHub {
@@ -164,6 +178,9 @@ struct PreferencesView: View {
                         "Credential and approval rules for \(Text("gh").font(.system(size: 13, design: .monospaced)).foregroundColor(accent))."
                     )
                     .font(.system(size: 13)).foregroundStyle(.secondary)
+                } else if selection == .tools && showingRestic {
+                    Text("Approve password delivery to a verified Restic process.")
+                        .font(.system(size: 13)).foregroundStyle(.secondary)
                 } else {
                     Text(selection.subtitle).font(.system(size: 13)).foregroundStyle(.secondary)
                 }
@@ -230,6 +247,21 @@ struct PreferencesView: View {
                                 ? "Disabled" : editor.snapshot?.provider?.binding.email ?? "No credential selected"
                         )
                         .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.system(size: 11, weight: .medium)).foregroundStyle(
+                        .secondary)
+                }.padding(.horizontal, 12).padding(.vertical, 10).frame(maxWidth: .infinity, alignment: .leading)
+            }.buttonStyle(.luminare)
+            Button {
+                showingRestic = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "externaldrive").font(.system(size: 22)).frame(width: 24, height: 24)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Restic").font(.system(size: 13, weight: .semibold))
+                        Text(editor.resticEnabled ? "Password handoff · approval per use" : "Disabled")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Image(systemName: "chevron.right").font(.system(size: 11, weight: .medium)).foregroundStyle(

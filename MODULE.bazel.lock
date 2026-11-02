@@ -769,7 +769,7 @@
           "FILE:@@//crates/qm-api-github/Cargo.toml 328c91138ebcdac98c345fa909a0995a0f83cef3d888d89eb580956e792a2eca",
           "FILE:@@//crates/qm-api-macros/Cargo.toml ccb207bce90df4bc39a6d7df1ed9f8f4e6f5a7ff9c1328ddb4f9b846c7114e6c",
           "FILE:@@//bins/quartermasterd/Cargo.toml 49db2693710b90c38f9c46e9d83da2f16a110f666f8aa259f72b7ce4b58aaff6",
-          "FILE:@@//bins/qm/Cargo.toml a397d9c6352be54380e0ca7ea8349a207a70f570ad26fe52e2269d44606abb92",
+          "FILE:@@//bins/qm/Cargo.toml 750604fc7abee051ec356cc20ad4e2e5898d19c7ff9f1d938fe71064e0082dee",
           "FILE:@@gazelle_rust+//Cargo.lock 0f5ccb0b0c90eaf9ca15866694cd30b7d7d6c16eed0c58a82f5cbdcf1aa65765",
           "FILE:@@gazelle_rust+//Cargo.toml c882cf0e33f7108e7672a9ea15baef710100b07295c920dbea10d47d43f75866",
           "FILE:@@gazelle_rust+//Cargo.Bazel.lock 0e405f74abdf4bd7664ec512b5d22a4381b3014f517d02de630d489123a43b8b"

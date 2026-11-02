@@ -205,14 +205,10 @@ Open **Settings → Vault** to inspect the selected enrolment. A replacement is
 verified into an inactive cache slot, then selected only after settings approval.
 **Disconnect…** stages removal of the selection. Approving it locks the provider;
 it retains encrypted files and does not modify the source vault.
-After disconnecting, select the intended cache under **Retained enrolments** to
-review and reauthorize it without signing in again. Listed metadata grants no
-access; Save authenticates the cache before selecting it.
 
 Approved settings use `dev.quartermaster.settings.development.v1` in the backend's
 Data Protection Keychain access group. The UI public-key pin uses the separate
-`dev.quartermaster.settings-key.development.v1` service. There is no authoritative
-JSON copy.
+`dev.quartermaster.settings-key.development.v1` service. There is no authoritative JSON copy.
 Opening the UI reads settings without requesting a fingerprint. Missing or
 unreadable protected state grants no access; **Reconnect** retries registration.
 
@@ -237,15 +233,15 @@ open target/macos/signed/Quartermaster.app
 ```
 
 The command stops the backend, waits for it to exit and clears its protected
-settings record. It retains the approval-key pin, Secure Enclave keys and encrypted
-cache files; those files
+settings record. It retains
+the approval-key pin, Secure Enclave keys and encrypted cache files; those files
 cannot select a vault or grant access. It refuses to reset while a backend still
 holds its lock.
 
 In **Settings → Vault**, verify your server, email and master password, then save
-with Touch ID. In **Tools → GitHub CLI**, choose its vault item and restore its
-rules. Account-cache format 2 requires re-enrolment; format 1 caches cannot be
-reused. Source vault items and repositories are unaffected.
+with Touch ID. In **Tools → GitHub CLI** and **Tools → Restic**, choose each tool's
+vault item and restore its rules. Account-cache format 2 requires re-enrolment;
+format 1 caches cannot be reused. Source vault items and repositories are unaffected.
 
 If signing reports no valid identity, check that the pinned certificate is valid
 and its private key is available. For missing or expired profiles, run

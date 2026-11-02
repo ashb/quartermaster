@@ -26,6 +26,7 @@ struct ProcessTreeRow: Identifiable {
     let label: String
     let duration: String
     let scopeOffered: Bool
+    var isProjected = false
     var id: UInt32 { process.pid }
     var dimmed: Bool { process.limited || (scopeOffered && choice == nil) }
 
@@ -71,6 +72,7 @@ struct ProcessTreeRow: Identifiable {
 
     var help: String {
         [
+            isProjected ? "Receives the password on approval. Shown beneath the caller for context." : nil,
             process.limited ? "Limited process information." : nil,
             scopeOffered && choice == nil ? "This process cannot receive a read grant." : nil, process.executable,
         ]
@@ -122,7 +124,9 @@ struct ProcessScopeTree: View {
                                     ProcessBranch()
                                         .stroke(
                                             .tertiary,
-                                            style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round)
+                                            style: StrokeStyle(
+                                                lineWidth: 1, lineCap: .round, lineJoin: .round,
+                                                dash: row.isProjected ? [3, 3] : [])
                                         )
                                         .frame(width: 9, height: 32)
                                         .offset(x: indent - 10)
@@ -162,6 +166,7 @@ struct ProcessScopeTree: View {
 
     private func processRow(_ row: ProcessTreeRow, first: Bool) -> some View {
         let selected = row.choice == selection
+        let accented = selected || row.isProjected
         let application = ProcessApplication(executable: row.process.executable)
         let content = HStack(spacing: 9) {
             if row.process.name == "gh", ApprovalAppearance.githubIcon != nil {
@@ -170,9 +175,9 @@ struct ProcessScopeTree: View {
                 Image(nsImage: application.icon).resizable().renderingMode(.original)
                     .scaledToFit().frame(width: 19, height: 19)
             } else {
-                Image(systemName: row.process.name == "login" ? "lock" : "terminal")
+                Image(systemName: row.isProjected ? "externaldrive" : row.process.name == "login" ? "lock" : "terminal")
                     .font(.system(size: 15)).frame(width: 19)
-                    .foregroundStyle(selected ? ApprovalAppearance.accent : .secondary)
+                    .foregroundStyle(accented ? ApprovalAppearance.accent : .secondary)
             }
             Text(verbatim: application?.name ?? row.process.name)
                 .font(.system(size: 13, weight: .medium, design: .monospaced)).lineLimit(1).truncationMode(.middle)
@@ -183,14 +188,18 @@ struct ProcessScopeTree: View {
                 Text(row.duration.isEmpty ? row.label : "\(row.label) · \(row.duration)")
                 Text(row.label)
             }.font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
-                .foregroundStyle(selected ? ApprovalAppearance.accent : .secondary)
+                .foregroundStyle(accented ? ApprovalAppearance.accent : .secondary)
             Image(systemName: selected ? "largecircle.fill.circle" : "circle")
                 .foregroundStyle(selected ? ApprovalAppearance.accent : .secondary)
                 .opacity(row.choice == nil ? 0 : 1).frame(width: 15)
         }
         .padding(.horizontal, 10).frame(maxWidth: .infinity, minHeight: 32)
         .background(background(for: row), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(selected ? ApprovalAppearance.accent : .clear))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10).strokeBorder(
+                accented ? ApprovalAppearance.accent : .clear,
+                style: StrokeStyle(lineWidth: 1, dash: row.isProjected ? [4, 3] : []))
+        )
         .contentShape(Rectangle())
         return Group {
             if row.scopeOffered {
@@ -214,7 +223,7 @@ struct ProcessScopeTree: View {
     }
 
     private func background(for row: ProcessTreeRow) -> Color {
-        if row.choice == selection { return ApprovalAppearance.accent.opacity(0.12) }
+        if row.choice == selection || row.isProjected { return ApprovalAppearance.accent.opacity(0.12) }
         guard case .root = selection,
             let selected = rows.firstIndex(where: { $0.choice == selection }),
             let index = rows.firstIndex(where: { $0.id == row.id }), index > selected

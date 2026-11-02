@@ -88,7 +88,7 @@ impl Paths {
         let _lock = exclusive_lock(&self.root.join("startup.lock"))?;
         self.stop_locked()?;
         qm_broker::reset_settings(self.options()).map_err(io::Error::other)?;
-        println!("Settings cleared. Open Quartermaster and enrol your vault again.");
+        println!("Settings cleared. Open Quartermaster and enrol your vault account again.");
         Ok(())
     }
 

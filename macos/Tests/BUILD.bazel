@@ -36,6 +36,7 @@ swift_test(
     name = "PreferencesTests",
     srcs = [
         "ConnectionRecoveryTests.swift",
+        "CredentialHandoffTests.swift",
         "PreferencesTests.swift",
         "VaultControlTests.swift",
     ],

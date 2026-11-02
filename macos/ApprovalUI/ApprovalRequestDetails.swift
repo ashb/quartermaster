@@ -80,7 +80,7 @@ extension ApprovalPresentation {
     }
 }
 
-private func processStarted(_ micros: UInt64?) -> String {
+func processStarted(_ micros: UInt64?) -> String {
     guard let micros else { return "Unavailable" }
     return Date(timeIntervalSince1970: Double(micros) / 1_000_000)
         .formatted(.dateTime.year().month(.abbreviated).day().hour().minute().second().timeZone())
@@ -88,9 +88,7 @@ private func processStarted(_ micros: UInt64?) -> String {
 
 struct ApprovalRequestDetails: View {
     let presentation: ApprovalPresentation
-    @Environment(\.dismiss) private var dismiss
     @State var tab = Tab.scope
-    @State private var copied = false
     @State private var raw = false
 
     enum Tab: CaseIterable {
@@ -119,26 +117,43 @@ struct ApprovalRequestDetails: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Full request").font(.system(size: 22, weight: .semibold))
-                    Text(verbatim: presentation.repository ?? presentation.callerName)
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(copied ? "Copied" : "Copy all") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(presentation.fullDetails, forType: .string)
-                    copied = true
-                }.fixedSize()
-            }
+        ApprovalDetailsSheet(
+            subtitle: presentation.repository ?? presentation.callerName,
+            text: text, fullDetails: presentation.fullDetails
+        ) {
             Picker("Details", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { Text(title(for: $0)).tag($0) }
             }.pickerStyle(.segmented).labelsHidden()
             if tab == .request, presentation.apiRequest?.readableText != nil {
                 Toggle("Raw HTTP", isOn: $raw).toggleStyle(.checkbox)
             }
+        }
+    }
+}
+
+struct ApprovalDetailsSheet<Controls: View>: View {
+    let subtitle: String
+    let text: String
+    let fullDetails: String
+    @ViewBuilder let controls: Controls
+    @Environment(\.dismiss) private var dismiss
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Full request").font(.system(size: 22, weight: .semibold))
+                    Text(verbatim: subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(copied ? "Copied" : "Copy all") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(fullDetails, forType: .string)
+                    copied = true
+                }.fixedSize()
+            }
+            controls
             ScrollView(.vertical) {
                 Text(verbatim: text).font(.system(size: 12, design: .monospaced))
                     .lineSpacing(5).textSelection(.enabled)

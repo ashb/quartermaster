@@ -1,5 +1,6 @@
 import AppKit
 import CryptoKit
+import Darwin
 import Foundation
 import LocalAuthentication
 import QuartermasterApprovalUI
@@ -14,7 +15,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
     enum Suspension: CaseIterable, Sendable { case enrolment, poll }
     enum VaultOutcome: CaseIterable, Sendable { case locked, syncFailed, synced }
     private let lost = Mutex(false)
-    private let snapshot: SettingsSnapshot
+    let snapshot: SettingsSnapshot
     private let vault: BrokerVaultStatus
     private let syncedVault: BrokerVaultStatus
     private let vaultOutcome: VaultOutcome?
@@ -25,8 +26,8 @@ private final class RecoveryClient: BrokerClient, Sendable {
     private let settingsReply: BrokerReply?
     @MainActor private(set) var registrationKeys: [Data] = []
     @MainActor private(set) var enrolmentKeys: [Data] = []
-    @MainActor private(set) var cancellations: [String] = []
     @MainActor private(set) var polls = 0
+    @MainActor private(set) var cancellations: [String] = []
     @MainActor private(set) var vaultOperations = 0
     @MainActor private var synchronized = false
     @MainActor private(set) var unexpectedCommands: [BrokerCommand] = []
@@ -47,7 +48,7 @@ private final class RecoveryClient: BrokerClient, Sendable {
         snapshot = try JSONDecoder().decode(
             SettingsSnapshot.self,
             from: Data(
-                #"{"state":"configured","revision":4,"session":"AQEBAQEBAQEBAQEBAQ==","settings":{"github":{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true},"mutations":"requireApproval"},"provider":{"slot":"dummy","binding":{"server":"https://vault.example.invalid","email":"dummy@example.invalid","account_id":"dummy"},"scope":"dummy","deviceKey":[1]},"migration":null}"#
+                #"{"state":"configured","revision":4,"session":"AQEBAQEBAQEBAQEBAQ==","settings":{"github":{"version":1,"mode":"github","repositories":[],"approveUnverifiedRequests":true},"mutations":"requireApproval"},"provider":{"slot":"dummy","binding":{"server":"https://vault.example.invalid","email":"dummy@example.invalid","account_id":"dummy","item_id":"dummy","field":"LoginPassword","role":"github-write"},"scope":"dummy","deviceKey":[1]},"migration":null}"#
                     .utf8))
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .secondsSince1970
@@ -101,15 +102,15 @@ private final class RecoveryClient: BrokerClient, Sendable {
             enrolmentKeys.append(key)
             if suspension == .enrolment { return try await withCheckedThrowingContinuation { pending = $0 } }
             return .enrolled
+        case .next:
+            polls += 1
+            if suspension == .poll { return try await withCheckedThrowingContinuation { pending = $0 } }
+            return .idle
         case .revokeReadGrant, .revokeReadGrants: return .readGrantsRevoked
         case .readGrants: return .readGrants([])
         case .cancel(let id):
             cancellations.append(id)
             return .canceled
-        case .next:
-            polls += 1
-            if suspension == .poll { return try await withCheckedThrowingContinuation { pending = $0 } }
-            return .idle
         default:
             unexpectedCommands.append(command)
             throw BrokerFailure.invalidMessage
@@ -182,6 +183,149 @@ private final class RecoveryClient: BrokerClient, Sendable {
     #expect(application.status == "Connected")
     try await eventually { (try? rendered()) != failed }
     #expect(attempts == 2)
+}
+
+@Test @MainActor func resticWithoutGitHubStillEnrollsAndPollsForApproval() async throws {
+    let baseline = try RecoveryClient()
+    var settings = BrokerSettings()
+    settings.restic = ResticSettings(executable: "/bin/restic", itemId: "22222222-2222-4222-8222-222222222222")
+    let snapshot = try JSONDecoder().decode(
+        SettingsSnapshot.self,
+        from: JSONSerialization.data(withJSONObject: [
+            "state": "configured", "revision": 4, "session": Data(repeating: 1, count: 16).base64EncodedString(),
+            "settings": JSONSerialization.jsonObject(with: JSONEncoder().encode(settings)),
+            "provider": JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(try #require(baseline.snapshot.provider))),
+        ]))
+    let client = try RecoveryClient(settingsReply: .settingsStatus(snapshot))
+    defer { client.cancel() }
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { client }, loadApprovalKey: { Data([1, 2, 3]) })
+    activate(application)
+    try await eventually { client.polls > 0 }
+    #expect(client.enrolmentKeys == [Data([1, 2, 3])])
+    #expect(application.preferences.snapshot?.settings?.github == nil)
+}
+
+@Test @MainActor func handoffPresentationHoldsAndReleasesTheGlobalDialogLease() async throws {
+    let client = try RecoveryClient(suspension: .poll)
+    let window = InertApprovalWindow()
+    let descriptor = open("/dev/null", O_RDONLY)
+    #expect(descriptor >= 0)
+    var acquisitions = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { client }, loadApprovalKey: { Data([1]) },
+        acquirePresentation: {
+            acquisitions += 1
+            return descriptor
+        },
+        makeHandoffWindow: { request, _ in
+            #expect(request.credentialName == "Backup password")
+            return window
+        })
+    defer {
+        window.close()
+        client.cancel()
+        client.complete(.failure(CancellationError()))
+    }
+    activate(application)
+    try await eventually { client.pending != nil }
+    client.complete(.success(.handoffReview(try handoffReview())))
+    try await eventually { window.isPresented }
+    #expect(acquisitions == 1)
+    #expect(fcntl(descriptor, F_GETFD) >= 0)
+    window.close()
+    #expect(fcntl(descriptor, F_GETFD) == -1)
+    #expect(client.cancellations.isEmpty)
+}
+
+@Test(arguments: [true, false]) @MainActor
+private func handoffWaitsWithoutReplacingAnExistingDialog(_ otherProcess: Bool) async throws {
+    let client = try RecoveryClient(suspension: .poll)
+    let existing = InertApprovalWindow()
+    let successor = InertApprovalWindow()
+    var blocked = otherProcess
+    var acquisitions = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { client }, loadApprovalKey: { Data([1]) },
+        acquirePresentation: {
+            acquisitions += 1
+            if blocked { throw DialogPresentationLease.Failure.alreadyPresented }
+            return open("/dev/null", O_RDONLY)
+        },
+        makeHandoffWindow: { _, _ in
+            return successor
+        })
+    defer {
+        existing.close()
+        successor.close()
+        client.cancel()
+        client.complete(.failure(CancellationError()))
+    }
+    activate(application)
+    try await eventually { client.pending != nil }
+    if !otherProcess { application.present(existing) }
+    client.complete(.success(.handoffReview(try handoffReview())))
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(client.cancellations.isEmpty)
+    #expect(!successor.isPresented)
+    #expect(existing.isPresented == !otherProcess)
+    blocked = false
+    existing.close()
+    try await eventually { successor.isPresented }
+    #expect(client.cancellations.isEmpty)
+    #expect(acquisitions > 0)
+}
+
+@Test(arguments: [true, false]) @MainActor
+private func expiredReviewsDoNotDisconnectTheApprovalClient(_ handoff: Bool) async throws {
+    let client = try RecoveryClient(suspension: .poll)
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { client }, loadApprovalKey: { Data([1]) },
+        acquirePresentation: {
+            Issue.record("Expired reviews must not acquire presentation")
+            throw DialogPresentationLease.Failure.alreadyPresented
+        })
+    defer {
+        client.cancel()
+        client.complete(.failure(CancellationError()))
+    }
+    activate(application)
+    try await eventually { client.pending != nil }
+    let created = try JSONDecoder().decode(MonotonicTimestamp.self, from: Data("1".utf8))
+    let review = try handoffReview(created: created)
+    client.complete(.success(handoff ? .handoffReview(review) : .review(review)))
+    try await eventually { client.polls == 2 }
+    #expect(client.cancellations == [review.id])
+    #expect(application.connected)
+    #expect(!client.disconnected)
+}
+
+@Test(arguments: [BrokerCommand.vaultLock, .revokeReadGrant(id: String(repeating: "a", count: 32)), .revokeReadGrants])
+@MainActor private func invalidationDiscardsDeferredReviews(_ command: BrokerCommand) async throws {
+    let client = try RecoveryClient(suspension: .poll, vaultOutcome: .locked)
+    var acquisitions = 0
+    let application = BrokerApplication(
+        setActivationPolicy: { _ in }, openConnection: { client }, loadApprovalKey: { Data([1]) },
+        acquirePresentation: {
+            acquisitions += 1
+            throw DialogPresentationLease.Failure.alreadyPresented
+        })
+    defer {
+        client.cancel()
+        client.complete(.failure(CancellationError()))
+    }
+    activate(application)
+    try await eventually { client.pending != nil }
+    client.complete(.success(.handoffReview(try handoffReview())))
+    try await eventually { acquisitions > 0 }
+    switch command {
+    case .vaultLock: application.vault(command)
+    case .revokeReadGrant(let id): application.revokeRead(id)
+    default: application.revokeReads()
+    }
+    try await eventually { client.polls == 2 }
+    #expect(application.connected)
 }
 
 @Test(arguments: RecoveryClient.Suspension.allCases, [true, false]) @MainActor

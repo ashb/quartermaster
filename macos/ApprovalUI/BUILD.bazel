@@ -16,6 +16,8 @@ swift_library(
         "ApprovalDialogView.swift",
         "ApprovalRequestDetails.swift",
         "ApprovalText.swift",
+        "CredentialHandoffDialog.swift",
+        "CredentialHandoffRequest.swift",
         "DisclosureSection.swift",
         "ProcessScopeTree.swift",
         "SettingsApprovalDialog.swift",

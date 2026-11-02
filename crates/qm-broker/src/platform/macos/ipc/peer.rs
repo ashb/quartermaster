@@ -137,6 +137,7 @@ impl PeerState {
             if let Some((generation, _)) = authenticated {
                 self.contexts.release(generation);
             }
+            eprintln!("Approval IPC request rejected: connection ended");
             reply.send(REJECTED);
             return;
         }
@@ -176,6 +177,9 @@ impl PeerState {
                     {
                         _slot.0.contexts.release(generation);
                     }
+                    if response.is_none() {
+                        eprintln!("Approval IPC request timed out or lost its backend response");
+                    }
                     objc2::rc::autoreleasepool(|_| {
                         reply.send(response.as_deref().unwrap_or(REJECTED))
                     });
@@ -204,6 +208,7 @@ impl PeerState {
             return;
         };
         let Some(slot) = self.reserve() else {
+            eprintln!("Approval IPC request rejected: connection closed or request limit reached");
             reply.send(REJECTED);
             return;
         };

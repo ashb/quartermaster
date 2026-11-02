@@ -232,6 +232,7 @@ public enum BrokerReply: Decodable, Sendable {
     case enrolled
     case idle
     case review(ApprovalReview)
+    case handoffReview(ApprovalReview)
     case challenge(ApprovalChallenge)
     case accepted
     case canceled
@@ -259,7 +260,7 @@ public enum BrokerReply: Decodable, Sendable {
     }
 
     private enum Kind: String, Decodable {
-        case hello, enrolled, idle, review, challenge, accepted, canceled
+        case hello, enrolled, idle, review, handoffReview, challenge, accepted, canceled
         case alreadyAdmitted, unknownOperation, readGrantsRevoked, readGrants, error, vaultStatus, vaultItems
         case settingsStatus, settingsReview, settingsChallenge, enrollmentStaged, settingsApplied, vaultUnlockReview
     }
@@ -279,6 +280,7 @@ public enum BrokerReply: Decodable, Sendable {
         case .enrolled: self = .enrolled
         case .idle: self = .idle
         case .review: self = .review(try fields.decode(ApprovalReview.self, forKey: .approval))
+        case .handoffReview: self = .handoffReview(try fields.decode(ApprovalReview.self, forKey: .approval))
         case .challenge: self = .challenge(try fields.decode(ApprovalChallenge.self, forKey: .authorization))
         case .accepted: self = .accepted
         case .canceled: self = .canceled

@@ -5,8 +5,10 @@ mod error;
 
 #[cfg(all(test, feature = "gh-compatibility"))]
 mod gh_tests;
+mod handoff;
 mod http;
 mod policy_source;
+mod restic_process;
 mod settings;
 mod state;
 mod vault_workflow;
@@ -138,6 +140,15 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let handoff_socket = paths.root.join("handoff.sock");
+    if let Ok(metadata) = fs::symlink_metadata(&handoff_socket) {
+        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(Error::State(Fault::InvalidSocket));
+        }
+        fs::remove_file(&handoff_socket)?;
+    }
+    let handoff_listener = UnixListener::bind(&handoff_socket)?;
+    fs::set_permissions(&handoff_socket, fs::Permissions::from_mode(0o600))?;
     let mut state = OwnerState::for_service()?;
     state.build = fs::read(paths.app.join("Contents/Resources/BuildInfo.json"))
         .ok()
@@ -166,6 +177,16 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
         tokio::net::UnixListener::from_std(listener)?
     };
     let ingress_shared = Arc::clone(&shared);
+    handoff_listener.set_nonblocking(true)?;
+    let handoff_listener = {
+        let _entered = runtime.enter();
+        tokio::net::UnixListener::from_std(handoff_listener)?
+    };
+    let handoffs = runtime.spawn(handoff::serve(
+        handoff_listener,
+        Arc::clone(&shared),
+        paths.clone(),
+    ));
     let expiration_shared = Arc::clone(&shared);
     let expiration = runtime.spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -201,9 +222,11 @@ pub(super) fn serve(options: crate::ServiceOptions) -> Result<()> {
     shared.1.notify_all();
     drop(native);
     ingress.abort();
+    handoffs.abort();
     expiration.abort();
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     fs::remove_file(socket)?;
+    fs::remove_file(handoff_socket)?;
     result.and_then(|()| {
         completion
             .try_recv()
@@ -219,7 +242,8 @@ async fn serve_ingress(
     let (send, receive) = tokio::sync::mpsc::channel::<tokio::net::UnixStream>(8);
     let receive = Arc::new(tokio::sync::Mutex::new(receive));
     let mut workers = tokio::task::JoinSet::new();
-    for _ in 0..4 {
+    // Leave capacity for authorised requests when every approval slot is occupied.
+    for _ in 0..(crate::owner::approval_queue::CAPACITY + 4) {
         let receive = Arc::clone(&receive);
         let shared = Arc::clone(&shared);
         let paths = paths.clone();
@@ -1358,10 +1382,14 @@ mod tests {
         let (completion, receive) = mpsc::sync_channel(1);
         state.pending = Some(ApprovalDelivery {
             _queue_ticket: None,
-            authenticated: None,
             id,
             principal,
-            request,
+            action: approval::ApprovalAction::Http(Box::new(approval::HttpApproval {
+                request,
+                completion,
+            })),
+            authenticated: None,
+            resolving_credential: false,
             provider: FrozenProvider {
                 source: Some(source),
                 identity,
@@ -1369,7 +1397,6 @@ mod tests {
             },
             context_lease: None,
             delivered: false,
-            completion,
         });
         handle(Client::Next {}, &mut state, &paths.load_policy()).unwrap();
         (directory, paths, key, state, receive)

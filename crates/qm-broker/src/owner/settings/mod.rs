@@ -85,6 +85,12 @@ pub(super) struct Settings {
         deserialize_with = "decode_github_credential"
     )]
     github_credential: Option<GitHubCredential>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "decode_restic"
+    )]
+    restic: Option<ResticConfig>,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -93,6 +99,16 @@ pub(in crate::owner) struct GitHubCredential {
     item_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     item_name: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::owner) struct ResticConfig {
+    pub(in crate::owner) enabled: bool,
+    pub(in crate::owner) executable: String,
+    pub(in crate::owner) item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::owner) item_name: Option<String>,
 }
 
 fn decode_github_credential<'de, D: serde::Deserializer<'de>>(
@@ -110,6 +126,34 @@ fn decode_github_credential<'de, D: serde::Deserializer<'de>>(
                 return Err(serde::de::Error::custom("GitHub item name is too long"));
             }
             Ok(credential)
+        })
+        .transpose()
+}
+
+fn decode_restic<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ResticConfig>, D::Error> {
+    Option::<ResticConfig>::deserialize(deserializer)?
+        .map(|mut config| {
+            let path = Path::new(&config.executable);
+            if !path.is_absolute()
+                || path.file_name().is_none()
+                || config.executable.ends_with('/')
+                || config.executable.len() > 4096
+                || config.executable.contains('\0')
+            {
+                return Err(serde::de::Error::custom("invalid Restic executable path"));
+            }
+            if config
+                .item_name
+                .as_ref()
+                .is_some_and(|name| name.len() > 1024)
+            {
+                return Err(serde::de::Error::custom("Restic item name is too long"));
+            }
+            config.item_id = ProviderBinding::canonical_item_id(&config.item_id)
+                .map_err(|_| serde::de::Error::custom("invalid Restic item identity"))?;
+            Ok(config)
         })
         .transpose()
 }
@@ -155,6 +199,30 @@ impl Settings {
         .map_err(|_| Error::Invalid)
     }
 
+    pub(in crate::owner) fn restic_binding(
+        &self,
+        account: &AccountBinding,
+    ) -> Result<ProviderBinding, Error> {
+        let config = self
+            .restic
+            .as_ref()
+            .filter(|config| config.enabled)
+            .ok_or(Error::Invalid)?;
+        ProviderBinding::new(
+            account.server(),
+            account.account_id(),
+            account.email(),
+            &config.item_id,
+            qm_providers::CredentialField::LoginPassword,
+            "restic-password",
+        )
+        .map_err(|_| Error::Invalid)
+    }
+
+    pub(in crate::owner) fn restic(&self) -> Option<&ResticConfig> {
+        self.restic.as_ref()
+    }
+
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > 65536 {
             return Err(Error::Invalid);
@@ -170,6 +238,9 @@ impl Settings {
                     MutationRule::Deny => PolicyDecision::Deny,
                 },
             ));
+        }
+        if self.restic().is_some_and(|restic| restic.enabled) {
+            return Ok(Policy::default().with_mutation_rule(PolicyDecision::Deny));
         }
         Err(AuthorizationError::Denied)
     }
@@ -396,6 +467,216 @@ mod tests {
         assert!(enabled == original);
         assert!(enabled.policy().is_ok());
         assert_eq!(serde_json::to_value(&enabled).unwrap(), encoded);
+    }
+
+    fn restic_settings(enabled: bool) -> serde_json::Value {
+        serde_json::json!({
+            "github": null,
+            "mutations": "requireApproval",
+            "restic": {
+                "enabled": enabled,
+                "executable": "/nix/store/example/bin/.restic-wrapped",
+                "itemId": "22222222-2222-4222-8222-222222222222",
+            }
+        })
+    }
+
+    #[test]
+    fn absent_restic_preserves_legacy_settings_bytes() {
+        let original = br#"{"github":{"version":1,"mode":"github","repositories":[{"id":123,"owner":"example","name":"one","writes":false}],"approveUnverifiedRequests":false},"mutations":"requireApproval"}"#;
+        let settings = Settings::decode(original).unwrap();
+        assert!(settings.restic().is_none());
+        assert_eq!(serde_json::to_vec(&settings).unwrap(), original);
+        let mut explicit_null: serde_json::Value = serde_json::from_slice(original).unwrap();
+        explicit_null["restic"] = serde_json::Value::Null;
+        let settings: Settings = serde_json::from_value(explicit_null).unwrap();
+        assert_eq!(serde_json::to_vec(&settings).unwrap(), original);
+    }
+
+    #[test]
+    fn disabled_restic_retains_its_selection_without_enabling_policy() {
+        for enabled in [false, true] {
+            let encoded = restic_settings(enabled);
+            let settings = Settings::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(&settings).unwrap(), encoded);
+            let config = settings.restic().unwrap();
+            assert_eq!(config.enabled, enabled);
+            assert_eq!(config.executable, "/nix/store/example/bin/.restic-wrapped");
+            assert_eq!(config.item_id, "22222222-2222-4222-8222-222222222222");
+            if enabled {
+                assert_eq!(
+                    settings.policy().unwrap().digest(),
+                    Policy::default()
+                        .with_mutation_rule(PolicyDecision::Deny)
+                        .digest()
+                );
+            } else {
+                assert!(matches!(settings.policy(), Err(AuthorizationError::Denied)));
+            }
+        }
+    }
+
+    #[test]
+    fn restic_preserves_enabled_github_policy_and_allows_disabled_github_configuration() {
+        let github_settings = rules();
+        let mut encoded = serde_json::to_value(&github_settings).unwrap();
+        encoded["restic"] = restic_settings(true)["restic"].clone();
+        let combined: Settings = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            combined.policy().unwrap().digest(),
+            github_settings.policy().unwrap().digest()
+        );
+        encoded["github"]["enabled"] = false.into();
+        let restic_only: Settings = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            restic_only.policy().unwrap().digest(),
+            Policy::default()
+                .with_mutation_rule(PolicyDecision::Deny)
+                .digest()
+        );
+        assert_eq!(serde_json::to_value(restic_only).unwrap(), encoded);
+    }
+
+    #[test]
+    fn invalid_restic_paths_and_items_are_rejected_in_settings_and_nested_commands() {
+        let invalid = [
+            ("executable", ""),
+            ("executable", "restic"),
+            ("executable", "./restic"),
+            ("executable", "~/bin/restic"),
+            ("executable", "/"),
+            ("executable", "/bin/restic/"),
+            ("executable", "/bin/restic\0"),
+            ("itemId", ""),
+            ("itemId", "not-an-item"),
+            ("itemId", "00000000-0000-0000-0000-000000000000"),
+        ];
+        for enabled in [false, true] {
+            for (field, value) in invalid {
+                let mut settings = restic_settings(enabled);
+                settings["restic"][field] = value.into();
+                assert!(
+                    Settings::decode(&serde_json::to_vec(&settings).unwrap()).is_err(),
+                    "{field}: {value:?}"
+                );
+                let command = serde_json::json!({
+                    "kind": "prepareSettings", "revision": 1,
+                    "settings": settings, "provider": {"kind": "keep"},
+                });
+                assert!(
+                    crate::owner::protocol::decode_client(&serde_json::to_vec(&command).unwrap())
+                        .is_err(),
+                    "{field}: {value:?}"
+                );
+            }
+        }
+        let mut oversized = restic_settings(true);
+        oversized["restic"]["executable"] = format!("/{}", "x".repeat(4096)).into();
+        assert!(Settings::decode(&serde_json::to_vec(&oversized).unwrap()).is_err());
+    }
+
+    #[test]
+    fn restic_requires_complete_configuration_and_canonicalises_item_identity() {
+        for field in ["enabled", "executable", "itemId"] {
+            let mut settings = restic_settings(true);
+            settings["restic"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<Settings>(settings).is_err(),
+                "{field}"
+            );
+        }
+        let mut settings = restic_settings(true);
+        settings["restic"]["executable"] = "/Applications/Backup Tools/restic".into();
+        settings["restic"]["itemId"] = "AABBCCDD-2222-4222-8222-222222222222".into();
+        let decoded: Settings = serde_json::from_value(settings).unwrap();
+        assert_eq!(
+            decoded.restic().unwrap().item_id,
+            "aabbccdd-2222-4222-8222-222222222222"
+        );
+    }
+
+    #[test]
+    fn optional_restic_item_name_preserves_legacy_encoding_and_is_bounded() {
+        let original = restic_settings(true);
+        let settings: Settings = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&settings).unwrap(), original);
+        let mut named = original.clone();
+        named["restic"]["itemName"] = "Restic backup".into();
+        let settings: Settings = serde_json::from_value(named.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&settings).unwrap(), named);
+        named["restic"]["itemName"] = "x".repeat(1025).into();
+        assert!(serde_json::from_value::<Settings>(named).is_err());
+    }
+
+    #[test]
+    fn signed_restic_selection_survives_protected_store_reload() {
+        let (key, _) = fixture();
+        let store = Store::memory();
+        let mut manager: Manager = store.register(key.public_key().as_ref()).unwrap();
+        let settings: Settings = serde_json::from_value(restic_settings(true)).unwrap();
+        let review = manager
+            .prepare(
+                7,
+                [1; 16],
+                Proposal {
+                    revision: Revision(0),
+                    settings: settings.clone(),
+                    provider: Some(pin()),
+                },
+                1_000.into(),
+                (),
+            )
+            .unwrap();
+        let challenge = manager
+            .authenticate(&review.id, 7, 1_001.into(), 1_002.into())
+            .unwrap();
+        let signature = key
+            .sign(
+                &SystemRandom::new(),
+                &BASE64.decode(challenge.bytes).unwrap(),
+            )
+            .unwrap();
+        let verified = manager
+            .approve(&review.id, 7, signature.as_ref(), 1_003.into())
+            .unwrap();
+        let admission = manager.admit(verified, 1_004.into()).unwrap();
+        manager.finish(store.publish(admission)).unwrap();
+        let restarted: Manager = store.load().unwrap().unwrap();
+        assert!(restarted.record().settings() == Some(&settings));
+        assert!(restarted.record().provider() == Some(&pin()));
+        assert_eq!(
+            restarted.policy().unwrap().digest(),
+            Policy::default()
+                .with_mutation_rule(PolicyDecision::Deny)
+                .digest()
+        );
+    }
+
+    #[test]
+    fn settings_review_revalidates_directly_constructed_restic_configuration() {
+        for invalid_item in [false, true] {
+            let (_, mut manager) = fixture();
+            let mut settings: Settings = serde_json::from_value(restic_settings(false)).unwrap();
+            let config = settings.restic.as_mut().unwrap();
+            if invalid_item {
+                config.item_id = "not-an-item".into();
+            } else {
+                config.executable = "restic".into();
+            }
+            let review = manager.prepare(
+                7,
+                [1; 16],
+                Proposal {
+                    revision: Revision(0),
+                    settings,
+                    provider: Some(pin()),
+                },
+                1_000.into(),
+                (),
+            );
+            assert!(matches!(review, Err(Error::Invalid)));
+            assert!(manager.idle());
+        }
     }
 
     #[test]

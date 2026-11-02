@@ -192,7 +192,9 @@ pub(super) enum Reply {
     Review {
         approval: ApprovalReview,
     },
-
+    HandoffReview {
+        approval: ApprovalReview,
+    },
     Challenge {
         authorization: ApprovalChallenge,
     },

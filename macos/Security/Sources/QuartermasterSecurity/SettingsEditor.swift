@@ -39,7 +39,7 @@ public final class SettingsEditor: ObservableObject {
     }
 
     public enum Failure: LocalizedError {
-        case unverifiedEnrollment, noChanges, invalidGitHubCredential,
+        case unverifiedEnrollment, noChanges, invalidResticSelection, invalidGitHubCredential,
             stagedCatalogueUnavailable
         public var errorDescription: String? {
             switch self {
@@ -47,6 +47,7 @@ public final class SettingsEditor: ObservableObject {
                 "Item names are unavailable for this vault draft. You can still save the vault connection."
             case .unverifiedEnrollment: "Vault details changed. Log in again before reviewing changes."
             case .noChanges: "There are no changes to review."
+            case .invalidResticSelection: "Choose a native Restic binary and a valid vault login item UUID."
             case .invalidGitHubCredential: "Choose the vault login item containing the GitHub token."
             }
         }
@@ -110,7 +111,7 @@ public final class SettingsEditor: ObservableObject {
 
     public var canReview: Bool {
         available && !busy && snapshot?.migration == nil && !enrollmentNeedsVerification && hasChanges
-            && draft.githubCredential?.validationMessage == nil
+            && draft.restic?.validationMessage == nil && draft.githubCredential?.validationMessage == nil
     }
     public var canImport: Bool { available && !busy && snapshot?.migration?.source.supported == true }
     public var canDiscard: Bool {
@@ -122,6 +123,14 @@ public final class SettingsEditor: ObservableObject {
         set {
             if draft.github == nil && newValue { draft.github = GitHubSettings() }
             draft.github?.enabled = newValue
+        }
+    }
+
+    public var resticEnabled: Bool {
+        get { draft.restic?.enabled == true }
+        set {
+            if draft.restic == nil && newValue { draft.restic = ResticSettings() }
+            draft.restic?.enabled = newValue
         }
     }
 
@@ -174,6 +183,14 @@ public final class SettingsEditor: ObservableObject {
         draft.githubCredential = GitHubCredential(itemId: item.id, itemName: item.name)
     }
 
+    public func selectResticItem(_ item: VaultItemSummary) {
+        guard acceptsItem(item) else { return }
+        var restic = draft.restic ?? ResticSettings(enabled: false)
+        restic.itemId = item.id
+        restic.itemName = item.name
+        draft.restic = restic
+    }
+
     public func load() async {
         await perform {
             let generation = generation
@@ -224,6 +241,7 @@ public final class SettingsEditor: ObservableObject {
         guard !busy, available, let snapshot, snapshot.migration == nil else { throw BrokerControlError.busy }
         guard !enrollmentNeedsVerification else { throw Failure.unverifiedEnrollment }
         guard hasChanges else { throw Failure.noChanges }
+        guard draft.restic?.validationMessage == nil else { throw Failure.invalidResticSelection }
         guard draft.githubCredential?.validationMessage == nil else { throw Failure.invalidGitHubCredential }
         return try await prepareReview(
             .prepareSettings(

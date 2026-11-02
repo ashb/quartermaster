@@ -15,10 +15,12 @@ swift_library(
     srcs = [
         "BrokerApplication.swift",
         "BrokerConnection.swift",
+        "BrokerHandoffPending.swift",
         "PreferencesLayout.swift",
         "PreferencesView.swift",
         "PreferencesWindowLifecycle.swift",
         "QuartermasterApp.swift",
+        "ResticPreferencesView.swift",
         "SettingsMigrationView.swift",
         "VaultItemPicker.swift",
         "VaultLoginForm.swift",

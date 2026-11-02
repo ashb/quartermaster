@@ -23,6 +23,14 @@ private enum CaptureFailure: Error {
 }
 
 private final class DocumentationClient: BrokerClient, Sendable {
+    private let fresh: Bool
+    private let acceptsLogin: Bool
+
+    init(fresh: Bool = false, acceptsLogin: Bool = false) {
+        self.fresh = fresh
+        self.acceptsLogin = acceptsLogin
+    }
+
     let disconnected = false
     func cancel() {}
 
@@ -32,9 +40,17 @@ private final class DocumentationClient: BrokerClient, Sendable {
         case .enroll: return .enrolled
         case .next: return .idle
         case .readGrants: return .readGrants([])
-        case .settingsRegister, .settingsStatus: return .settingsStatus(try Self.snapshot())
+        case .settingsRegister, .settingsStatus: return .settingsStatus(try Self.snapshot(fresh: fresh))
+        case .stageEnrollment:
+            guard fresh, acceptsLogin else { throw BrokerControlError.invalidCredentials }
+            let configured = try Self.snapshot()
+            return .enrollmentStaged(ticket: "documentation-ticket", provider: try Self.provider(configured))
         case .settingsCancel: return .canceled
         case .vaultStatus:
+            if fresh {
+                return .vaultStatus(
+                    try JSONDecoder().decode(BrokerVaultStatus.self, from: Data(#"{"state":"unenrolled"}"#.utf8)))
+            }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .secondsSince1970
             return .vaultStatus(
@@ -52,8 +68,18 @@ private final class DocumentationClient: BrokerClient, Sendable {
         "account_id": "11111111-1111-4111-8111-111111111111",
     ]
 
-    private static func snapshot() throws -> SettingsSnapshot {
-        try JSONDecoder().decode(
+    private static func provider(_ snapshot: SettingsSnapshot) throws -> SettingsProvider {
+        guard let provider = snapshot.provider else { throw CaptureFailure.unexpectedOperation }
+        return provider
+    }
+
+    private static func snapshot(fresh: Bool = false) throws -> SettingsSnapshot {
+        if fresh {
+            return SettingsSnapshot(
+                state: "unconfigured", revision: 0, session: Data(repeating: 1, count: 16), settings: nil,
+                provider: nil, migration: nil)
+        }
+        return try JSONDecoder().decode(
             SettingsSnapshot.self,
             from: JSONSerialization.data(withJSONObject: [
                 "state": "configured", "revision": 5,
@@ -161,9 +187,46 @@ private final class DocumentationClient: BrokerClient, Sendable {
         apiRequest: try APIRequestReview.parse(request: bytes), readScope: try ReadScopeReview.parse(request: bytes))
 }
 
+@MainActor private func handoffSample() throws -> CredentialHandoffRequest {
+    let rex =
+        NSHomeDirectory()
+        + "/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex"
+    let shim =
+        Bundle.main.url(forAuxiliaryExecutable: "qm")?.path ?? "/Applications/Quartermaster.app/Contents/MacOS/qm"
+    let fields: [String: Any] = [
+        "kind": "credentialHandoff", "tool": "restic", "credentialName": "Restic",
+        "recipient": [
+            "pid": 1202, "execution": "sample-execution", "executable": "/nix/store/example-restic/bin/.restic-wrapped",
+            "requirement": "sample-code-requirement",
+        ],
+        "command": [
+            "/nix/store/example-restic/bin/.restic-wrapped", "--repo", "/tmp/quartermaster-demo", "backup",
+            "/tmp/example-data",
+        ],
+        "workingDirectory": "/Users/example/code/quartermaster",
+        "requester": [
+            "pid": 1201, "executable": shim, "signingIdentifier": "qm", "cdHash": "sample", "adHoc": false,
+            "ancestryComplete": true,
+            "commandLine": "qm run restic -- --repo /tmp/quartermaster-demo backup /tmp/example-data",
+            "processes": [
+                ["pid": 1100, "name": "rex", "executable": rex, "limited": false],
+                ["pid": 1199, "name": "login", "executable": "/usr/bin/login", "limited": false],
+                ["pid": 1200, "name": "zsh", "executable": "/bin/zsh", "limited": false],
+            ],
+        ],
+        "provider": [
+            "server": "https://vault.example.invalid", "account": "sample", "email": "demo@example.invalid",
+            "item": "sample", "field": "LoginPassword", "role": "restic-password", "enrollment": "sample",
+            "generation": 1,
+        ],
+        "created": MonotonicTimestamp.now.serializedNanoseconds, "operationId": "sample",
+    ]
+    return try JSONDecoder().decode(CredentialHandoffRequest.self, from: JSONSerialization.data(withJSONObject: fields))
+}
+
 @MainActor private func render(
     _ view: some View, size: NSSize?, title: String, to output: URL,
-    floating: Bool = false, settling: Duration = .milliseconds(500), prepare: () -> Void = {},
+    floating: Bool = false, bitmap: Bool = false, settling: Duration = .milliseconds(500), prepare: () -> Void = {},
     validate: () throws -> Void = {}
 ) async throws {
     let content = view.environment(\.locale, Locale(identifier: "en_GB"))
@@ -190,6 +253,16 @@ private final class DocumentationClient: BrokerClient, Sendable {
     prepare()
     try await Task.sleep(for: .milliseconds(100))
     window.contentView?.layoutSubtreeIfNeeded()
+    if bitmap {
+        guard let view = window.contentView,
+            let image = view.bitmapImageRepForCachingDisplay(in: view.bounds)
+        else { throw CaptureFailure.rendering }
+        view.cacheDisplay(in: view.bounds, to: image)
+        guard let data = image.representation(using: .png, properties: [:]) else { throw CaptureFailure.rendering }
+        try data.write(to: output, options: .atomic)
+        print(output.lastPathComponent)
+        return
+    }
     let shareable = try await SCShareableContent.currentProcess
     guard let captured = shareable.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else {
         throw CaptureFailure.rendering
@@ -220,9 +293,12 @@ private final class DocumentationClient: BrokerClient, Sendable {
 
     @MainActor private static func capture() async throws {
         guard CommandLine.arguments.count == 3,
-            ["--settings-only", "--authentication-ui"].contains(CommandLine.arguments[2])
+            ["--settings-only", "--authentication-ui", "--handoff-preview", "--vault-pane-preview"].contains(
+                CommandLine.arguments[2])
         else {
-            print("Usage: DocumentationScreenshots OUTPUT (--settings-only | --authentication-ui)")
+            print(
+                "Usage: DocumentationScreenshots OUTPUT (--settings-only | --authentication-ui | --handoff-preview | --vault-pane-preview)"
+            )
             print("--authentication-ui briefly shows and cancels a real Touch ID prompt. Do not touch the reader.")
             throw CaptureFailure.usage
         }
@@ -240,6 +316,32 @@ private final class DocumentationClient: BrokerClient, Sendable {
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
         app.appearance = NSAppearance(named: .darkAqua)
+        if CommandLine.arguments[2] == "--vault-pane-preview" {
+            try await vaultPanePreview(output)
+            return
+        }
+        if CommandLine.arguments[2] == "--handoff-preview" {
+            let request = try handoffSample()
+            let controller = ApprovalController(unlock: InertUnlock(), reason: "Inert documentation preview")
+            guard controller.supersedeReview() else { throw CaptureFailure.unexpectedOperation }
+            for expanded in [false, true] {
+                try await render(
+                    VStack(spacing: 0) {
+                        CredentialHandoffView(
+                            request: request, controller: controller, close: {}, showsDetails: expanded)
+                        Text("Preview · sample data · authentication inactive")
+                            .font(.caption).foregroundStyle(.secondary).padding(.bottom, 16)
+                    },
+                    size: nil, title: "Restic approval preview",
+                    to: output.appendingPathComponent(expanded ? "restic-expanded.png" : "restic-approval.png"),
+                    floating: true)
+            }
+            try await render(
+                CredentialHandoffDetails(request: request), size: NSSize(width: 660, height: 520),
+                title: "Full request",
+                to: output.appendingPathComponent("restic-full-request.png"))
+            return
+        }
         if CommandLine.arguments[2] == "--authentication-ui" {
             let controller = ApprovalController(
                 unlock: InertUnlock(), reason: "Capture Quartermaster documentation; do not authenticate")
@@ -310,4 +412,42 @@ private final class DocumentationClient: BrokerClient, Sendable {
             to: output.appendingPathComponent("settings-vault-edit.png"),
             prepare: { application.preferences.draft.mutations = .deny })
     }
+    @MainActor private static func vaultPanePreview(_ output: URL) async throws {
+        for stage in ["initial", "error", "ready"] {
+            let application = BrokerApplication(
+                setActivationPolicy: { _ in },
+                openConnection: { DocumentationClient(fresh: true, acceptsLogin: stage == "ready") },
+                loadApprovalKey: { Data(repeating: 1, count: 65) },
+                acquirePresentation: { throw CaptureFailure.unexpectedOperation })
+            application.reconnect()
+            for _ in 0..<100 where !application.preferences.available { try await Task.sleep(for: .milliseconds(10)) }
+            guard application.preferences.available else { throw CaptureFailure.connectionTimeout }
+            var draft = application.preferences.enrollment
+            draft.server = "https://vault.example.com"
+            draft.email = "ash@example.com"
+            if stage != "initial" {
+                await application.preferences.enroll(password: "documentation-only", replacement: draft)
+            }
+            if stage == "error" {
+                try await render(
+                    PreferencesGroup(title: "Connect your vault") {
+                        VaultLoginForm(
+                            editor: application.preferences, application: application,
+                            draft: .constant(draft), password: .constant("documentation-only"), cancel: nil)
+                    }
+                    .padding(24).frame(width: 660, height: 310, alignment: .topLeading)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .tint(ApprovalAppearance.accent).luminareTint(overridingWith: ApprovalAppearance.accent)
+                    .luminareCornerRadius(12).luminareMinHeight(24),
+                    size: NSSize(width: 660, height: 310), title: "Vault login",
+                    to: output.appendingPathComponent("vault-login-error.png"), bitmap: true)
+            } else {
+                try await render(
+                    PreferencesView(editor: application.preferences, application: application),
+                    size: NSSize(width: 880, height: 540), title: "Quartermaster",
+                    to: output.appendingPathComponent("vault-\(stage).png"), bitmap: true)
+            }
+        }
+    }
+
 }

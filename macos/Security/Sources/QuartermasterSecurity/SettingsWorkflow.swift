@@ -64,10 +64,35 @@ public struct GitHubCredential: Codable, Equatable, Sendable {
     }
 }
 
+public struct ResticSettings: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    public var executable: String
+    public var itemId: String
+    public var itemName: String?
+
+    public init(enabled: Bool = true, executable: String = "", itemId: String = "", itemName: String? = nil) {
+        self.enabled = enabled
+        self.executable = executable
+        self.itemId = itemId
+        self.itemName = itemName
+    }
+
+    public var validationMessage: String? {
+        guard executable.hasPrefix("/"), !executable.hasSuffix("/"), executable.utf8.count <= 4096,
+            !executable.contains("\0")
+        else { return "Choose an absolute path to the native Restic binary." }
+        guard let item = UUID(uuidString: itemId), item.uuidString != "00000000-0000-0000-0000-000000000000" else {
+            return "Enter the UUID of the vault login item containing the Restic password."
+        }
+        return nil
+    }
+}
+
 public struct BrokerSettings: Codable, Equatable, Sendable {
     public enum MutationRule: String, Codable, Sendable { case requireApproval, deny }
     public var github: GitHubSettings?
     public var githubCredential: GitHubCredential?
+    public var restic: ResticSettings?
     public var mutations: MutationRule = .requireApproval
 
     public init() {}

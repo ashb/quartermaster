@@ -33,16 +33,6 @@ use. Types prevent accidental misuse, not deliberately malicious broker code.
 
 ## Settings authority
 
-A console-counter change revokes every approval, native settings context and
-pending unlock. An enrolment may survive only as an inactive encrypted draft:
-its exact cache identity and ticket confer no provider authority. Its warm
-snapshot is discarded, including when login completes after the change. A fresh
-review must capture that same encrypted source and require authenticated native
-presence before unwrapping it. Explicit cancellation, UI disconnect, vault lock,
-screen lock, sleep, wake, inactivity and logout discard the reservation and draft.
-Login completion belongs to its original reservation, settings session, record
-revision and provider generation; stale completion cannot consume a newer login.
-
 Rust owns the approved settings revision, vault selection and UI approval-key pin
 as one record in its exact Data Protection Keychain group, without file-backed
 authority. Editable cache metadata selects neither policy nor enrolment.
@@ -89,6 +79,14 @@ provider generation prevents selection and releases pending plaintext. Importing
 a previous selection freezes its slot, binding and key identity, rejects cache
 substitution and requires authenticated unwrap. Orphan cache files cannot select
 an enrolment or initiate a settings import.
+An inactive enrolment descriptor grants no authority. Console-generation changes
+cancel every prepared approval and discard any warm enrolment snapshot, while
+an ongoing login or encrypted descriptor may remain available for a new review.
+The requesting connection, draft revision, account and cache identity must still
+match. A new review authenticates and unwraps the cold cache before selection;
+old contexts and proofs cannot be reused. Explicit cancellation, disconnection,
+and delivered lock, sleep or logout events invalidate the login reservation and
+descriptor as well.
 Opening settings or reviewing drafts never arms authentication; the user chooses
 Save Changes before Touch ID authorizes publication.
 
@@ -391,6 +389,27 @@ read-only upstream permissions, which a credential role label cannot attest.
 Approval cannot freeze upstream state, mutable names or credential permissions,
 and unfamiliar effects remain unverified after approval.
 
+## Approval presentation and queuing
+
+Show one approval at a time. Queue concurrent requests without replacing,
+covering or changing the active review. Otherwise a fingerprint intended for
+one operation could authorise a different operation presented just before contact.
+This applies across mediated requests, credential release, settings and vault
+operations.
+
+Bind each authentication context, nonce and proof to its own frozen review.
+Queued work cannot authenticate or inherit another review's successful presence.
+Invalidate the previous context and reject its late callbacks before allowing
+another review to authenticate. A queued request waits until the current dialog
+closes. Timeout alone must not replace an open dialog. Once presented, the new
+review shows native Touch ID directly, without an extra button to enable it.
+
+Bound queue length and waiting time. Drop disconnected, cancelled or expired
+requests; recheck caller, policy and credential selection when admitting a queued
+request for review. Queue progression cannot extend an issued review's deadline
+or the 30-second lifetime after authentication. Queue overflow must return a
+useful busy response rather than silently dropping a caller.
+
 ## Keep authority narrow and short-lived
 
 Approvals are request-bound, expiring and single-use. Mediated request approvals
@@ -620,10 +639,10 @@ Keychain isolation requires attended OS checks that each signed role receives
 `errSecMissingEntitlement` for the other's group. Unit tests establish neither
 that OS boundary nor signing-key isolation.
 
-## Credential handoff (planned)
+## Credential handoff
 
 Host-configured credential handoff may authorize an unmediated tool to receive
-a selected credential in its environment, trading request enforcement for
+a selected credential, trading request enforcement for
 compatibility. A failed or unfamiliar mediated request never triggers it automatically.
 
 Authorize the verified recipient, selected provider/account/item/field and
@@ -637,9 +656,46 @@ restrict subsequent requests or retract copies; release-grant expiry and process
 exit do not expire credentials. Further limits need upstream scope, expiry or
 revocation. Strict profiles prohibiting export deny handoff.
 
-Account enrolment can expose bounded authenticated item UUID/name metadata for
-choosing a tool credential before publication. The catalogue belongs to its
-login ticket and account, conveys no credential authority and is discarded when
-the draft is replaced, cancelled or disconnected. A failed or oversized catalogue
-is unavailable metadata, not failed account authentication or an empty vault.
-Selecting an item still requires signed settings review before use.
+Restic receives its repository password through a private inherited pipe. The
+broker launches the host-configured native executable with a cleared environment;
+the requesting CLI receives only output and exit status. The initial integration
+supports local repositories and requires an online vault. Selecting a
+Restic item does not replace GitHub's selected item or create a second vault
+session.
+
+The authenticated settings UI may list selectable login-item names and UUIDs from
+the unlocked vault. Names are authenticated with each item's key; this lookup
+returns no passwords and does not change the selected item. Successful account
+staging may return the same bounded, authenticated UUID/name catalogue with its
+inactive ticket and account binding. Catalogue availability is explicit: exceeding
+item-count or encoded reply-size bounds leaves the account staged with no picker
+metadata. The picker reports that limitation; it cannot report an empty catalogue
+or make account enrolment depend on selecting an item.
+The UI retains available metadata only in that settings
+draft; replacement, edited account details, discard and disconnection remove it.
+A console-generation change may discard Rust's warm snapshot without discarding
+this inert metadata. Selecting an item creates no credential or operation
+authority; publication still requires a fresh signed settings review and the
+original staged cache identity checks and authenticated unwrap when cold.
+Saving the selection
+still requires signed settings approval.
+
+Mediated requests and handoffs share the approval lifecycle. The same native
+authentication unlocks a cold vault and signs the release; provider I/O cannot
+extend its deadline. The frozen item UUID selects the credential. Its display name
+is retained in signed settings when chosen from the vault.
+
+Each release requires fresh approval of the item binding,
+recipient execution, command and working directory. Arguments describe the launch;
+they do not establish read-only access. The broker checks the requester, settings
+revision, provider generation, cache identity, UI session and approval deadline
+again immediately before release. Recipient checks bind the owned child to its
+uid, kernel process identity, exec generation, parent and code requirement.
+Exec, exit or lost monitoring invalidates that recipient permanently.
+
+Release consumes its authority before a single bounded, nonblocking pipe write.
+Cancellation or disconnection before admission closes the pipe and terminates the
+child. An uncertain write cannot be retried. Native process transitions can race
+an already admitted write, as with mediated dispatch. After release, QM cannot
+prevent Restic from retaining or exporting the password or decrypted repository
+keys. This is credential access, not approval of individual backup operations.

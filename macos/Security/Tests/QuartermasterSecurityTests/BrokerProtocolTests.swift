@@ -136,7 +136,7 @@ private func brokerTimestamp(_ nanoseconds: UInt64) throws -> MonotonicTimestamp
             kind = "vaultUnlockReview"
             #expect(review.revision == 4)
             #expect(review.provider.binding.email == "dummy@example.invalid")
-        case .vaultItems, .settingsStatus, .settingsReview, .settingsChallenge, .enrollmentStaged,
+        case .vaultItems, .handoffReview, .settingsStatus, .settingsReview, .settingsChallenge, .enrollmentStaged,
             .settingsApplied:
             Issue.record("Unexpected settings reply in the operation fixture")
             kind = "unexpectedSettings"

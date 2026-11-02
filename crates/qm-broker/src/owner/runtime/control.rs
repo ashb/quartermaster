@@ -51,7 +51,7 @@ pub(super) fn handle(
             let document = crate::owner::review::ReviewDocument::new(
                 state.operations.request(id, &pending.principal)?.clone(),
                 state.operations.grant_claims(id, &pending.principal)?,
-                pending.request.context().clone(),
+                pending.http()?.request.context().clone(),
             )?;
             state
                 .operations
@@ -59,7 +59,7 @@ pub(super) fn handle(
             state
                 .operations
                 .begin_approval(id, &pending.principal, &ui.session)?;
-            pending.request = document;
+            pending.http_mut()?.request = document;
             Ok(Reply::Review {
                 approval: pending.review(
                     ui,
@@ -136,6 +136,7 @@ pub(super) fn handle(
             state.ui = Some(UiSession {
                 session,
                 connection: None,
+                peer: None,
             });
             Ok(Reply::Enrolled)
         }
@@ -148,6 +149,11 @@ pub(super) fn handle(
                 return Ok(Reply::Idle);
             };
             pending.delivered = true;
+            if let approval::ApprovalAction::Handoff(handoff) = &pending.action {
+                return Ok(Reply::HandoffReview {
+                    approval: handoff.wire.clone(),
+                });
+            }
             Ok(Reply::Review {
                 approval: pending.review(
                     ui,
@@ -158,9 +164,31 @@ pub(super) fn handle(
                 ),
             })
         }
+
         Client::Presence { .. } => Err(Error::State(Fault::NativeContextRequired)),
         Client::Proof { id, signature } => approval::proof(&id, &BASE64.decode(signature)?, state),
         Client::Cancel { id } => {
+            if state
+                .admitted_approval
+                .as_ref()
+                .is_some_and(|(admitted, session)| {
+                    admitted == &id
+                        && state
+                            .ui
+                            .as_ref()
+                            .is_some_and(|ui| ui.session.id() == *session)
+                })
+            {
+                return Ok(Reply::AlreadyAdmitted);
+            }
+            if state
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.id.to_string() == id && p.handoff().is_ok())
+            {
+                state.cancel_pending();
+                return Ok(Reply::Canceled);
+            }
             let result = match (OperationId::parse(&id), state.ui.as_ref()) {
                 (Ok(id), Some(ui)) => state.operations.cancel_interactive(id, ui.session.id()),
                 _ => CancellationResult::UnknownOperation,
@@ -411,13 +439,24 @@ pub(super) fn handle_event(
         });
         return Ok(ipc::Response::Deferred(receive));
     }
-    let result = request
-        .and_then(|request| process_message(request, context.as_ref(), &connection, shared, paths));
+    let result = request.and_then(|request| {
+        process_message(
+            request,
+            context.as_ref(),
+            &connection,
+            shared,
+            paths,
+            runtime,
+        )
+    });
     if result.is_err() {
         connection.release_context();
     }
     shared.1.notify_all();
-    encode_result(result).map(Into::into)
+    match result {
+        Ok(response) => Ok(response),
+        Err(error) => encode_result(Err(error)).map(Into::into),
+    }
 }
 
 pub(super) fn encode_result(result: Result<Reply>) -> Result<Vec<u8>> {
@@ -433,7 +472,8 @@ fn process_message(
     connection: &ipc::Connection<'_>,
     shared: &Shared,
     paths: &ServicePaths,
-) -> Result<Reply> {
+    runtime: &tokio::runtime::Handle,
+) -> Result<ipc::Response> {
     {
         let mut state = shared
             .0
@@ -452,9 +492,15 @@ fn process_message(
     }
     match request {
         Client::Presence { id, authenticated } => match context {
-            Some(context) => {
-                approval::native_presence(&id, authenticated, context, connection, shared, paths)
-            }
+            Some(context) => approval::native_presence(
+                &id,
+                authenticated,
+                context,
+                connection,
+                shared,
+                paths,
+                runtime,
+            ),
             None => Err(Error::State(Fault::NativeContextRequired)),
         },
         request if context.is_none() => {
@@ -462,12 +508,13 @@ fn process_message(
                 .0
                 .lock()
                 .map_err(|_| Error::State(Fault::StateUnavailable))?;
-            plain_message(
+            encode_result(plain_message(
                 request,
                 &connection.handle(),
                 &mut state,
                 &Err(crate::owner::policy::AuthorizationError::InvalidPolicy),
-            )
+            ))
+            .map(Into::into)
         }
         _ => Err(Error::State(Fault::UnexpectedContext)),
     }
@@ -491,6 +538,7 @@ fn plain_message(
     let reply = handle(request, state, policy);
     if enrollment && reply.is_ok() {
         state.ui.as_mut().unwrap().connection = Some(connection.id());
+        state.ui.as_mut().unwrap().peer = Some(connection.clone());
     }
     reply
 }
@@ -552,7 +600,7 @@ mod tests {
                 "github-write",
             )
             .unwrap();
-        let mut context = pending.request.context().clone();
+        let mut context = pending.http().unwrap().request.context().clone();
         context.read_roots = requirement.root_choices();
         let claims = requirement.grant_claims();
         let id = state
@@ -578,7 +626,7 @@ mod tests {
             .begin_approval(id, &pending.principal, &state.ui.as_ref().unwrap().session)
             .unwrap();
         pending.id = id;
-        pending.request = document;
+        pending.http_mut().unwrap().request = document;
         pending.delivered = false;
         state.pending = Some(pending);
         let shared = Arc::new((Mutex::new(state), Condvar::new()));

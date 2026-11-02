@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "macos", test))]
 mod approval_queue;
 #[cfg(target_os = "macos")]
 mod maintenance;
@@ -11,6 +12,7 @@ mod review;
 mod runtime;
 #[cfg(any(target_os = "macos", test))]
 mod settings;
+#[cfg(any(target_os = "macos", test))]
 mod signing;
 #[cfg(target_os = "macos")]
 mod vault;
@@ -82,6 +84,7 @@ pub(super) fn persisted_status(options: ServiceOptions) -> Result<CacheStatus, S
         Err(ServiceError::UnsupportedPlatform)
     }
 }
+
 pub(super) fn reset_settings(options: ServiceOptions) -> Result<(), ServiceError> {
     #[cfg(target_os = "macos")]
     {
