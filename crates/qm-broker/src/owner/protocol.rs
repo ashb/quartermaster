@@ -242,6 +242,9 @@ pub(super) enum ControlError {
     ProviderChanged,
     SessionEnded,
     Unavailable,
+    InvalidCredentials,
+    MfaRequired,
+    ServerUnavailable,
 }
 
 impl fmt::Display for ControlError {
@@ -254,6 +257,9 @@ impl fmt::Display for ControlError {
             Self::ProviderChanged => "provider selection changed",
             Self::SessionEnded => "authorization session ended",
             Self::Unavailable => "service unavailable",
+            Self::InvalidCredentials => "vault credentials rejected",
+            Self::MfaRequired => "additional vault authentication required",
+            Self::ServerUnavailable => "vault server unavailable",
         })
     }
 }

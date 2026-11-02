@@ -65,7 +65,7 @@ impl MigrationReview {
             return Err(Fault::Canceled.into());
         }
         if state.pending.is_some()
-            || state.administration.staging
+            || state.administration.staging.is_some()
             || state.administration.registering
         {
             return Err(ControlError::Busy.into());

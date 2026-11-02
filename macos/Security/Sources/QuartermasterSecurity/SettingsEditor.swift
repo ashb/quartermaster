@@ -231,6 +231,11 @@ public final class SettingsEditor: ObservableObject {
     }
 
     public func cancel() async {
+        if busy {
+            discardDraft()
+            _ = try? await call(.settingsCancel(id: nil))
+            return
+        }
         await perform {
             let generation = generation
             let reply = try await call(.settingsCancel(id: nil))
@@ -329,6 +334,12 @@ public final class SettingsEditor: ObservableObject {
                 case .vaultLogin:
                     let detail: String
                     switch error as? BrokerControlError {
+                    case .invalidCredentials:
+                        detail = "The email or master password wasn’t accepted. Check them and try again."
+                    case .mfaRequired:
+                        detail = "This vault requires additional authentication that Quartermaster doesn’t support yet."
+                    case .serverUnavailable:
+                        detail = "Could not reach the vault server. Check its address and your connection."
                     case .denied:
                         detail = "Could not log in. Quartermaster refused the request; reconnect and try again."
                     default:

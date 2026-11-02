@@ -70,6 +70,24 @@ private func editorProvider(
     #expect(!editor.busy)
 }
 
+@Test(arguments: ["invalidCredentials", "mfaRequired", "serverUnavailable"])
+@MainActor func vaultLoginFailuresExplainWhatTheUserCanCorrect(_ reason: String) async {
+    let snapshot = editorSnapshot()
+    let editor = SettingsEditor { command in
+        if case .stageEnrollment = command { throw BrokerControlError(rawValue: reason) ?? .unavailable }
+        return .settingsStatus(snapshot)
+    }
+    await editor.load()
+    await editor.enroll(password: "dummy-password")
+    switch reason {
+    case "invalidCredentials": #expect(editor.vaultLoginError?.contains("password") == true)
+    case "mfaRequired": #expect(editor.vaultLoginError?.contains("additional authentication") == true)
+    default: #expect(editor.vaultLoginError?.contains("reach") == true)
+    }
+    #expect(editor.message.isEmpty)
+    #expect(!editor.busy)
+}
+
 @Test(arguments: ["settings", "enrolment", "whitespace", "forget", "staged"])
 @MainActor func discardIsAvailableOnlyWhileThereAreDraftChanges(_ change: String) async throws {
     let provider = editorProvider()
@@ -457,6 +475,38 @@ private func editorProvider(
     #expect(editor.stagedProvider == nil)
     #expect(cancellations == 1)
     #expect(!editor.canReview)
+    #expect(editor.message.isEmpty)
+}
+
+@Test(arguments: [true, false]) @MainActor
+func cancelDuringEnrollmentRevokesTheReservationBeforeTheLoginReturns(_ succeeds: Bool) async {
+    let snapshot = editorSnapshot(provider: editorProvider())
+    var login: CheckedContinuation<BrokerReply, any Error>?
+    var cancellations = 0
+    let editor = SettingsEditor { command in
+        switch command {
+        case .stageEnrollment: return try await withCheckedThrowingContinuation { login = $0 }
+        case .settingsCancel:
+            cancellations += 1
+            return .canceled
+        default: return .settingsStatus(snapshot)
+        }
+    }
+    await editor.load()
+    let pending = Task { await editor.enroll(password: "dummy-password") }
+    while login == nil { await Task.yield() }
+    await editor.cancel()
+    #expect(cancellations == 1)
+    #expect(editor.busy)
+    if succeeds {
+        login?.resume(returning: .enrollmentStaged(ticket: "obsolete", provider: editorProvider()))
+    } else {
+        login?.resume(throwing: BrokerControlError.invalidCredentials)
+    }
+    await pending.value
+    #expect(!editor.busy)
+    #expect(editor.stagedProvider == nil)
+    #expect(editor.vaultLoginError == nil)
     #expect(editor.message.isEmpty)
 }
 

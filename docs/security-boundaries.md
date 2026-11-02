@@ -33,6 +33,16 @@ use. Types prevent accidental misuse, not deliberately malicious broker code.
 
 ## Settings authority
 
+A console-counter change revokes every approval, native settings context and
+pending unlock. An enrolment may survive only as an inactive encrypted draft:
+its exact cache identity and ticket confer no provider authority. Its warm
+snapshot is discarded, including when login completes after the change. A fresh
+review must capture that same encrypted source and require authenticated native
+presence before unwrapping it. Explicit cancellation, UI disconnect, vault lock,
+screen lock, sleep, wake, inactivity and logout discard the reservation and draft.
+Login completion belongs to its original reservation, settings session, record
+revision and provider generation; stale completion cannot consume a newer login.
+
 Rust owns the approved settings revision, vault selection and UI approval-key pin
 as one record in its exact Data Protection Keychain group, without file-backed
 authority. Editable cache metadata selects neither policy nor enrolment.

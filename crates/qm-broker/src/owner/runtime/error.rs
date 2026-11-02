@@ -168,6 +168,15 @@ impl From<Error> for ControlError {
             Error::Protocol(code) => code,
             Error::Credential(error) => error.into(),
             Error::Vault(vault::Error::Lifecycle(error)) => error.into(),
+            Error::Vault(vault::Error::Provider(
+                qm_providers::ProviderError::InvalidCredentials,
+            )) => Self::InvalidCredentials,
+            Error::Vault(vault::Error::Provider(qm_providers::ProviderError::MfaUnsupported)) => {
+                Self::MfaRequired
+            }
+            Error::Vault(vault::Error::Provider(
+                qm_providers::ProviderError::ServerUnavailable,
+            )) => Self::ServerUnavailable,
             Error::Vault(vault::Error::StorageBusy) => Self::Busy,
             Error::State(Fault::ApprovalExpired) => Self::Expired,
             Error::State(Fault::ProviderChanged | Fault::ApprovalKeyChanged) => {
@@ -287,6 +296,24 @@ mod tests {
     #[test]
     fn structured_failures_retain_their_wire_categories() {
         for (error, expected) in [
+            (
+                Error::Vault(vault::Error::Provider(
+                    qm_providers::ProviderError::InvalidCredentials,
+                )),
+                ControlError::InvalidCredentials,
+            ),
+            (
+                Error::Vault(vault::Error::Provider(
+                    qm_providers::ProviderError::MfaUnsupported,
+                )),
+                ControlError::MfaRequired,
+            ),
+            (
+                Error::Vault(vault::Error::Provider(
+                    qm_providers::ProviderError::ServerUnavailable,
+                )),
+                ControlError::ServerUnavailable,
+            ),
             (
                 Error::Provider(provider_lifecycle::Error::Busy),
                 ControlError::Busy,

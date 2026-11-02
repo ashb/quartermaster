@@ -226,6 +226,10 @@ impl OwnerState {
 
     pub(super) fn disconnect_ui(&mut self) {
         self.administration.cancel_changes();
+        self.disconnect_approval_ui();
+    }
+
+    fn disconnect_approval_ui(&mut self) {
         if let Some(ui) = self.ui.take() {
             self.operations.cancel_interactive_session(ui.session.id());
         }
@@ -255,7 +259,12 @@ impl OwnerState {
         }
         self.authorizer.revoke_approvals();
         self.operations.cancel_approvals();
-        self.disconnect_ui();
+        if event == HostSessionEvent::ConsoleChange {
+            self.administration.console_changed();
+            self.disconnect_approval_ui();
+        } else {
+            self.disconnect_ui();
+        }
         self.provider.cancel_pending();
         Ok(())
     }

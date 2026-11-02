@@ -82,7 +82,7 @@ impl Binding {
 fn ensure_idle(state: &OwnerState) -> Result<()> {
     let admin = &state.administration;
     if state.pending.is_some()
-        || admin.staging
+        || admin.staging.is_some()
         || admin.registering
         || admin.unlock.is_some()
         || !admin

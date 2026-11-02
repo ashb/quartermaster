@@ -60,18 +60,23 @@ pub(super) fn prepare(
     paths: &ServicePaths,
 ) -> Result<Reply> {
     let reply = super::prepare(revision, settings, provider, peer, shared)?;
-    if additions.is_empty() {
-        return Ok(reply);
-    }
     let Reply::SettingsReview { review } = reply else {
         return Err(ControlError::Unavailable.into());
     };
-    let id = review.id;
+    let id = review.id.clone();
     let result = (|| {
         let (review, pin) = {
             let mut state = shared.0.lock().map_err(|_| Fault::StateUnavailable)?;
             let manager = manager(&mut state, &id, peer)?;
-            let review = manager.add_repositories(&id, peer.id().value(), additions)?;
+            let context = manager.context(&id, peer.id().value())?;
+            if additions.is_empty() && (context.identity.is_none() || context.warm.is_some()) {
+                return Ok(Reply::SettingsReview { review });
+            }
+            let review = if additions.is_empty() {
+                review
+            } else {
+                manager.add_repositories(&id, peer.id().value(), additions)?
+            };
             let pin = manager
                 .context(&id, peer.id().value())?
                 .pin

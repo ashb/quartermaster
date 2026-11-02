@@ -152,6 +152,7 @@ public enum BrokerCommand: Encodable, Sendable {
 
 public enum BrokerControlError: String, Codable, Error, Sendable {
     case invalidMessage, denied, expired, busy, providerChanged, sessionEnded, unavailable
+    case invalidCredentials, mfaRequired, serverUnavailable
 }
 
 public struct VaultBinding: Codable, Equatable, Sendable {
